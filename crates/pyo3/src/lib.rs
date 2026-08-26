@@ -255,6 +255,11 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
 
+    let n = "longbridge";
+    let submodule = pyo3::wrap_pymodule!(nautilus_longbridge::python::longbridge);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+
     let n = "interactive_brokers";
     let submodule = pyo3::wrap_pymodule!(nautilus_interactive_brokers::python::interactive_brokers);
     m.add_wrapped(submodule)?;

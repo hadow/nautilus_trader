@@ -17,6 +17,7 @@ members = [
   "crates/adapters/interactive_brokers",
   "crates/adapters/kraken",
   "crates/adapters/lighter",
+  "crates/adapters/longbridge",
   "crates/adapters/okx",
   "crates/adapters/polymarket",
   "crates/adapters/sandbox",
@@ -112,6 +113,7 @@ nautilus-hyperliquid = { path = "crates/adapters/hyperliquid", version = "0.63.0
 nautilus-interactive-brokers = { path = "crates/adapters/interactive_brokers", version = "0.63.0" }
 nautilus-kraken = { path = "crates/adapters/kraken", version = "0.63.0", default-features = false }
 nautilus-lighter = { path = "crates/adapters/lighter", version = "0.63.0", default-features = false }
+nautilus-longbridge = { path = "crates/adapters/longbridge", version = "0.63.0", default-features = false }
 nautilus-okx = { path = "crates/adapters/okx", version = "0.63.0", default-features = false }
 nautilus-polymarket = { path = "crates/adapters/polymarket", version = "0.63.0", default-features = false }
 nautilus-sandbox = { path = "crates/adapters/sandbox", version = "0.63.0", default-features = false }
@@ -345,6 +347,7 @@ fallible-streaming-iterator = "0.1.9"
 flate2 = "1.1.9"
 hypersync-client = { version = "1.4.0" }
 ibapi = "=3.3.0"
+longbridge = "4.5.0"
 ryu = "1.0.23"
 serde_repr = "0.1.21"
 time = { version = "0.3.55", default-features = false, features = [
