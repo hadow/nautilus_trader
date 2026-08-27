@@ -22,6 +22,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["high-precision"]
+examples = ["nautilus-live/node", "nautilus-trading/examples"]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
@@ -46,7 +47,7 @@ high-precision = ["nautilus-model/high-precision"]
 ignored = ["nautilus-system"]
 
 [package.metadata.docs.rs]
-features = ["high-precision"]
+features = ["examples", "high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -73,16 +74,23 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+] }
+nautilus-trading = { workspace = true }
+
 rstest = { workspace = true }
 
 [[example]]
 name = "longbridge-data-tester"
 path = "examples/node_data_tester.rs"
+required-features = ["examples"]
 doc = false
 
 [[example]]
 name = "longbridge-exec-tester"
 path = "examples/node_exec_tester.rs"
+required-features = ["examples"]
 doc = false
 
 [[test]]

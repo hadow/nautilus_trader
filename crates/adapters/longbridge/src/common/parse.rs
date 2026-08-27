@@ -128,6 +128,7 @@ pub fn parse_depth(
         parsed_bids[index] = BookOrder::new(OrderSide::Buy, price, size, 0);
         bid_counts[index] = u32::try_from(level.order_num.max(0)).unwrap_or(u32::MAX);
     }
+
     for (index, level) in asks
         .iter()
         .filter(|level| level.price.is_some())
@@ -382,15 +383,19 @@ pub fn parse_order_status_report(
         ts_init,
         None,
     );
+
     if let Some(price) = order.price {
         report = report.with_price(Price::from_decimal(price)?);
     }
+
     if let Some(avg_px) = order.executed_price {
         report = report.with_avg_px(avg_px);
     }
+
     if let Some(trigger_price) = order.trigger_price {
         report = report.with_trigger_price(Price::from_decimal(trigger_price)?);
     }
+
     if !order.msg.is_empty() && report.order_status == OrderStatus::Canceled {
         report.cancel_reason = Some(order.msg.clone());
     }

@@ -142,6 +142,7 @@ impl ExecutionClientFactory for LongbridgeExecutionClientFactory {
                 )
             })?
             .clone();
+
         if !matches!(config.account_type, AccountType::Cash | AccountType::Margin) {
             anyhow::bail!(
                 "Longbridge supports CASH or MARGIN accounts, was {:?}",

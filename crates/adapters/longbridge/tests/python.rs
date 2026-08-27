@@ -16,12 +16,15 @@
 #![cfg(feature = "python")]
 
 use nautilus_longbridge::{
-    config::{LongbridgeDataClientConfig, LongbridgeExecClientConfig},
+    config::{DEFAULT_OAUTH_CALLBACK_PORT, LongbridgeDataClientConfig, LongbridgeExecClientConfig},
     factories::{LongbridgeDataClientFactory, LongbridgeExecutionClientFactory},
     python,
 };
 use nautilus_model::identifiers::{AccountId, TraderId};
-use pyo3::{Py, Python, types::PyModule};
+use pyo3::{
+    Py, Python,
+    types::{PyDict, PyModule},
+};
 use rstest::rstest;
 
 #[rstest]
@@ -42,6 +45,47 @@ fn test_python_module_registers_configs_and_factories() {
                 ),
             )
             .is_ok(),
+        );
+
+        let kwargs = PyDict::new(py);
+        kwargs
+            .set_item("oauth_client_id", "public-client-id")
+            .unwrap();
+        kwargs.set_item("oauth_callback_port", 60_400).unwrap();
+        let config = module
+            .getattr("LongbridgeDataClientConfig")
+            .unwrap()
+            .call((), Some(&kwargs))
+            .unwrap();
+        assert_eq!(
+            config
+                .getattr("oauth_client_id")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "public-client-id",
+        );
+        assert_eq!(
+            config
+                .getattr("oauth_callback_port")
+                .unwrap()
+                .extract::<u16>()
+                .unwrap(),
+            60_400,
+        );
+
+        let default_config = module
+            .getattr("LongbridgeExecClientConfig")
+            .unwrap()
+            .call0()
+            .unwrap();
+        assert_eq!(
+            default_config
+                .getattr("oauth_callback_port")
+                .unwrap()
+                .extract::<u16>()
+                .unwrap(),
+            DEFAULT_OAUTH_CALLBACK_PORT,
         );
     });
 }

@@ -18,7 +18,8 @@
 //!
 //! The adapter uses the official [`longbridge`] Rust SDK. [`longbridge::quote::QuoteContext`]
 //! owns market-data transport and [`longbridge::trade::TradeContext`] owns trading, account,
-//! position, execution and private-push transport.
+//! position, execution and private-push transport. Authentication uses the SDK's OAuth 2.0
+//! authorization-code flow with persisted, automatically refreshed tokens.
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

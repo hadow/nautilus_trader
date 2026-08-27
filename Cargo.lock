@@ -6971,6 +6971,8 @@ dependencies = [
  "nautilus-live",
  "nautilus-model",
  "nautilus-system",
+ "nautilus-testkit",
+ "nautilus-trading",
  "pyo3",
  "pyo3-stub-gen",
  "rstest",

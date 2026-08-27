@@ -16,7 +16,7 @@
 //! Live Longbridge market-data client backed by the official Rust SDK.
 
 use std::{
-    fmt,
+    fmt::Debug,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -79,8 +79,8 @@ pub struct LongbridgeDataClient {
     connected: AtomicBool,
 }
 
-impl fmt::Debug for LongbridgeDataClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for LongbridgeDataClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(LongbridgeDataClient))
             .field("client_id", &self.client_id)
             .field("config", &self.config)
@@ -126,6 +126,7 @@ impl LongbridgeDataClient {
 
     fn terminate_stream(&mut self) {
         self.cancellation_token.cancel();
+
         if let Some(handle) = self.stream_handle.take() {
             handle.abort();
         }
@@ -182,7 +183,7 @@ impl DataClient for LongbridgeDataClient {
         }
 
         self.cancellation_token = CancellationToken::new();
-        let sdk_config = self.config.sdk_config()?;
+        let sdk_config = self.config.sdk_config().await?;
         let (context, mut receiver) = QuoteContext::new(sdk_config);
         context
             .subscriptions()
@@ -193,6 +194,7 @@ impl DataClient for LongbridgeDataClient {
         let subscriptions = Arc::clone(&self.subscriptions);
         let cancellation = self.cancellation_token.clone();
         let clock = self.clock;
+
         self.stream_handle = Some(get_runtime().spawn(async move {
             loop {
                 tokio::select! {
@@ -200,6 +202,7 @@ impl DataClient for LongbridgeDataClient {
                     event = receiver.recv() => {
                         let Some(event) = event else { break };
                         let ts_init = clock.get_time_ns();
+
                         match event.detail {
                             PushEventDetail::Depth(depth) => {
                                 match parse_depth(&event.symbol, &depth.bids, &depth.asks, ts_init, ts_init) {
@@ -210,6 +213,7 @@ impl DataClient for LongbridgeDataClient {
                                         {
                                             log::error!("Failed to dispatch Longbridge depth: {error}");
                                         }
+
                                         if state.quotes.contains(&depth.instrument_id)
                                             && let Some(quote) = quote
                                             && let Err(error) = sender.send(DataEvent::Data(Data::Quote(quote)))
@@ -228,6 +232,7 @@ impl DataClient for LongbridgeDataClient {
                                             .expect(MUTEX_POISONED)
                                             .trades
                                             .contains(&crate::common::parse::instrument_id(&event.symbol));
+
                                         if subscribed {
                                             for trade in trades {
                                                 if let Err(error) = sender.send(DataEvent::Data(Data::Trade(trade))) {
@@ -247,6 +252,7 @@ impl DataClient for LongbridgeDataClient {
                                     .bars
                                     .get(&key)
                                     .copied();
+
                                 if let Some(bar_type) = bar_type {
                                     match parse_bar(bar_type, update.candlestick, ts_init) {
                                         Ok(bar) => {
@@ -290,6 +296,7 @@ impl DataClient for LongbridgeDataClient {
         let already_active = state.depth10.contains(&cmd.instrument_id);
         let inserted = state.quotes.insert(cmd.instrument_id);
         drop(state);
+
         if already_active || !inserted {
             return Ok(());
         }
@@ -306,6 +313,7 @@ impl DataClient for LongbridgeDataClient {
         let already_active = state.quotes.contains(&cmd.instrument_id);
         let inserted = state.depth10.insert(cmd.instrument_id);
         drop(state);
+
         if already_active || !inserted {
             return Ok(());
         }
@@ -324,6 +332,7 @@ impl DataClient for LongbridgeDataClient {
             .expect(MUTEX_POISONED)
             .trades
             .insert(cmd.instrument_id);
+
         if !inserted {
             return Ok(());
         }
@@ -344,6 +353,7 @@ impl DataClient for LongbridgeDataClient {
             .expect(MUTEX_POISONED)
             .bars
             .insert((symbol.clone(), period as i32), cmd.bar_type);
+
         if previous.is_some() {
             return Ok(());
         }
@@ -362,6 +372,7 @@ impl DataClient for LongbridgeDataClient {
         let removed = state.quotes.remove(&cmd.instrument_id);
         let retain_depth = state.depth10.contains(&cmd.instrument_id);
         drop(state);
+
         if removed && !retain_depth {
             let symbol = cmd.instrument_id.symbol.as_str().to_string();
             self.spawn_result("quote unsubscription", async move {
@@ -377,6 +388,7 @@ impl DataClient for LongbridgeDataClient {
         let removed = state.depth10.remove(&cmd.instrument_id);
         let retain_depth = state.quotes.contains(&cmd.instrument_id);
         drop(state);
+
         if removed && !retain_depth {
             let symbol = cmd.instrument_id.symbol.as_str().to_string();
             self.spawn_result("depth unsubscription", async move {
@@ -394,6 +406,7 @@ impl DataClient for LongbridgeDataClient {
             .expect(MUTEX_POISONED)
             .trades
             .remove(&cmd.instrument_id);
+
         if !removed {
             return Ok(());
         }
@@ -414,6 +427,7 @@ impl DataClient for LongbridgeDataClient {
             .expect(MUTEX_POISONED)
             .bars
             .remove(&(symbol.clone(), period as i32));
+
         if removed.is_none() {
             return Ok(());
         }

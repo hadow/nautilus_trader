@@ -18,7 +18,9 @@
 use nautilus_model::enums::AccountType;
 use pyo3::pymethods;
 
-use crate::config::{LongbridgeDataClientConfig, LongbridgeExecClientConfig};
+use crate::config::{
+    DEFAULT_OAUTH_CALLBACK_PORT, LongbridgeDataClientConfig, LongbridgeExecClientConfig,
+};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -26,25 +28,22 @@ impl LongbridgeDataClientConfig {
     /// Configuration for the Longbridge live data client.
     #[new]
     #[pyo3(signature = (
-        app_key = None,
-        app_secret = None,
-        access_token = None,
+        oauth_client_id = None,
+        oauth_callback_port = DEFAULT_OAUTH_CALLBACK_PORT,
         http_url = None,
         quote_ws_url = None,
         enable_overnight = false,
     ))]
     fn py_new(
-        app_key: Option<String>,
-        app_secret: Option<String>,
-        access_token: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_callback_port: u16,
         http_url: Option<String>,
         quote_ws_url: Option<String>,
         enable_overnight: bool,
     ) -> Self {
         Self {
-            app_key,
-            app_secret,
-            access_token,
+            oauth_client_id,
+            oauth_callback_port,
             http_url,
             quote_ws_url,
             enable_overnight,
@@ -62,20 +61,17 @@ impl LongbridgeExecClientConfig {
     /// Configuration for the Longbridge live execution client.
     #[new]
     #[pyo3(signature = (
-        app_key = None,
-        app_secret = None,
-        access_token = None,
+        oauth_client_id = None,
+        oauth_callback_port = DEFAULT_OAUTH_CALLBACK_PORT,
         http_url = None,
         trade_ws_url = None,
         account_type = AccountType::Margin,
         papertrading = false,
         outside_rth = false,
     ))]
-    #[expect(clippy::too_many_arguments)]
     fn py_new(
-        app_key: Option<String>,
-        app_secret: Option<String>,
-        access_token: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_callback_port: u16,
         http_url: Option<String>,
         trade_ws_url: Option<String>,
         account_type: AccountType,
@@ -83,9 +79,8 @@ impl LongbridgeExecClientConfig {
         outside_rth: bool,
     ) -> Self {
         Self {
-            app_key,
-            app_secret,
-            access_token,
+            oauth_client_id,
+            oauth_callback_port,
             http_url,
             trade_ws_url,
             account_type,

@@ -17,7 +17,7 @@
 
 use std::{
     collections::VecDeque,
-    fmt,
+    fmt::Debug,
     future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -124,6 +124,7 @@ impl OrderContexts {
         if let Some(context) = self.by_venue.get(&order.order_id) {
             return Some(context.clone());
         }
+
         if !order.remark.is_empty()
             && let Some(context) = self.by_client.get(&order.remark).cloned()
         {
@@ -147,6 +148,7 @@ impl SeenTradeIds {
         if self.ids.contains(&trade_id) {
             return false;
         }
+
         if self.ids.len() >= Self::CAPACITY
             && let Some(oldest) = self.order.pop_front()
         {
@@ -175,8 +177,8 @@ pub struct LongbridgeExecutionClient {
     clock: &'static AtomicTime,
 }
 
-impl fmt::Debug for LongbridgeExecutionClient {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for LongbridgeExecutionClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(LongbridgeExecutionClient))
             .field("client_id", &self.core.client_id)
             .field("account_id", &self.core.account_id)
@@ -240,6 +242,7 @@ impl LongbridgeExecutionClient {
 
     fn terminate(&mut self) {
         self.pending_tasks.abort_all();
+
         if let Some(handle) = self.stream_handle.take() {
             handle.abort();
         }
@@ -257,9 +260,11 @@ impl LongbridgeExecutionClient {
         let timeout = Duration::from_secs_f64(timeout_secs);
         loop {
             tokio::time::sleep(Duration::from_millis(10)).await;
+
             if self.core.cache().account(&account_id).is_some() {
                 return Ok(());
             }
+
             if start.elapsed() >= timeout {
                 anyhow::bail!(
                     "Timeout waiting for Longbridge account {account_id} to be registered after {timeout_secs}s",
@@ -305,9 +310,11 @@ async fn fetch_orders(
         if let Some(symbol) = &symbol {
             history_options = history_options.symbol(symbol);
         }
+
         if let Some(start) = start {
             history_options = history_options.start_at(offset_datetime(start)?);
         }
+
         if let Some(end) = end {
             history_options = history_options.end_at(offset_datetime(end)?);
         }
@@ -355,9 +362,11 @@ async fn fetch_executions(
     if let Some(symbol) = &symbol {
         history_options = history_options.symbol(symbol);
     }
+
     if let Some(start) = start {
         history_options = history_options.start_at(offset_datetime(start)?);
     }
+
     if let Some(end) = end {
         history_options = history_options.end_at(offset_datetime(end)?);
     }
@@ -444,7 +453,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         if self.core.is_connected() {
             return Ok(());
         }
-        let sdk_config = self.config.sdk_config()?;
+        let sdk_config = self.config.sdk_config().await?;
         let (context, mut receiver) = TradeContext::new(sdk_config);
         context
             .subscribe([TopicType::Private])
@@ -468,6 +477,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let seen_trade_ids = Arc::clone(&self.seen_trade_ids);
         let account_id = self.core.account_id;
         let clock = self.clock;
+
         self.stream_handle = Some(get_runtime().spawn(async move {
             while let Some(event) = receiver.recv().await {
                 let PushEvent::OrderChanged(update) = event;
@@ -512,6 +522,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
                                 .lock()
                                 .expect(MUTEX_POISONED)
                                 .insert(execution.trade_id.clone());
+
                             if !is_new {
                                 continue;
                             }
@@ -522,6 +533,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
                                     continue;
                                 }
                             };
+
                             match parse_fill_report(
                                 &execution,
                                 account_id,
@@ -610,6 +622,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
             );
             return Ok(());
         }
+
         if order.is_post_only() {
             self.emitter.emit_order_denied(
                 &order,
@@ -617,6 +630,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
             );
             return Ok(());
         }
+
         if order.is_reduce_only() {
             self.emitter
                 .emit_order_denied(&order, "Longbridge stock orders do not support reduce-only");
@@ -655,12 +669,15 @@ impl ExecutionClient for LongbridgeExecutionClient {
         )
         .client_request_id(client_order_id.to_string())
         .remark(client_order_id.to_string());
+
         if let Some(price) = order.price() {
             options = options.submitted_price(price.as_decimal());
         }
+
         if let Some(trigger_price) = order.trigger_price() {
             options = options.trigger_price(trigger_price.as_decimal());
         }
+
         if let Some(expire_time) = order.expire_time() {
             let expire_date = match offset_datetime(expire_time) {
                 Ok(value) => value.date(),
@@ -671,6 +688,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
             };
             options = options.expire_date(expire_date);
         }
+
         if self.config.outside_rth {
             options = options.outside_rth(OutsideRTH::AnyTime);
         }
@@ -756,6 +774,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         if let Some(price) = cmd.price {
             options = options.price(price.as_decimal());
         }
+
         if let Some(trigger_price) = cmd.trigger_price {
             options = options.trigger_price(trigger_price.as_decimal());
         }
@@ -834,12 +853,14 @@ impl ExecutionClient for LongbridgeExecutionClient {
             let orders = context
                 .today_orders(GetTodayOrdersOptions::new().symbol(symbol))
                 .await?;
+
             for order in orders {
                 if requested_side != OrderSide::NoOrderSide
                     && order_side_from_sdk(order.side)? != requested_side
                 {
                     continue;
                 }
+
                 if matches!(
                     order.status,
                     longbridge::trade::OrderStatus::Filled
