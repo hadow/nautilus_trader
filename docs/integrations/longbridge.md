@@ -47,7 +47,7 @@ in the underlying companies.
 | ------------------- | ----------------------------------- | ------------------------------------------ | ------------------------------------------- |
 | Interactive Brokers | Data and execution testers          | Testers, contract and historical downloads | Requires a running TWS or IB Gateway        |
 | Databento           | Data tester                         | Data tester and historical workflows       | No execution client                         |
-| Longbridge          | Data and paper‑execution testers    | Data and paper‑execution testers           | No instrument‑provider or history example   |
+| Longbridge          | Data, paper‑execution and grid      | Data and paper‑execution testers           | No instrument‑provider or history example   |
 | Architect AX        | Data and execution testers          | Testers and strategy examples              | Trades equity‑linked derivatives, not stock |
 | Hyperliquid         | Data, execution and outcome testers | Data, execution and outcome testers        | Trades equity‑linked derivatives, not stock |
 
@@ -152,12 +152,13 @@ reconciliation reports without a fabricated client order ID.
 
 ## Examples and tests
 
-The Rust examples construct a complete `LiveNode`, register a sample `AAPL.US` equity, and run the
-built-in data or execution tester:
+The Rust examples construct complete `LiveNode` instances. The data and execution testers register a
+sample `AAPL.US` equity; the grid example registers the three equities described below:
 
 ```bash
 cargo run -p nautilus-longbridge --features examples --example longbridge-data-tester
 cargo run -p nautilus-longbridge --features examples --example longbridge-exec-tester
+cargo run -p nautilus-longbridge --features examples --example longbridge-grid-mm
 ```
 
 Equivalent Python examples are available under `examples/live/longbridge/`:
@@ -172,9 +173,26 @@ execution tester enables reconciliation and exercises market submission, a passi
 cancellation, position close and private order push. Its defaults use Longbridge paper trading,
 submit one-share orders, and avoid unsupported post-only and reduce-only flags.
 
-The embedded `AAPL.US` definition is an example, not a security master. Verify the raw symbol,
-currency, price increment, lot size and minimum quantity against current venue rules. Replace it
-with a catalog or custom provider definition for production use.
+The grid example runs an independent built-in Rust `GridMarketMaker` for each of `AAPL.US`,
+`MSFT.US` and `NVDA.US`. Each symbol uses three levels per side, ten shares per order, a 60-share
+maximum position, 25 bps grid spacing and a 10 bps requote threshold. The node queries Longbridge's
+trading-day and trading-session APIs and runs until the current US regular session closes. It handles
+US daylight-saving time and Longbridge half-trading days, and refuses to start on a non-trading day
+or after the regular close.
+
+The per-symbol strategy IDs, order tags, reconciliation claims and position limits are distinct.
+The margin account is required because each symmetric grid can open short positions. The example
+does not impose an aggregate account-level position or notional cap.
+
+At startup, the three strategies can submit up to 18 resting orders in total. Longbridge does not
+support post-only or reduce-only instructions, so the example disables both. Consequently, limit
+orders can execute immediately and the asynchronous cancel-and-close sequence cannot guarantee a
+flat account. Use an isolated paper account, confirm its available buying power, and inspect the
+account after shutdown before adapting the example for live trading.
+
+The embedded `AAPL.US`, `MSFT.US` and `NVDA.US` definitions are examples, not a security master.
+Verify every raw symbol, currency, price increment, lot size and minimum quantity against current
+venue rules. Replace them with a catalog or custom provider definition for production use.
 
 Run its focused Rust and PyO3 tests with:
 

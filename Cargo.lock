@@ -6964,6 +6964,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "jiff",
  "log",
  "longbridge",
  "nautilus-common",

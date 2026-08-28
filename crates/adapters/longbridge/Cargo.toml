@@ -79,6 +79,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 ] }
 nautilus-trading = { workspace = true }
 
+jiff = { workspace = true }
 rstest = { workspace = true }
 
 [[example]]
@@ -90,6 +91,12 @@ doc = false
 [[example]]
 name = "longbridge-exec-tester"
 path = "examples/node_exec_tester.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-grid-mm"
+path = "examples/node_grid_mm.rs"
 required-features = ["examples"]
 doc = false
 

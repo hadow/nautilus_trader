@@ -45,6 +45,10 @@ pub struct GridMarketMakerConfig {
     /// Trade size per grid level. When `None` the strategy resolves it from
     /// the instrument's `min_quantity` during `on_start`.
     pub trade_size: Option<Quantity>,
+    /// If limit orders should use the post-only instruction.
+    /// Disable this for venues which do not support post-only orders.
+    #[builder(default = true)]
+    pub post_only: bool,
     /// Number of price levels on each side (buy & sell).
     #[builder(default = 3)]
     pub num_levels: usize,

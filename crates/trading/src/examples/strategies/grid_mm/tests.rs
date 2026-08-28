@@ -87,12 +87,24 @@ fn test_config_defaults() {
     );
     assert_eq!(config.base.order_id_tag, Some("001".to_string()));
     assert_eq!(config.trade_size, None);
+    assert!(config.post_only);
     assert_eq!(config.num_levels, 3);
     assert_eq!(config.grid_step_bps, 10);
     assert_eq!(config.skew_factor, 0.0);
     assert_eq!(config.requote_threshold_bps, 5);
     assert_eq!(config.expire_time_secs, None);
     assert!(!config.on_cancel_resubmit);
+}
+
+#[rstest]
+fn test_config_can_disable_post_only() {
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(InstrumentId::from("ETHUSDT-PERP.BINANCE"))
+        .max_position(Quantity::from("10.0"))
+        .post_only(false)
+        .build();
+
+    assert!(!config.post_only);
 }
 
 #[rstest]

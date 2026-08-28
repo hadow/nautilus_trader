@@ -52,6 +52,7 @@ would breach `max_position` are skipped.
 | `instrument_id`         | `InstrumentId` | *required* | Instrument to trade.                                                               |
 | `max_position`          | `Quantity`     | *required* | Hard cap on net exposure (long or short).                                          |
 | `trade_size`            | `Option<Qty>`  | `None`     | Size per grid level. When `None`, resolves from the instrument's `min_quantity`.   |
+| `post_only`             | `bool`         | `true`     | Rust-only override for venues without post-only support.                           |
 | `num_levels`            | `usize`        | `3`        | Number of price levels on each side (buy and sell).                                |
 | `grid_step_bps`         | `u32`          | `10`       | Grid spacing in basis points of mid-price. 10 bps = 0.1%.                          |
 | `skew_factor`           | `f64`          | `0.0`      | Inventory skew multiplier. Higher values skew more aggressively against position.  |

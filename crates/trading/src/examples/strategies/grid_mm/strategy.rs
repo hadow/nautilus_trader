@@ -205,8 +205,19 @@ impl DataActor for GridMarketMaker {
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
         let instrument_id = self.config.instrument_id;
+        let time_in_force = self.config.base.market_exit_time_in_force;
+        let reduce_only = self.config.base.market_exit_reduce_only;
         self.cancel_all_orders(instrument_id, None, None, None)?;
-        self.close_all_positions(instrument_id, None, None, None, None, None, None, None)?;
+        self.close_all_positions(
+            instrument_id,
+            None,
+            None,
+            None,
+            Some(time_in_force),
+            Some(reduce_only),
+            None,
+            None,
+        )?;
         self.unsubscribe_quotes(instrument_id, None, None);
         Ok(())
     }
@@ -330,7 +341,7 @@ impl DataActor for GridMarketMaker {
                 price,
                 tif,
                 expire_time,
-                Some(true), // post_only
+                Some(self.config.post_only),
                 None,
                 None,
                 None,
