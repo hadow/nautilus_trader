@@ -15,6 +15,8 @@
 
 //! Python constructors for Longbridge configuration.
 
+use std::collections::HashMap;
+
 use nautilus_model::enums::AccountType;
 use pyo3::pymethods;
 
@@ -33,6 +35,7 @@ impl LongbridgeDataClientConfig {
         http_url = None,
         quote_ws_url = None,
         enable_overnight = false,
+        instrument_price_increments = None,
     ))]
     fn py_new(
         oauth_client_id: Option<String>,
@@ -40,6 +43,7 @@ impl LongbridgeDataClientConfig {
         http_url: Option<String>,
         quote_ws_url: Option<String>,
         enable_overnight: bool,
+        instrument_price_increments: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
             oauth_client_id,
@@ -47,6 +51,7 @@ impl LongbridgeDataClientConfig {
             http_url,
             quote_ws_url,
             enable_overnight,
+            instrument_price_increments: instrument_price_increments.unwrap_or_default(),
         }
     }
 

@@ -20,7 +20,7 @@ use std::{collections::hash_map::DefaultHasher, hash::Hasher, str::FromStr};
 use ahash::AHashMap;
 use anyhow::Context;
 use longbridge::{
-    quote::{Candlestick, Depth, Period, Trade},
+    quote::{Candlestick, Depth, Period, SecurityBoard, SecurityStaticInfo, Trade},
     trade::{
         AccountBalance as LongbridgeAccountBalance, Execution, Order,
         OrderSide as LongbridgeOrderSide, OrderStatus as LongbridgeOrderStatus,
@@ -38,6 +38,7 @@ use nautilus_model::{
         PositionSideSpecified, PriceType, RecordFlag, TimeInForce,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
+    instruments::{Equity, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
@@ -99,6 +100,72 @@ pub fn period_from_bar_type(bar_type: BarType) -> anyhow::Result<Period> {
     Ok(period)
 }
 
+/// Parses Longbridge static security metadata into a cash equity definition.
+///
+/// # Errors
+///
+/// Returns an error for a non-equity board or invalid currency, lot size, or price increment.
+pub fn parse_instrument(
+    info: &SecurityStaticInfo,
+    price_increment: Price,
+    ts_init: UnixNanos,
+) -> anyhow::Result<InstrumentAny> {
+    anyhow::ensure!(
+        matches!(
+            info.board,
+            SecurityBoard::USMain
+                | SecurityBoard::USPink
+                | SecurityBoard::HKEquity
+                | SecurityBoard::HKPreIPO
+                | SecurityBoard::SHMainConnect
+                | SecurityBoard::SHMainNonConnect
+                | SecurityBoard::SHSTAR
+                | SecurityBoard::SZMainConnect
+                | SecurityBoard::SZMainNonConnect
+                | SecurityBoard::SZGEMConnect
+                | SecurityBoard::SZGEMNonConnect
+                | SecurityBoard::SGMain
+        ),
+        "Longbridge security {} has unsupported board {}",
+        info.symbol,
+        info.board,
+    );
+    anyhow::ensure!(
+        info.lot_size > 0,
+        "Longbridge security {} has invalid lot size {}",
+        info.symbol,
+        info.lot_size,
+    );
+
+    let instrument_id = instrument_id(&info.symbol);
+    let raw_symbol = Symbol::from(info.symbol.as_str());
+    let currency = Currency::from_str(&info.currency)
+        .with_context(|| format!("invalid currency for Longbridge security {instrument_id}"))?;
+    let lot_size = Quantity::from_decimal(Decimal::from(info.lot_size))?;
+    let equity = Equity::new_checked(
+        instrument_id,
+        raw_symbol,
+        None,
+        currency,
+        price_increment.precision,
+        price_increment,
+        Some(lot_size),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ts_init,
+        ts_init,
+    )?;
+    Ok(InstrumentAny::from(equity))
+}
+
 /// Parses a Longbridge depth snapshot and its top-of-book quote.
 ///
 /// # Errors
@@ -117,25 +184,25 @@ pub fn parse_depth(
     let mut bid_counts = [0_u32; DEPTH10_LEN];
     let mut ask_counts = [0_u32; DEPTH10_LEN];
 
-    for (index, level) in bids
+    for (index, (level, raw_price)) in bids
         .iter()
-        .filter(|level| level.price.is_some())
+        .filter_map(|level| level.price.map(|price| (level, price)))
         .take(DEPTH10_LEN)
         .enumerate()
     {
-        let price = Price::from_decimal(level.price.expect("filtered Some price"))?;
+        let price = Price::from_decimal(raw_price)?;
         let size = Quantity::from_decimal(Decimal::from(level.volume))?;
         parsed_bids[index] = BookOrder::new(OrderSide::Buy, price, size, 0);
         bid_counts[index] = u32::try_from(level.order_num.max(0)).unwrap_or(u32::MAX);
     }
 
-    for (index, level) in asks
+    for (index, (level, raw_price)) in asks
         .iter()
-        .filter(|level| level.price.is_some())
+        .filter_map(|level| level.price.map(|price| (level, price)))
         .take(DEPTH10_LEN)
         .enumerate()
     {
-        let price = Price::from_decimal(level.price.expect("filtered Some price"))?;
+        let price = Price::from_decimal(raw_price)?;
         let size = Quantity::from_decimal(Decimal::from(level.volume))?;
         parsed_asks[index] = BookOrder::new(OrderSide::Sell, price, size, 0);
         ask_counts[index] = u32::try_from(level.order_num.max(0)).unwrap_or(u32::MAX);
@@ -230,7 +297,7 @@ pub fn parse_bar(
     candlestick: Candlestick,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
-    Ok(Bar::new_checked(
+    Bar::new_checked(
         bar_type,
         Price::from_decimal(candlestick.open)?,
         Price::from_decimal(candlestick.high)?,
@@ -239,7 +306,7 @@ pub fn parse_bar(
         Quantity::from_decimal(Decimal::from(candlestick.volume))?,
         unix_nanos(candlestick.timestamp)?,
         ts_init,
-    )?)
+    )
 }
 
 /// Maps a Nautilus order side to the SDK.
@@ -525,7 +592,7 @@ pub fn parse_account_state(
 
 #[cfg(test)]
 mod tests {
-    use longbridge::quote::TradeDirection;
+    use longbridge::quote::{DerivativeType, SecurityBoard, SecurityStaticInfo, TradeDirection};
     use nautilus_model::{
         data::{BarSpecification, BarType},
         enums::{AggregationSource, BarAggregation, PriceType},
@@ -583,5 +650,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ticks[0].trade_id, repeated[0].trade_id);
+    }
+
+    #[rstest]
+    fn test_parse_instrument_uses_static_info_and_configured_tick() {
+        let instrument = parse_instrument(
+            &SecurityStaticInfo {
+                symbol: "700.HK".to_string(),
+                name_cn: "腾讯控股".to_string(),
+                name_en: "Tencent".to_string(),
+                name_hk: "騰訊控股".to_string(),
+                exchange: "SEHK".to_string(),
+                currency: "HKD".to_string(),
+                lot_size: 100,
+                total_shares: 1,
+                circulating_shares: 1,
+                hk_shares: 1,
+                eps: Decimal::ZERO,
+                eps_ttm: Decimal::ZERO,
+                bps: Decimal::ZERO,
+                dividend_yield: Decimal::ZERO,
+                stock_derivatives: DerivativeType::empty(),
+                board: SecurityBoard::HKEquity,
+            },
+            Price::from("0.001"),
+            UnixNanos::from(42),
+        )
+        .unwrap();
+
+        let InstrumentAny::Equity(equity) = instrument else {
+            panic!("expected equity");
+        };
+        assert_eq!(equity.id.to_string(), "700.HK.LONGBRIDGE");
+        assert_eq!(equity.currency, Currency::HKD());
+        assert_eq!(equity.price_increment, Price::from("0.001"));
+        assert_eq!(equity.lot_size, Some(Quantity::from(100)));
+        assert_eq!(equity.min_quantity, None);
+        assert_eq!(equity.ts_event, UnixNanos::from(42));
     }
 }

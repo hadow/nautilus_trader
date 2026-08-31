@@ -61,6 +61,7 @@ ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+jiff = { workspace = true }
 log = { workspace = true }
 longbridge = { workspace = true }
 rust_decimal = { workspace = true }
@@ -79,7 +80,6 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 ] }
 nautilus-trading = { workspace = true }
 
-jiff = { workspace = true }
 rstest = { workspace = true }
 
 [[example]]

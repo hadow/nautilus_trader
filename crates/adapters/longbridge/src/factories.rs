@@ -85,6 +85,7 @@ impl DataClientFactory for LongbridgeDataClientFactory {
                 )
             })?
             .clone();
+        config.validate()?;
         Ok(Box::new(LongbridgeDataClient::new(
             ClientId::from(name),
             config,

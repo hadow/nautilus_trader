@@ -23,7 +23,7 @@ use nautilus_longbridge::{
 use nautilus_model::identifiers::{AccountId, TraderId};
 use pyo3::{
     Py, Python,
-    types::{PyDict, PyModule},
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyModule},
 };
 use rstest::rstest;
 
@@ -52,6 +52,13 @@ fn test_python_module_registers_configs_and_factories() {
             .set_item("oauth_client_id", "public-client-id")
             .unwrap();
         kwargs.set_item("oauth_callback_port", 60_400).unwrap();
+        let instrument_price_increments = PyDict::new(py);
+        instrument_price_increments
+            .set_item("AAPL.US.LONGBRIDGE", "0.01")
+            .unwrap();
+        kwargs
+            .set_item("instrument_price_increments", instrument_price_increments)
+            .unwrap();
         let config = module
             .getattr("LongbridgeDataClientConfig")
             .unwrap()
@@ -72,6 +79,16 @@ fn test_python_module_registers_configs_and_factories() {
                 .extract::<u16>()
                 .unwrap(),
             60_400,
+        );
+        assert_eq!(
+            config
+                .getattr("instrument_price_increments")
+                .unwrap()
+                .extract::<std::collections::HashMap<String, String>>()
+                .unwrap()
+                .get("AAPL.US.LONGBRIDGE")
+                .map(String::as_str),
+            Some("0.01"),
         );
 
         let default_config = module

@@ -26,9 +26,8 @@ use longbridge::{
     Config,
     oauth::{OAuth, OAuthBuilder},
 };
-use nautilus_model::enums::AccountType;
+use nautilus_model::{enums::AccountType, identifiers::InstrumentId, types::Price};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 /// Default local callback port used by the Longbridge OAuth 2.0 flow.
 pub const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 60_355;
@@ -39,8 +38,8 @@ struct CachedOAuth {
     oauth: OAuth,
 }
 
-static OAUTH_CLIENTS: LazyLock<Mutex<HashMap<String, CachedOAuth>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static OAUTH_CLIENTS: LazyLock<tokio::sync::Mutex<HashMap<String, CachedOAuth>>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(format!("LONGBRIDGE_{name}"))
@@ -165,6 +164,11 @@ pub struct LongbridgeDataClientConfig {
     /// Whether to request US overnight quote data.
     #[builder(default)]
     pub enable_overnight: bool,
+    /// Exact minimum price increments keyed by fully qualified Nautilus instrument ID.
+    ///
+    /// The keys also define which instruments are loaded from Longbridge static security info.
+    #[builder(default)]
+    pub instrument_price_increments: HashMap<String, String>,
 }
 
 impl Debug for LongbridgeDataClientConfig {
@@ -175,6 +179,10 @@ impl Debug for LongbridgeDataClientConfig {
             .field("http_url", &self.http_url)
             .field("quote_ws_url", &self.quote_ws_url)
             .field("enable_overnight", &self.enable_overnight)
+            .field(
+                "instrument_price_increments",
+                &self.instrument_price_increments,
+            )
             .finish()
     }
 }
@@ -186,6 +194,7 @@ nautilus_core::impl_pyo3_config_getters!(LongbridgeDataClientConfig {
     http_url: Option<String>,
     quote_ws_url: Option<String>,
     enable_overnight: bool,
+    instrument_price_increments: HashMap<String, String>,
 });
 
 impl Default for LongbridgeDataClientConfig {
@@ -195,6 +204,69 @@ impl Default for LongbridgeDataClientConfig {
 }
 
 impl LongbridgeDataClientConfig {
+    /// Validates configured instrument IDs and exact price increments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed IDs, another venue, or a non-positive price increment.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.instrument_ids().map(|_| ())
+    }
+
+    /// Returns configured instrument IDs in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed IDs, another venue, or an invalid price increment.
+    pub fn instrument_ids(&self) -> anyhow::Result<Vec<InstrumentId>> {
+        let mut ids = Vec::with_capacity(self.instrument_price_increments.len());
+        for (raw_id, raw_increment) in &self.instrument_price_increments {
+            let instrument_id = raw_id
+                .parse::<InstrumentId>()
+                .map_err(|e| anyhow::anyhow!("invalid Longbridge instrument ID {raw_id:?}: {e}"))?;
+            anyhow::ensure!(
+                instrument_id.venue.as_str() == "LONGBRIDGE",
+                "Longbridge instrument ID {raw_id:?} must use venue LONGBRIDGE",
+            );
+            let increment = raw_increment.parse::<Price>().map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid Longbridge price increment {raw_increment:?} for {instrument_id}: {e}",
+                )
+            })?;
+            anyhow::ensure!(
+                increment.is_positive(),
+                "Longbridge price increment for {instrument_id} must be positive",
+            );
+            ids.push(instrument_id);
+        }
+        ids.sort_unstable_by_key(ToString::to_string);
+        Ok(ids)
+    }
+
+    /// Returns the configured exact price increment for an instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the instrument has no configured increment or it is invalid.
+    pub fn price_increment(&self, instrument_id: InstrumentId) -> anyhow::Result<Price> {
+        let raw = self
+            .instrument_price_increments
+            .get(&instrument_id.to_string())
+            .with_context(|| {
+                format!(
+                    "missing exact Longbridge price increment for {instrument_id}; configure instrument_price_increments",
+                )
+            })?;
+        let increment = raw.parse::<Price>().map_err(|e| {
+            anyhow::anyhow!("invalid Longbridge price increment {raw:?} for {instrument_id}: {e}",)
+        })?;
+        anyhow::ensure!(
+            increment.is_positive(),
+            "Longbridge price increment for {instrument_id} must be positive",
+        );
+        Ok(increment)
+    }
+
     /// Builds an OAuth-backed SDK configuration.
     ///
     /// The official SDK loads and refreshes the token in its default storage. If no usable token
@@ -305,6 +377,7 @@ impl LongbridgeExecClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::{identifiers::InstrumentId, types::Price};
     use rstest::rstest;
 
     use super::*;
@@ -351,5 +424,41 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("public-client-id"));
         assert!(debug.contains("60400"));
+    }
+
+    #[rstest]
+    fn test_instrument_price_increments_require_longbridge_ids_and_positive_prices() {
+        let valid = LongbridgeDataClientConfig {
+            instrument_price_increments: HashMap::from([(
+                "AAPL.US.LONGBRIDGE".to_string(),
+                "0.01".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(
+            valid
+                .price_increment(InstrumentId::from("AAPL.US.LONGBRIDGE"))
+                .unwrap(),
+            Price::from("0.01"),
+        );
+
+        let wrong_venue = LongbridgeDataClientConfig {
+            instrument_price_increments: HashMap::from([(
+                "AAPL.XNAS".to_string(),
+                "0.01".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(wrong_venue.validate().is_err());
+
+        let zero_tick = LongbridgeDataClientConfig {
+            instrument_price_increments: HashMap::from([(
+                "AAPL.US.LONGBRIDGE".to_string(),
+                "0".to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert!(zero_tick.validate().is_err());
     }
 }

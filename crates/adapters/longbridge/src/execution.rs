@@ -225,8 +225,8 @@ impl LongbridgeExecutionClient {
         F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let handle = get_runtime().spawn(async move {
-            if let Err(error) = future.await {
-                log::warn!("Longbridge {description} failed: {error:#}");
+            if let Err(e) = future.await {
+                log::warn!("Longbridge {description} failed: {e:#}");
             }
         });
         self.pending_tasks.push(handle);
@@ -484,8 +484,8 @@ impl ExecutionClient for LongbridgeExecutionClient {
                 let options = GetTodayOrdersOptions::new().order_id(update.order_id.clone());
                 let order = match task_context.today_orders(options).await {
                     Ok(orders) => orders.into_iter().find(|order| order.order_id == update.order_id),
-                    Err(error) => {
-                        log::warn!("Failed to refresh Longbridge pushed order {}: {error}", update.order_id);
+                    Err(e) => {
+                        log::warn!("Failed to refresh Longbridge pushed order {}: {e}", update.order_id);
                         None
                     }
                 };
@@ -511,7 +511,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
                 let ts_init = clock.get_time_ns();
                 match parse_order_status_report(&order, account_id, client_order_id, ts_init) {
                     Ok(report) => emitter.send_order_status_report(report),
-                    Err(error) => log::warn!("Failed to parse Longbridge order push: {error:#}"),
+                    Err(e) => log::warn!("Failed to parse Longbridge order push: {e:#}"),
                 }
 
                 let execution_options = GetTodayExecutionsOptions::new().order_id(order.order_id.clone());
@@ -528,8 +528,8 @@ impl ExecutionClient for LongbridgeExecutionClient {
                             }
                             let side = match order_side_from_sdk(order.side) {
                                 Ok(side) => side,
-                                Err(error) => {
-                                    log::warn!("Failed to parse Longbridge fill side: {error:#}");
+                                Err(e) => {
+                                    log::warn!("Failed to parse Longbridge fill side: {e:#}");
                                     continue;
                                 }
                             };
@@ -543,12 +543,12 @@ impl ExecutionClient for LongbridgeExecutionClient {
                                 clock.get_time_ns(),
                             ) {
                                 Ok(report) => emitter.send_fill_report(report),
-                                Err(error) => log::warn!("Failed to parse Longbridge fill push: {error:#}"),
+                                Err(e) => log::warn!("Failed to parse Longbridge fill push: {e:#}"),
                             }
                         }
                     }
-                    Err(error) => log::warn!(
-                        "Failed to refresh executions for Longbridge order {}: {error}",
+                    Err(e) => log::warn!(
+                        "Failed to refresh executions for Longbridge order {}: {e}",
                         order.order_id,
                     ),
                 }
@@ -639,22 +639,22 @@ impl ExecutionClient for LongbridgeExecutionClient {
 
         let order_type = match to_longbridge_order_type(order.order_type()) {
             Ok(value) => value,
-            Err(error) => {
-                self.emitter.emit_order_denied(&order, &error.to_string());
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
                 return Ok(());
             }
         };
         let side = match to_longbridge_order_side(order.order_side()) {
             Ok(value) => value,
-            Err(error) => {
-                self.emitter.emit_order_denied(&order, &error.to_string());
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
                 return Ok(());
             }
         };
         let time_in_force = match to_longbridge_time_in_force(order.time_in_force()) {
             Ok(value) => value,
-            Err(error) => {
-                self.emitter.emit_order_denied(&order, &error.to_string());
+            Err(e) => {
+                self.emitter.emit_order_denied(&order, &e.to_string());
                 return Ok(());
             }
         };
@@ -681,8 +681,8 @@ impl ExecutionClient for LongbridgeExecutionClient {
         if let Some(expire_time) = order.expire_time() {
             let expire_date = match offset_datetime(expire_time) {
                 Ok(value) => value.date(),
-                Err(error) => {
-                    self.emitter.emit_order_denied(&order, &error.to_string());
+                Err(e) => {
+                    self.emitter.emit_order_denied(&order, &e.to_string());
                     return Ok(());
                 }
             };
@@ -719,19 +719,19 @@ impl ExecutionClient for LongbridgeExecutionClient {
                         .associate_venue(&response.order_id, local_context);
                     emitter.emit_order_accepted(&order, venue_order_id, clock.get_time_ns());
                 }
-                Err(error) if is_authoritative_rejection(&error) => {
+                Err(e) if is_authoritative_rejection(&e) => {
                     emitter.emit_order_rejected_event(
                         order.strategy_id(),
                         order.instrument_id(),
                         order.client_order_id(),
-                        &format!("Longbridge rejected order: {error}"),
+                        &format!("Longbridge rejected order: {e}"),
                         clock.get_time_ns(),
                         false,
                     );
                 }
-                Err(error) => {
+                Err(e) => {
                     log::error!(
-                        "Ambiguous Longbridge submit outcome for {}: {error}; reconcile before retrying",
+                        "Ambiguous Longbridge submit outcome for {}: {e}; reconcile before retrying",
                         order.client_order_id(),
                     );
                 }
@@ -782,19 +782,19 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("order modification", async move {
-            if let Err(error) = context.replace_order(options).await {
-                if is_authoritative_rejection(&error) {
+            if let Err(e) = context.replace_order(options).await {
+                if is_authoritative_rejection(&e) {
                     emitter.emit_order_modify_rejected_event(
                         cmd.strategy_id,
                         cmd.instrument_id,
                         cmd.client_order_id,
                         Some(venue_order_id),
-                        &format!("Longbridge rejected modification: {error}"),
+                        &format!("Longbridge rejected modification: {e}"),
                         clock.get_time_ns(),
                     );
                 } else {
                     log::error!(
-                        "Ambiguous Longbridge modify outcome for {}: {error}; reconcile before retrying",
+                        "Ambiguous Longbridge modify outcome for {}: {e}; reconcile before retrying",
                         cmd.client_order_id,
                     );
                 }
@@ -820,22 +820,22 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("order cancellation", async move {
-            if let Err(error) = context
+            if let Err(e) = context
                 .cancel_order(CancelOrderOptions::new(venue_order_id.to_string()))
                 .await
             {
-                if is_authoritative_rejection(&error) {
+                if is_authoritative_rejection(&e) {
                     emitter.emit_order_cancel_rejected_event(
                         cmd.strategy_id,
                         cmd.instrument_id,
                         cmd.client_order_id,
                         Some(venue_order_id),
-                        &format!("Longbridge rejected cancellation: {error}"),
+                        &format!("Longbridge rejected cancellation: {e}"),
                         clock.get_time_ns(),
                     );
                 } else {
                     log::error!(
-                        "Ambiguous Longbridge cancel outcome for {}: {error}; reconcile before retrying",
+                        "Ambiguous Longbridge cancel outcome for {}: {e}; reconcile before retrying",
                         cmd.client_order_id,
                     );
                 }

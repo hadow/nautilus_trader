@@ -13,8 +13,8 @@ execution, account, position and private push APIs.
 | 10‑level depth            | Supported | Published as `OrderBookDepth10` snapshots.                                              |
 | Trades                    | Supported | The SDK does not expose aggressor side, so it is reported as unknown.                   |
 | External bars             | Supported | Only Longbridge candlestick periods and `LAST` price bars.                              |
-| Instrument definitions    | No        | Register exact definitions from a catalog or custom provider before use.                |
-| Historical market data    | No        | The current adapter slice exposes live subscriptions only.                              |
+| Instrument definitions    | Supported | Static security metadata plus explicitly configured exact price increments.             |
+| Historical bars           | Supported | Up to 1,000 unadjusted Longbridge candlesticks per request.                             |
 | Submit orders             | Supported | Market, limit, market‑if‑touched and limit‑if‑touched.                                  |
 | Modify and cancel         | Supported | A venue order ID is required.                                                           |
 | Account balances          | Supported | Currency cash records and account‑level margin requirements are aggregated by currency. |
@@ -33,29 +33,29 @@ Brokers and Longbridge route orders for cash equities. Databento supplies equity
 execute orders. Architect AX and Hyperliquid expose equity-linked perpetual derivatives, not shares
 in the underlying companies.
 
-| Adapter             | Exposure                        | Market data                          | Execution            | Instrument definitions                         |
-| ------------------- | ------------------------------- | ------------------------------------ | -------------------- | ---------------------------------------------- |
-| Interactive Brokers | Cash equities and other assets  | Live and historical                  | Broker‑routed orders | Loaded from TWS or IB Gateway contract details |
-| Databento           | US cash‑equity datasets         | Rich live and historical schemas     | Not available        | Decoded from definition records                |
-| Longbridge          | Cash equities available to user | Live quotes, depth, trades, and bars | Broker‑routed orders | Must be supplied by the application            |
-| Architect AX        | Equity‑linked perpetuals        | Derivative order book and trades     | Derivative orders    | Loaded from AX                                 |
-| Hyperliquid         | HIP‑3 equity‑linked perpetuals  | Derivative order book and trades     | Derivative orders    | Loaded from Hyperliquid                        |
+| Adapter             | Exposure                        | Market data                          | Execution            | Instrument definitions                          |
+| ------------------- | ------------------------------- | ------------------------------------ | -------------------- | ----------------------------------------------- |
+| Interactive Brokers | Cash equities and other assets  | Live and historical                  | Broker‑routed orders | Loaded from TWS or IB Gateway contract details  |
+| Databento           | US cash‑equity datasets         | Rich live and historical schemas     | Not available        | Decoded from definition records                 |
+| Longbridge          | Cash equities available to user | Live and historical bars, live ticks | Broker‑routed orders | Loaded from static security metadata and config |
+| Architect AX        | Equity‑linked perpetuals        | Derivative order book and trades     | Derivative orders    | Loaded from AX                                  |
+| Hyperliquid         | HIP‑3 equity‑linked perpetuals  | Derivative order book and trades     | Derivative orders    | Loaded from Hyperliquid                         |
 
 ### Example coverage comparison
 
-| Adapter             | Rust examples                       | Python examples                            | Equity‑relevant gap                         |
-| ------------------- | ----------------------------------- | ------------------------------------------ | ------------------------------------------- |
-| Interactive Brokers | Data and execution testers          | Testers, contract and historical downloads | Requires a running TWS or IB Gateway        |
-| Databento           | Data tester                         | Data tester and historical workflows       | No execution client                         |
-| Longbridge          | Data, paper‑execution and grid      | Data and paper‑execution testers           | No instrument‑provider or history example   |
-| Architect AX        | Data and execution testers          | Testers and strategy examples              | Trades equity‑linked derivatives, not stock |
-| Hyperliquid         | Data, execution and outcome testers | Data, execution and outcome testers        | Trades equity‑linked derivatives, not stock |
+| Adapter             | Rust examples                       | Python examples                            | Equity‑relevant gap                          |
+| ------------------- | ----------------------------------- | ------------------------------------------ | -------------------------------------------- |
+| Interactive Brokers | Data and execution testers          | Testers, contract and historical downloads | Requires a running TWS or IB Gateway         |
+| Databento           | Data tester                         | Data tester and historical workflows       | No execution client                          |
+| Longbridge          | Data, paper‑execution and grid      | Data and paper‑execution testers           | Historical quotes and trades are unavailable |
+| Architect AX        | Data and execution testers          | Testers and strategy examples              | Trades equity‑linked derivatives, not stock  |
+| Hyperliquid         | Data, execution and outcome testers | Data, execution and outcome testers        | Trades equity‑linked derivatives, not stock  |
 
 Interactive Brokers is the closest in-tree comparison because both adapters combine stock market
 data, account state, positions, reconciliation, and execution. Its instrument provider is broader
 and can resolve contract metadata dynamically. Longbridge has a simpler direct OAuth connection
-and official SDK contexts, but the current adapter requires the application to provide exact stock
-metadata before subscribing or trading.
+and official SDK contexts. Longbridge static security metadata supplies the symbol, currency and
+board lot; the application supplies the exact price increment which the OpenAPI response omits.
 
 Databento is complementary to Longbridge rather than interchangeable with it. It can provide
 high-quality US equity definitions and historical data, but symbols and venue identity must be
@@ -106,6 +106,10 @@ from nautilus_trader.adapters.longbridge import LongbridgeExecutionClientFactory
 data_config = LongbridgeDataClientConfig(
     oauth_client_id="...",
     enable_overnight=True,
+    instrument_price_increments={
+        "AAPL.US.LONGBRIDGE": "0.01",
+        "700.HK.LONGBRIDGE": "0.001",
+    },
 )
 exec_config = LongbridgeExecClientConfig(
     oauth_client_id="...",
@@ -127,11 +131,36 @@ AAPL.US.LONGBRIDGE
 700.HK.LONGBRIDGE
 ```
 
-The Longbridge static-security response includes currency and board lot size, but not a reliable
-minimum price increment across all supported security classes and markets. The adapter therefore
-does not manufacture instrument definitions. Register instruments from a catalog or a custom
-instrument provider before subscribing or submitting orders. This preserves exact validation of
-price and quantity increments instead of inferring a tick size from a recent quote.
+The Longbridge static-security response includes currency and board lot size, but not the minimum
+price increment. Configure `instrument_price_increments` with fully qualified Nautilus instrument
+IDs and exact decimal strings. Its keys define the instruments loaded on connection and returned by
+instrument requests. The adapter rejects malformed IDs, non-Longbridge venues, zero or negative
+increments, and unsupported non-equity boards; it never infers a tick size from recent prices.
+
+For example:
+
+```python
+data_config = LongbridgeDataClientConfig(
+    instrument_price_increments={
+        "AAPL.US.LONGBRIDGE": "0.01",
+        "700.HK.LONGBRIDGE": "0.001",
+    },
+)
+```
+
+Definitions use the exact configured price increment and the broker-reported currency and board
+lot. Board lot is recorded as `lot_size`, not as `min_quantity`, because odd-lot eligibility can
+differ by market and order side.
+
+## Historical bars
+
+`RequestBars` supports the same external `LAST` intervals as live candlesticks. Requests use
+unadjusted prices and all enabled Longbridge trading sessions. Returned bars are sorted,
+deduplicated, and filtered to the inclusive UTC `start` and `end` bounds.
+
+The Longbridge endpoint returns at most 1,000 candlesticks, so `limit` must be between 1 and 1,000;
+an omitted limit requests 1,000. Historical quote ticks, trades and order-book data are not exposed
+by this adapter.
 
 ## Execution semantics
 

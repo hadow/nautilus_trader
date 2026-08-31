@@ -37,11 +37,7 @@ fn extract_data_factory(
     factory
         .extract::<LongbridgeDataClientFactory>(py)
         .map(|factory| Box::new(factory) as Box<dyn DataClientFactory>)
-        .map_err(|error| {
-            to_pyvalue_err(format!(
-                "Failed to extract Longbridge data factory: {error}"
-            ))
-        })
+        .map_err(|e| to_pyvalue_err(format!("Failed to extract Longbridge data factory: {e}")))
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -52,9 +48,9 @@ fn extract_exec_factory(
     factory
         .extract::<LongbridgeExecutionClientFactory>(py)
         .map(|factory| Box::new(factory) as Box<dyn ExecutionClientFactory>)
-        .map_err(|error| {
+        .map_err(|e| {
             to_pyvalue_err(format!(
-                "Failed to extract Longbridge execution factory: {error}"
+                "Failed to extract Longbridge execution factory: {e}"
             ))
         })
 }
@@ -64,9 +60,7 @@ fn extract_data_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn Cl
     config
         .extract::<LongbridgeDataClientConfig>(py)
         .map(|config| Box::new(config) as Box<dyn ClientConfig>)
-        .map_err(|error| {
-            to_pyvalue_err(format!("Failed to extract Longbridge data config: {error}"))
-        })
+        .map_err(|e| to_pyvalue_err(format!("Failed to extract Longbridge data config: {e}")))
 }
 
 #[expect(clippy::needless_pass_by_value)]
@@ -74,9 +68,9 @@ fn extract_exec_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn Cl
     config
         .extract::<LongbridgeExecClientConfig>(py)
         .map(|config| Box::new(config) as Box<dyn ClientConfig>)
-        .map_err(|error| {
+        .map_err(|e| {
             to_pyvalue_err(format!(
-                "Failed to extract Longbridge execution config: {error}"
+                "Failed to extract Longbridge execution config: {e}"
             ))
         })
 }
@@ -99,16 +93,14 @@ pub fn longbridge(_: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     let registry = get_global_pyo3_registry();
     registry
         .register_factory_extractor(LONGBRIDGE.to_string(), extract_data_factory)
-        .map_err(|error| {
-            to_pyruntime_err(format!(
-                "Failed to register Longbridge data factory: {error}"
-            ))
+        .map_err(|e| {
+            to_pyruntime_err(format!("Failed to register Longbridge data factory: {e}"))
         })?;
     registry
         .register_exec_factory_extractor(LONGBRIDGE.to_string(), extract_exec_factory)
-        .map_err(|error| {
+        .map_err(|e| {
             to_pyruntime_err(format!(
-                "Failed to register Longbridge execution factory: {error}"
+                "Failed to register Longbridge execution factory: {e}"
             ))
         })?;
     registry
@@ -116,19 +108,15 @@ pub fn longbridge(_: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
             "LongbridgeDataClientConfig".to_string(),
             extract_data_config,
         )
-        .map_err(|error| {
-            to_pyruntime_err(format!(
-                "Failed to register Longbridge data config: {error}"
-            ))
-        })?;
+        .map_err(|e| to_pyruntime_err(format!("Failed to register Longbridge data config: {e}")))?;
     registry
         .register_config_extractor(
             "LongbridgeExecClientConfig".to_string(),
             extract_exec_config,
         )
-        .map_err(|error| {
+        .map_err(|e| {
             to_pyruntime_err(format!(
-                "Failed to register Longbridge execution config: {error}"
+                "Failed to register Longbridge execution config: {e}"
             ))
         })?;
     Ok(())
