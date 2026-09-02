@@ -75,6 +75,8 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-backtest = { workspace = true }
+nautilus-indicators = { workspace = true }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
@@ -97,6 +99,18 @@ doc = false
 [[example]]
 name = "longbridge-grid-mm"
 path = "examples/node_grid_mm.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-range-fakeout-backtest"
+path = "examples/node_range_fakeout_backtest.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-slc-trader"
+path = "examples/node_slc_trader.rs"
 required-features = ["examples"]
 doc = false
 
