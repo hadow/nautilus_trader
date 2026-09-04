@@ -186,7 +186,7 @@ where
     call.await
 }
 
-const QUOTE_CONNECTION_HELD: AtomicBool = AtomicBool::new(false);
+static QUOTE_CONNECTION_HELD: AtomicBool = AtomicBool::new(false);
 
 /// Process-local guard for Longbridge's single quote WebSocket connection rule.
 ///
