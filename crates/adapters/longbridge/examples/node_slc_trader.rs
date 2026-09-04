@@ -228,8 +228,8 @@ impl AppConfig {
         let daily_loss_limit = env_parse("LONGBRIDGE_SLC_DAILY_LOSS_LIMIT", "50")?;
         let max_open_risk = env_parse("LONGBRIDGE_SLC_MAX_OPEN_RISK", "50")?;
         let max_account_notional = env_parse("LONGBRIDGE_SLC_MAX_ACCOUNT_NOTIONAL", "5000")?;
-        let max_open_positions = env_parse("LONGBRIDGE_SLC_MAX_OPEN_POSITIONS", "1")?;
-        let max_order_quantity = env_parse("LONGBRIDGE_SLC_MAX_ORDER_QUANTITY", "5")?;
+        let max_open_positions = env_parse("LONGBRIDGE_SLC_MAX_OPEN_POSITIONS", "10")?;
+        let max_order_quantity = env_parse("LONGBRIDGE_SLC_MAX_ORDER_QUANTITY", "50")?;
         let max_order_notional = env_parse("LONGBRIDGE_SLC_MAX_ORDER_NOTIONAL", "5000")?;
         let max_entry_slippage_ticks = env_parse("LONGBRIDGE_SLC_MAX_ENTRY_SLIPPAGE_TICKS", "5")?;
         let risk_reward = env_parse("LONGBRIDGE_SLC_RISK_REWARD", "2")?;
@@ -338,9 +338,9 @@ impl AppConfig {
             entry_end_minute: env_time("LONGBRIDGE_SLC_ENTRY_END", "15:30")?,
             flatten_before_close_minutes: env_parse(
                 "LONGBRIDGE_SLC_FLATTEN_BEFORE_CLOSE_MINUTES",
-                "5",
+                "10",
             )?,
-            max_trades_per_day: env_parse("LONGBRIDGE_SLC_MAX_TRADES_PER_DAY", "1")?,
+            max_trades_per_day: env_parse("LONGBRIDGE_SLC_MAX_TRADES_PER_DAY", "20")?,
         };
         session.validate()?;
         let default_risk_state_path = if papertrading {
