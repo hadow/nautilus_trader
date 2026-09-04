@@ -3,10 +3,46 @@
 symbol = "QQQ.US"
 price_increment = "0.01"
 
-# [[symbols]]
-# symbol = "AAPL.US"
-# price_increment = "0.01"
+[[symbols]]
+symbol = "AAPL.US"
+price_increment = "0.01"
 
-# [[symbols]]
-# symbol = "MSFT.US"
-# price_increment = "0.01"
+[[symbols]]
+symbol = "MSFT.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "NVDA.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "AMD.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "U.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "TTWO.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "TME.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "BA.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "INTU.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "CRCL.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "TSLA.US"
+price_increment = "0.01"

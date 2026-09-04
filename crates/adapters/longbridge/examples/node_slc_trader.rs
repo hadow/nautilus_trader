@@ -316,8 +316,8 @@ impl AppConfig {
             "stochastic thresholds must satisfy 0 < oversold < overbought < 100",
         );
 
-        let five_minute_warmup = env_parse("LONGBRIDGE_SLC_5M_WARMUP", "500")?;
-        let four_hour_warmup = env_parse("LONGBRIDGE_SLC_4H_WARMUP", "100")?;
+        let five_minute_warmup = env_parse("LONGBRIDGE_SLC_5M_WARMUP", "100")?;
+        let four_hour_warmup = env_parse("LONGBRIDGE_SLC_4H_WARMUP", "10")?;
         let minimum_five_minute_warmup = atr_period.max(
             stochastic_k_period
                 .saturating_add(stochastic_k_smoothing)
