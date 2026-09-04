@@ -26,6 +26,22 @@ The SDK execution record does not expose commission or liquidity side. Fill repo
 zero commission in the order currency and `NO_LIQUIDITY_SIDE`; downstream accounting should replace
 these values from a broker statement if exact fee reconciliation is required.
 
+## API limits
+
+The adapter applies process-wide Longbridge limits across every client instance:
+
+- quote calls are limited to 10 per rolling second and five concurrent requests;
+- only one quote connection can be held in a process;
+- a quote connection reserves at most 500 unique symbols, with multiple data types for one symbol
+  counting once;
+- trade calls are limited to 30 per rolling 30 seconds and start at least 20 milliseconds apart.
+
+Subscription slots are conservatively retained until the data client is reset, preventing an
+asynchronous unsubscribe followed by a subscribe from briefly exceeding 500 server-side symbols.
+The guards cannot coordinate separate operating-system processes; do not run multiple nodes with
+the same Longbridge account unless an external process supervisor enforces the account-wide limits.
+See the [official Longbridge rate limits](https://open.longbridge.com/docs#rate-limit).
+
 ## Equity adapter comparison
 
 The in-tree adapters expose three materially different forms of equity access. Only Interactive
@@ -156,7 +172,8 @@ differ by market and order side.
 
 `RequestBars` supports the same external `LAST` intervals as live candlesticks. Requests use
 unadjusted prices and all enabled Longbridge trading sessions. Returned bars are sorted,
-deduplicated, and filtered to the inclusive UTC `start` and `end` bounds.
+deduplicated, and filtered to the inclusive UTC `start` and `end` bounds. Requests with an `end`
+use a backward offset query so the provider-side count is anchored to that boundary.
 
 The Longbridge endpoint returns at most 1,000 candlesticks, so `limit` must be between 1 and 1,000;
 an omitted limit requests 1,000. Historical quote ticks, trades and order-book data are not exposed

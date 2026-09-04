@@ -30,17 +30,34 @@ session times, size and risk parameters. The signal is confirmed at bar close an
 fills no earlier than the next bar, so gaps and intrabar ordering remain conservative OHLC
 assumptions rather than tick-level simulation.
 
-The SLC trader is a parameterized, bar-only live strategy for US equities. It defaults to `QQQ.US`
-in Longbridge paper trading, risks at most USD 25 and five shares per entry, allows one trade per
-day, submits a market-if-touched protective stop for every entry fill, and starts a cancel-then-close
-exit when a completed 5-minute bar closes beyond the signal-close-based 2R target or reaches the
-pre-close cutoff. It requires realtime candlestick pushes; confirmed-only pushes would add a bar of
-latency. Live routing requires both
+The SLC trader is a parameterized, bar-signal live strategy for US equities. Configure its symbols
+and exact price increments in [`examples/slc_symbols.toml`](examples/slc_symbols.toml), or point
+`LONGBRIDGE_SLC_CONFIG_PATH` at another TOML file. It defaults to Longbridge paper trading and one
+trade per symbol per day. Fresh and once-broken/reclaimed levels are retained in bounded per-side
+collections, and stochastic periods and confirmation windows are configurable. Entry orders are
+one-bar marketable limits sized from their worst allowed price. Every fill receives a
+market-if-touched protective stop, and its 2R target is recalculated from average fill price.
+Executable top-of-book quotes trigger the cancel-then-close target exit immediately; completed
+5-minute bars remain a conservative fallback. It requires realtime candlestick pushes;
+confirmed-only pushes would add a bar of signal latency.
+
+All per-symbol strategies share a persisted SLC-owned risk ledger. Defaults cap open risk at USD 50,
+account notional at USD 5,000, simultaneous entries or positions at one, and realized daily loss at
+USD 50. Manual trades and positions owned by other strategies are outside this ledger, so use an
+isolated account. Override these with `LONGBRIDGE_SLC_MAX_OPEN_RISK`,
+`LONGBRIDGE_SLC_MAX_ACCOUNT_NOTIONAL`, `LONGBRIDGE_SLC_MAX_OPEN_POSITIONS`, and
+`LONGBRIDGE_SLC_DAILY_LOSS_LIMIT`. `LONGBRIDGE_SLC_RISK_STATE_PATH` selects the state file; paper and
+live routing use separate files under `target/` by default. Corrupt state prevents startup, and a
+restart retains daily trade counts, realized P&L, and conservative open-risk reservations.
+
+At INFO level it reports per-symbol warmup counts, finalized 5-minute OHLCV and indicators, 4-hour
+structure trends, active zone counts, data readiness, account risk, orders, exits and realized P&L.
+Live routing requires both
 `LONGBRIDGE_SLC_PAPERTRADING=false` and
-`LONGBRIDGE_SLC_LIVE_ACK=I_UNDERSTAND_LIVE_ORDERS`. A restart resets the in-memory daily counters and
-flattens reconciled strategy exposure before accepting new entries. Paper-test the strategy and
-inspect the broker account after every shutdown; profitability and a flat shutdown state cannot be
-guaranteed.
+`LONGBRIDGE_SLC_LIVE_ACK=I_UNDERSTAND_LIVE_ORDERS`. Reconciled strategy exposure is flattened before
+new entries are accepted, and managed stop keeps reconciling orders and positions during shutdown.
+Paper-test the strategy and inspect the broker account after every shutdown; profitability and a
+flat shutdown state cannot be guaranteed.
 
 Python tester nodes are available in
 [`examples/live/longbridge`](../../../examples/live/longbridge). The tester examples register an

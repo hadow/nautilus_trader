@@ -1,0 +1,12 @@
+# Longbridge symbols traded by the SLC example. Add one table per US equity.
+[[symbols]]
+symbol = "QQQ.US"
+price_increment = "0.01"
+
+# [[symbols]]
+# symbol = "AAPL.US"
+# price_increment = "0.01"
+
+# [[symbols]]
+# symbol = "MSFT.US"
+# price_increment = "0.01"

@@ -17,6 +17,7 @@
 
 use std::{
     fmt::Debug,
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -32,7 +33,7 @@ use longbridge::quote::{
 };
 use nautilus_common::{
     clients::DataClient,
-    live::{get_runtime, runner::get_data_event_sender},
+    live::{get_runtime, runner::get_data_event_sender, task::TaskHandles},
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -54,7 +55,7 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
-use time::{Date, Month};
+use time::{Date, Month, PrimitiveDateTime, Time};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -64,6 +65,10 @@ use crate::{
         parse::{
             instrument_id, parse_bar, parse_depth, parse_instrument, parse_trades,
             period_from_bar_type,
+        },
+        rate_limit::{
+            MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, quote_api_call,
+            try_acquire_quote_connection,
         },
     },
     config::LongbridgeDataClientConfig,
@@ -75,6 +80,21 @@ struct SubscriptionState {
     depth10: AHashSet<InstrumentId>,
     trades: AHashSet<InstrumentId>,
     bars: AHashMap<(String, i32), BarType>,
+    // ponytail: Retain slots until reset to avoid async unsubscribe/subscribe races exceeding 500;
+    // reclaim after confirmed unsubscriptions if rotating through more than 500 symbols is needed.
+    reserved_symbols: AHashSet<String>,
+}
+
+impl SubscriptionState {
+    fn reserve_subscription(&mut self, symbol: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.reserved_symbols.contains(symbol)
+                || self.reserved_symbols.len() < MAX_QUOTE_SUBSCRIPTION_SYMBOLS,
+            "Longbridge cannot subscribe to more than {MAX_QUOTE_SUBSCRIPTION_SYMBOLS} unique symbols",
+        );
+        self.reserved_symbols.insert(symbol.to_string());
+        Ok(())
+    }
 }
 
 /// Longbridge live data client.
@@ -82,7 +102,9 @@ pub struct LongbridgeDataClient {
     client_id: ClientId,
     config: LongbridgeDataClientConfig,
     context: Option<QuoteContext>,
+    connection_guard: Option<QuoteConnectionGuard>,
     stream_handle: Option<JoinHandle<()>>,
+    pending_tasks: TaskHandles,
     cancellation_token: CancellationToken,
     subscriptions: Arc<Mutex<SubscriptionState>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -96,6 +118,7 @@ impl Debug for LongbridgeDataClient {
             .field("client_id", &self.client_id)
             .field("config", &self.config)
             .field("has_context", &self.context.is_some())
+            .field("holds_quote_connection", &self.connection_guard.is_some())
             .field("connected", &self.is_connected())
             .finish_non_exhaustive()
     }
@@ -109,7 +132,9 @@ impl LongbridgeDataClient {
             client_id,
             config,
             context: None,
+            connection_guard: None,
             stream_handle: None,
+            pending_tasks: TaskHandles::default(),
             cancellation_token: CancellationToken::new(),
             subscriptions: Arc::new(Mutex::new(SubscriptionState::default())),
             data_sender: get_data_event_sender(),
@@ -128,15 +153,23 @@ impl LongbridgeDataClient {
     where
         F: Future<Output = longbridge::Result<()>> + Send + 'static,
     {
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             if let Err(e) = future.await {
                 log::error!("Longbridge {description} failed: {e}");
             }
         });
     }
 
+    fn spawn_task<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.pending_tasks.push(get_runtime().spawn(future));
+    }
+
     fn terminate_stream(&mut self) {
         self.cancellation_token.cancel();
+        self.pending_tasks.abort_all();
 
         if let Some(handle) = self.stream_handle.take() {
             handle.abort();
@@ -146,7 +179,11 @@ impl LongbridgeDataClient {
     }
 }
 
-use std::future::Future;
+impl Drop for LongbridgeDataClient {
+    fn drop(&mut self) {
+        self.terminate_stream();
+    }
+}
 
 const MAX_HISTORICAL_BARS: usize = 1_000;
 const MAX_STATIC_INFO_SYMBOLS: usize = 500;
@@ -164,8 +201,7 @@ async fn load_instruments(
             .iter()
             .map(|id| id.symbol.as_str().to_string())
             .collect::<Vec<_>>();
-        let static_info = context
-            .static_info(symbols)
+        let static_info = quote_api_call(context.static_info(symbols))
             .await
             .context("failed to request Longbridge static security info")?;
 
@@ -187,6 +223,10 @@ async fn load_instruments(
 }
 
 fn history_date(symbol: &str, value: UnixNanos) -> anyhow::Result<Date> {
+    Ok(history_datetime(symbol, value)?.date())
+}
+
+fn history_datetime(symbol: &str, value: UnixNanos) -> anyhow::Result<PrimitiveDateTime> {
     let timezone_name = match symbol.rsplit_once('.').map(|(_, market)| market) {
         Some("US") => "America/New_York",
         Some("HK") => "Asia/Hong_Kong",
@@ -195,12 +235,20 @@ fn history_date(symbol: &str, value: UnixNanos) -> anyhow::Result<Date> {
         _ => anyhow::bail!("unsupported Longbridge market suffix in {symbol}"),
     };
     let timestamp = Timestamp::from_nanosecond(i128::from(value.as_u64()))?;
-    let date = timestamp.to_zoned(get_timezone(timezone_name)?).date();
-    Ok(Date::from_calendar_date(
-        i32::from(date.year()),
-        Month::try_from(u8::try_from(date.month())?)?,
-        u8::try_from(date.day())?,
-    )?)
+    let local = timestamp.to_zoned(get_timezone(timezone_name)?);
+    let date = local.date();
+    Ok(PrimitiveDateTime::new(
+        Date::from_calendar_date(
+            i32::from(date.year()),
+            Month::try_from(u8::try_from(date.month())?)?,
+            u8::try_from(date.day())?,
+        )?,
+        Time::from_hms(
+            u8::try_from(local.hour())?,
+            u8::try_from(local.minute())?,
+            0,
+        )?,
+    ))
 }
 
 fn validate_historical_bar_request(
@@ -234,31 +282,40 @@ async fn request_historical_bars(
 ) -> anyhow::Result<Vec<Bar>> {
     let period = validate_historical_bar_request(bar_type, start, end, limit)?;
     let symbol = bar_type.instrument_id().symbol.as_str().to_string();
-    let candlesticks = if start.is_none() && end.is_none() {
-        context
-            .candlesticks(
-                symbol,
-                period,
-                limit,
-                AdjustType::NoAdjust,
-                TradeSessions::All,
-            )
-            .await?
+    let candlesticks = if let Some(end) = end {
+        let end = history_datetime(&symbol, end)?;
+        quote_api_call(context.history_candlesticks_by_offset(
+            symbol,
+            period,
+            AdjustType::NoAdjust,
+            false,
+            Some(end),
+            limit,
+            TradeSessions::All,
+        ))
+        .await?
+    } else if start.is_none() {
+        quote_api_call(context.candlesticks(
+            symbol,
+            period,
+            limit,
+            AdjustType::NoAdjust,
+            TradeSessions::All,
+        ))
+        .await?
     } else {
         let start_date = start
             .map(|value| history_date(&symbol, value))
             .transpose()?;
-        let end_date = end.map(|value| history_date(&symbol, value)).transpose()?;
-        context
-            .history_candlesticks_by_date(
-                symbol,
-                period,
-                AdjustType::NoAdjust,
-                start_date,
-                end_date,
-                TradeSessions::All,
-            )
-            .await?
+        quote_api_call(context.history_candlesticks_by_date(
+            symbol,
+            period,
+            AdjustType::NoAdjust,
+            start_date,
+            None,
+            TradeSessions::All,
+        ))
+        .await?
     };
 
     let mut bars = candlesticks
@@ -324,9 +381,14 @@ impl DataClient for LongbridgeDataClient {
 
         self.cancellation_token = CancellationToken::new();
         let sdk_config = self.config.sdk_config().await?;
+        let connection_guard = if let Some(guard) = self.connection_guard.take() {
+            guard
+        } else {
+            try_acquire_quote_connection()
+                .context("only one Longbridge quote connection is allowed per process")?
+        };
         let (context, mut receiver) = QuoteContext::new(sdk_config);
-        context
-            .subscriptions()
+        quote_api_call(context.subscriptions())
             .await
             .context("failed to establish Longbridge quote session")?;
 
@@ -427,6 +489,7 @@ impl DataClient for LongbridgeDataClient {
         }));
 
         self.context = Some(context);
+        self.connection_guard = Some(connection_guard);
         self.connected.store(true, Ordering::Release);
         log::info!("Connected Longbridge data client {}", self.client_id);
         Ok(())
@@ -449,7 +512,7 @@ impl DataClient for LongbridgeDataClient {
         let instrument_ids = config.instrument_ids()?;
         let sender = self.data_sender.clone();
         let clock = self.clock;
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             match load_instruments(&context, &config, &instrument_ids, clock.get_time_ns()).await {
                 Ok(instruments) => {
                     for instrument in instruments {
@@ -472,7 +535,7 @@ impl DataClient for LongbridgeDataClient {
         config.price_increment(cmd.instrument_id)?;
         let sender = self.data_sender.clone();
         let clock = self.clock;
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             match load_instruments(&context, &config, &[cmd.instrument_id], clock.get_time_ns())
                 .await
             {
@@ -496,6 +559,7 @@ impl DataClient for LongbridgeDataClient {
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let context = self.context()?;
         let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+        state.reserve_subscription(cmd.instrument_id.symbol.as_str())?;
         let already_active = state.depth10.contains(&cmd.instrument_id);
         let inserted = state.quotes.insert(cmd.instrument_id);
         drop(state);
@@ -505,7 +569,7 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("quote subscription", async move {
-            context.subscribe([symbol], SubFlags::DEPTH).await
+            quote_api_call(context.subscribe([symbol], SubFlags::DEPTH)).await
         });
         Ok(())
     }
@@ -513,6 +577,7 @@ impl DataClient for LongbridgeDataClient {
     fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
         let context = self.context()?;
         let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+        state.reserve_subscription(cmd.instrument_id.symbol.as_str())?;
         let already_active = state.quotes.contains(&cmd.instrument_id);
         let inserted = state.depth10.insert(cmd.instrument_id);
         drop(state);
@@ -522,26 +587,24 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("depth subscription", async move {
-            context.subscribe([symbol], SubFlags::DEPTH).await
+            quote_api_call(context.subscribe([symbol], SubFlags::DEPTH)).await
         });
         Ok(())
     }
 
     fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let context = self.context()?;
-        let inserted = self
-            .subscriptions
-            .lock()
-            .expect(MUTEX_POISONED)
-            .trades
-            .insert(cmd.instrument_id);
+        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+        state.reserve_subscription(cmd.instrument_id.symbol.as_str())?;
+        let inserted = state.trades.insert(cmd.instrument_id);
+        drop(state);
 
         if !inserted {
             return Ok(());
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("trade subscription", async move {
-            context.subscribe([symbol], SubFlags::TRADE).await
+            quote_api_call(context.subscribe([symbol], SubFlags::TRADE)).await
         });
         Ok(())
     }
@@ -550,19 +613,18 @@ impl DataClient for LongbridgeDataClient {
         let context = self.context()?;
         let period = period_from_bar_type(cmd.bar_type)?;
         let symbol = cmd.bar_type.instrument_id().symbol.as_str().to_string();
-        let previous = self
-            .subscriptions
-            .lock()
-            .expect(MUTEX_POISONED)
+        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+        state.reserve_subscription(&symbol)?;
+        let previous = state
             .bars
             .insert((symbol.clone(), period as i32), cmd.bar_type);
+        drop(state);
 
         if previous.is_some() {
             return Ok(());
         }
         self.spawn_result("bar subscription", async move {
-            context
-                .subscribe_candlesticks(symbol, period, TradeSessions::All)
+            quote_api_call(context.subscribe_candlesticks(symbol, period, TradeSessions::All))
                 .await
                 .map(|_| ())
         });
@@ -579,7 +641,7 @@ impl DataClient for LongbridgeDataClient {
         if removed && !retain_depth {
             let symbol = cmd.instrument_id.symbol.as_str().to_string();
             self.spawn_result("quote unsubscription", async move {
-                context.unsubscribe([symbol], SubFlags::DEPTH).await
+                quote_api_call(context.unsubscribe([symbol], SubFlags::DEPTH)).await
             });
         }
         Ok(())
@@ -595,7 +657,7 @@ impl DataClient for LongbridgeDataClient {
         if removed && !retain_depth {
             let symbol = cmd.instrument_id.symbol.as_str().to_string();
             self.spawn_result("depth unsubscription", async move {
-                context.unsubscribe([symbol], SubFlags::DEPTH).await
+                quote_api_call(context.unsubscribe([symbol], SubFlags::DEPTH)).await
             });
         }
         Ok(())
@@ -615,7 +677,7 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("trade unsubscription", async move {
-            context.unsubscribe([symbol], SubFlags::TRADE).await
+            quote_api_call(context.unsubscribe([symbol], SubFlags::TRADE)).await
         });
         Ok(())
     }
@@ -635,7 +697,7 @@ impl DataClient for LongbridgeDataClient {
             return Ok(());
         }
         self.spawn_result("bar unsubscription", async move {
-            context.unsubscribe_candlesticks(symbol, period).await
+            quote_api_call(context.unsubscribe_candlesticks(symbol, period)).await
         });
         Ok(())
     }
@@ -656,7 +718,7 @@ impl DataClient for LongbridgeDataClient {
         let end = datetime_to_unix_nanos(request.end);
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             match load_instruments(&context, &config, &instrument_ids, clock.get_time_ns()).await {
                 Ok(instruments) => {
                     let response = DataResponse::Instruments(InstrumentsResponse::new(
@@ -690,7 +752,7 @@ impl DataClient for LongbridgeDataClient {
         let end = datetime_to_unix_nanos(request.end);
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             match load_instruments(
                 &context,
                 &config,
@@ -739,7 +801,7 @@ impl DataClient for LongbridgeDataClient {
         let client_id = request.client_id.unwrap_or(self.client_id);
         let clock = self.clock;
 
-        get_runtime().spawn(async move {
+        self.spawn_task(async move {
             match request_historical_bars(
                 context,
                 request.bar_type,
@@ -783,7 +845,7 @@ mod tests {
         enums::{AggregationSource, BarAggregation, PriceType},
     };
     use rstest::rstest;
-    use time::macros::{date, datetime};
+    use time::macros::{date, datetime, time};
 
     use super::*;
     use crate::common::parse::instrument_id;
@@ -836,5 +898,20 @@ mod tests {
             history_date("700.HK", timestamp).unwrap(),
             date!(2026 - 01 - 01)
         );
+        assert_eq!(
+            history_datetime("AAPL.US", timestamp).unwrap().time(),
+            time!(20:00)
+        );
+    }
+
+    #[rstest]
+    fn test_subscription_limit_counts_unique_symbols() {
+        let mut state = SubscriptionState::default();
+        for index in 0..crate::common::rate_limit::MAX_QUOTE_SUBSCRIPTION_SYMBOLS {
+            state.reserve_subscription(&format!("{index}.US")).unwrap();
+        }
+
+        assert!(state.reserve_subscription("0.US").is_ok());
+        assert!(state.reserve_subscription("OVER.US").is_err());
     }
 }

@@ -17,5 +17,3 @@
 
 pub mod consts;
 pub mod parse;
-#[doc(hidden)]
-pub mod rate_limit;

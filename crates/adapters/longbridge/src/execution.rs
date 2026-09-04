@@ -70,6 +70,7 @@ use crate::{
             parse_position_status_report, to_longbridge_order_side, to_longbridge_order_type,
             to_longbridge_time_in_force,
         },
+        rate_limit::trade_api_call,
     },
     config::LongbridgeExecClientConfig,
 };
@@ -303,7 +304,7 @@ async fn fetch_orders(
     if let Some(symbol) = &symbol {
         today_options = today_options.symbol(symbol);
     }
-    let mut orders = context.today_orders(today_options).await?;
+    let mut orders = trade_api_call(context.today_orders(today_options)).await?;
 
     if !open_only {
         let mut history_options = GetHistoryOrdersOptions::new();
@@ -318,7 +319,7 @@ async fn fetch_orders(
         if let Some(end) = end {
             history_options = history_options.end_at(offset_datetime(end)?);
         }
-        orders.extend(context.history_orders(history_options).await?);
+        orders.extend(trade_api_call(context.history_orders(history_options)).await?);
     }
 
     let mut seen = AHashSet::new();
@@ -356,7 +357,7 @@ async fn fetch_executions(
     if let Some(symbol) = &symbol {
         today_options = today_options.symbol(symbol);
     }
-    let mut executions = context.today_executions(today_options).await?;
+    let mut executions = trade_api_call(context.today_executions(today_options)).await?;
 
     let mut history_options = GetHistoryExecutionsOptions::new();
     if let Some(symbol) = &symbol {
@@ -370,7 +371,7 @@ async fn fetch_executions(
     if let Some(end) = end {
         history_options = history_options.end_at(offset_datetime(end)?);
     }
-    executions.extend(context.history_executions(history_options).await?);
+    executions.extend(trade_api_call(context.history_executions(history_options)).await?);
 
     let mut seen = AHashSet::new();
     executions.retain(|execution| seen.insert(execution.trade_id.clone()));
@@ -455,12 +456,11 @@ impl ExecutionClient for LongbridgeExecutionClient {
         }
         let sdk_config = self.config.sdk_config().await?;
         let (context, mut receiver) = TradeContext::new(sdk_config);
-        context
-            .subscribe([TopicType::Private])
+        trade_api_call(context.subscribe([TopicType::Private]))
             .await
             .context("failed to subscribe to Longbridge private trade stream")?;
 
-        let account_balances = context.account_balance(None).await?;
+        let account_balances = trade_api_call(context.account_balance(None)).await?;
         let (balances, margins) = parse_account_state(&account_balances)?;
         self.emitter.try_emit_account_state(
             balances,
@@ -482,7 +482,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
             while let Some(event) = receiver.recv().await {
                 let PushEvent::OrderChanged(update) = event;
                 let options = GetTodayOrdersOptions::new().order_id(update.order_id.clone());
-                let order = match task_context.today_orders(options).await {
+                let order = match trade_api_call(task_context.today_orders(options)).await {
                     Ok(orders) => orders.into_iter().find(|order| order.order_id == update.order_id),
                     Err(e) => {
                         log::warn!("Failed to refresh Longbridge pushed order {}: {e}", update.order_id);
@@ -515,7 +515,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
                 }
 
                 let execution_options = GetTodayExecutionsOptions::new().order_id(order.order_id.clone());
-                match task_context.today_executions(execution_options).await {
+                match trade_api_call(task_context.today_executions(execution_options)).await {
                     Ok(executions) => {
                         for execution in executions {
                             let is_new = seen_trade_ids
@@ -577,7 +577,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("account query", async move {
-            let response = context.account_balance(None).await?;
+            let response = trade_api_call(context.account_balance(None)).await?;
             let (balances, margins) = parse_account_state(&response)?;
             emitter.try_emit_account_state(balances, margins, true, clock.get_time_ns(), None)?;
             Ok(())
@@ -710,7 +710,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("order submission", async move {
-            match context.submit_order(options).await {
+            match trade_api_call(context.submit_order(options)).await {
                 Ok(response) => {
                     let venue_order_id = VenueOrderId::from(response.order_id.as_str());
                     contexts
@@ -782,7 +782,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("order modification", async move {
-            if let Err(e) = context.replace_order(options).await {
+            if let Err(e) = trade_api_call(context.replace_order(options)).await {
                 if is_authoritative_rejection(&e) {
                     emitter.emit_order_modify_rejected_event(
                         cmd.strategy_id,
@@ -820,9 +820,10 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("order cancellation", async move {
-            if let Err(e) = context
-                .cancel_order(CancelOrderOptions::new(venue_order_id.to_string()))
-                .await
+            if let Err(e) = trade_api_call(
+                context.cancel_order(CancelOrderOptions::new(venue_order_id.to_string())),
+            )
+            .await
             {
                 if is_authoritative_rejection(&e) {
                     emitter.emit_order_cancel_rejected_event(
@@ -850,9 +851,9 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         let requested_side = cmd.order_side;
         self.spawn_task("cancel all orders", async move {
-            let orders = context
-                .today_orders(GetTodayOrdersOptions::new().symbol(symbol))
-                .await?;
+            let orders =
+                trade_api_call(context.today_orders(GetTodayOrdersOptions::new().symbol(symbol)))
+                    .await?;
 
             for order in orders {
                 if requested_side != OrderSide::NoOrderSide
@@ -871,7 +872,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
                 ) {
                     continue;
                 }
-                context.cancel_order(order.order_id).await?;
+                trade_api_call(context.cancel_order(order.order_id)).await?;
             }
             Ok(())
         });
@@ -991,8 +992,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let options = cmd.instrument_id.map(|instrument_id| {
             GetStockPositionsOptions::new().symbols([instrument_id.symbol.as_str()])
         });
-        context
-            .stock_positions(options)
+        trade_api_call(context.stock_positions(options))
             .await?
             .channels
             .iter()

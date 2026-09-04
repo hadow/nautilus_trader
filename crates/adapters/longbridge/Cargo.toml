@@ -83,6 +83,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 nautilus-trading = { workspace = true }
 
 rstest = { workspace = true }
+toml = { workspace = true, features = ["display"] }
 
 [[example]]
 name = "longbridge-data-tester"
