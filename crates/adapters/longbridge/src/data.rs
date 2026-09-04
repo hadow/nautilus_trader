@@ -282,7 +282,19 @@ async fn request_historical_bars(
 ) -> anyhow::Result<Vec<Bar>> {
     let period = validate_historical_bar_request(bar_type, start, end, limit)?;
     let symbol = bar_type.instrument_id().symbol.as_str().to_string();
-    let candlesticks = if let Some(end) = end {
+    let candlesticks = if let (Some(start), Some(end)) = (start, end) {
+        let start_date = history_date(&symbol, start)?;
+        let end_date = history_date(&symbol, end)?;
+        quote_api_call(context.history_candlesticks_by_date(
+            symbol,
+            period,
+            AdjustType::NoAdjust,
+            Some(start_date),
+            Some(end_date),
+            TradeSessions::All,
+        ))
+        .await?
+    } else if let Some(end) = end {
         let end = history_datetime(&symbol, end)?;
         quote_api_call(context.history_candlesticks_by_offset(
             symbol,
