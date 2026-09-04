@@ -272,7 +272,7 @@ impl AppConfig {
         );
         anyhow::ensure!(risk_reward > Decimal::ZERO, "risk reward must be positive");
 
-        let atr_period = env_parse("LONGBRIDGE_SLC_ATR_PERIOD", "14")?;
+        let atr_period: usize = env_parse("LONGBRIDGE_SLC_ATR_PERIOD", "14")?;
         let displacement_atr_multiple = env_parse("LONGBRIDGE_SLC_DISPLACEMENT_ATR", "1.5")?;
         let displacement_close_fraction =
             env_parse("LONGBRIDGE_SLC_DISPLACEMENT_CLOSE_FRACTION", "0.25")?;
@@ -280,7 +280,7 @@ impl AppConfig {
         let zone_ttl_bars = env_parse("LONGBRIDGE_SLC_ZONE_TTL_BARS", "78")?;
         let max_zones_per_side = env_parse("LONGBRIDGE_SLC_MAX_ZONES_PER_SIDE", "3")?;
         let confirmation_window_bars = env_parse("LONGBRIDGE_SLC_CONFIRMATION_WINDOW_BARS", "3")?;
-        let stochastic_k_period = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_PERIOD", "5")?;
+        let stochastic_k_period: usize = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_PERIOD", "5")?;
         let stochastic_k_smoothing = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_SMOOTHING", "3")?;
         let stochastic_d_period = env_parse("LONGBRIDGE_SLC_STOCHASTIC_D_PERIOD", "3")?;
         let oversold = env_parse("LONGBRIDGE_SLC_OVERSOLD", "20")?;
