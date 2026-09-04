@@ -33,7 +33,8 @@ const QUOTE_WINDOW: Duration = Duration::from_secs(1);
 const QUOTE_MAX_CONCURRENCY: usize = 5;
 const TRADE_MAX_CALLS: usize = 30;
 const TRADE_WINDOW: Duration = Duration::from_secs(30);
-const TRADE_MIN_INTERVAL: Duration = Duration::from_millis(20);
+// Leave room for network and server clock granularity above Longbridge's strict 20ms boundary.
+const TRADE_MIN_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 struct RateState {
@@ -227,6 +228,11 @@ mod tests {
         drop(limiter.acquire().await);
 
         assert!(started.elapsed() >= TRADE_MIN_INTERVAL);
+    }
+
+    #[test]
+    fn test_trade_rate_limiter_keeps_margin_above_server_boundary() {
+        assert!(TRADE_MIN_INTERVAL > Duration::from_millis(20));
     }
 
     #[tokio::test]
