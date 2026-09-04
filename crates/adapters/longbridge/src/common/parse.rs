@@ -291,22 +291,38 @@ pub fn parse_trades(
 ///
 /// # Errors
 ///
-/// Returns an error if a timestamp or fixed-point value cannot be represented.
+/// Returns an error with symbol, bar type, timestamp, and OHLC context if a value cannot be
+/// represented or the candlestick violates Nautilus OHLC invariants.
 pub fn parse_bar(
     bar_type: BarType,
     candlestick: Candlestick,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
-    Bar::new_checked(
-        bar_type,
-        Price::from_decimal(candlestick.open)?,
-        Price::from_decimal(candlestick.high)?,
-        Price::from_decimal(candlestick.low)?,
-        Price::from_decimal(candlestick.close)?,
-        Quantity::from_decimal(Decimal::from(candlestick.volume))?,
-        unix_nanos(candlestick.timestamp)?,
-        ts_init,
-    )
+    let (timestamp, open, high, low, close) = (
+        candlestick.timestamp,
+        candlestick.open,
+        candlestick.high,
+        candlestick.low,
+        candlestick.close,
+    );
+    (|| {
+        Bar::new_checked(
+            bar_type,
+            Price::from_decimal(open)?,
+            Price::from_decimal(high)?,
+            Price::from_decimal(low)?,
+            Price::from_decimal(close)?,
+            Quantity::from_decimal(Decimal::from(candlestick.volume))?,
+            unix_nanos(timestamp)?,
+            ts_init,
+        )
+    })()
+    .with_context(|| {
+        format!(
+            "invalid Longbridge bar: symbol={}, bar_type={bar_type}, timestamp={timestamp}, open={open}, high={high}, low={low}, close={close}",
+            bar_type.instrument_id().symbol,
+        )
+    })
 }
 
 /// Maps a Nautilus order side to the SDK.

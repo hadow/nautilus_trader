@@ -56,7 +56,7 @@ use anyhow::Context;
 use jiff::{Timestamp, civil::Time as CivilTime, tz::TimeZone};
 use longbridge::{
     Market,
-    quote::{AdjustType, Period, QuoteContext, TradeSession, TradeSessions},
+    quote::{AdjustType, Candlestick, Period, QuoteContext, TradeSession, TradeSessions},
 };
 use nautilus_common::{actor::DataActor, enums::Environment, live::get_runtime};
 use nautilus_core::{
@@ -100,7 +100,7 @@ use nautilus_trading::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use time::{Date, Month, Time};
+use time::{Date, Month, OffsetDateTime, Time};
 use ustr::Ustr;
 
 const TRADER_ID: &str = "SLC-TRADER-001";
@@ -324,13 +324,12 @@ impl AppConfig {
                 .saturating_add(stochastic_d_period),
         );
         anyhow::ensure!(
-            five_minute_warmup > minimum_five_minute_warmup
-                && five_minute_warmup <= MAX_WARMUP_BARS,
-            "5-minute warmup must initialize ATR and stochastic periods and not exceed {MAX_WARMUP_BARS}",
+            five_minute_warmup > minimum_five_minute_warmup && five_minute_warmup < MAX_WARMUP_BARS,
+            "5-minute warmup must initialize ATR and stochastic periods and be less than {MAX_WARMUP_BARS}",
         );
         anyhow::ensure!(
-            four_hour_warmup > pivot_span * 2 + 1 && four_hour_warmup <= MAX_WARMUP_BARS,
-            "4-hour warmup must exceed the pivot window and not exceed {MAX_WARMUP_BARS}",
+            four_hour_warmup > pivot_span * 2 + 1 && four_hour_warmup < MAX_WARMUP_BARS,
+            "4-hour warmup must exceed the pivot window and be less than {MAX_WARMUP_BARS}",
         );
 
         let session = SessionRules {
@@ -2453,25 +2452,27 @@ async fn load_warmup_bars(
     bar_type: BarType,
     count: usize,
 ) -> anyhow::Result<Vec<Bar>> {
-    let mut bars = quote_api_call(context.candlesticks(
+    let request_count = count
+        .checked_add(1)
+        .filter(|request_count| *request_count <= MAX_WARMUP_BARS)
+        .context("warmup count must leave room for one in-progress Longbridge bar")?;
+    let candlesticks = quote_api_call(context.candlesticks(
         symbol,
         period,
-        count,
+        request_count,
         AdjustType::NoAdjust,
         TradeSessions::Intraday,
     ))
     .await
-    .with_context(|| format!("failed to request {period:?} warmup bars for {symbol}"))?
-    .into_iter()
-    .map(|candlestick| parse_bar(bar_type, candlestick, UnixNanos::default()))
-    .collect::<anyhow::Result<Vec<_>>>()?;
-    bars.sort_unstable_by_key(|bar| bar.ts_event);
-    bars.dedup_by_key(|bar| bar.ts_event);
-    anyhow::ensure!(
-        bars.len() >= count,
-        "Longbridge returned {} of {count} required {period:?} warmup bars for {symbol}",
-        bars.len(),
-    );
+    .with_context(|| format!("failed to request {period:?} warmup bars for {symbol}"))?;
+    let bars = parse_warmup_bars(
+        symbol,
+        period,
+        bar_type,
+        candlesticks,
+        count,
+        OffsetDateTime::now_utc(),
+    )?;
     let latest = bars
         .last()
         .expect("warmup count was validated above")
@@ -2481,6 +2482,43 @@ async fn load_warmup_bars(
         latest <= now && now.as_u64().saturating_sub(latest.as_u64()) <= MAX_WARMUP_AGE_NANOS,
         "Longbridge returned stale or future {period:?} warmup data for {symbol}: latest={latest}",
     );
+    Ok(bars)
+}
+
+/// Removes in-progress candles, then parses, orders, and validates one warmup response.
+fn parse_warmup_bars(
+    symbol: &str,
+    period: Period,
+    bar_type: BarType,
+    candlesticks: Vec<Candlestick>,
+    count: usize,
+    now: OffsetDateTime,
+) -> anyhow::Result<Vec<Bar>> {
+    let bar_duration = match period {
+        Period::FiveMinute => time::Duration::minutes(5),
+        Period::FourHour => time::Duration::hours(4),
+        _ => anyhow::bail!("unsupported SLC warmup period: {period:?}"),
+    };
+    let mut bars = candlesticks
+        .into_iter()
+        .filter(|candlestick| {
+            candlestick
+                .timestamp
+                .checked_add(bar_duration)
+                .is_some_and(|closed_at| closed_at <= now)
+        })
+        .map(|candlestick| parse_bar(bar_type, candlestick, UnixNanos::default()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    bars.sort_unstable_by_key(|bar| bar.ts_event);
+    bars.dedup_by_key(|bar| bar.ts_event);
+    anyhow::ensure!(
+        bars.len() >= count,
+        "Longbridge returned {} of {count} required {period:?} warmup bars for {symbol}",
+        bars.len(),
+    );
+    if bars.len() > count {
+        bars = bars.split_off(bars.len() - count);
+    }
     Ok(bars)
 }
 
@@ -2679,6 +2717,29 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn sdk_candlestick(
+        open: &str,
+        high: &str,
+        low: &str,
+        close: &str,
+        timestamp: &str,
+    ) -> Candlestick {
+        toml::from_str(&format!(
+            r#"
+open = "{open}"
+high = "{high}"
+low = "{low}"
+close = "{close}"
+volume = 100
+turnover = "10000"
+timestamp = "{timestamp}"
+trade_session = "Intraday"
+open_updated = true
+"#,
+        ))
+        .unwrap()
+    }
+
     fn bar(
         bar_type: BarType,
         open: &str,
@@ -2687,12 +2748,14 @@ mod tests {
         close: &str,
         timestamp: u64,
     ) -> Bar {
+        let price =
+            |value: &str| Price::from_decimal_dp(value.parse::<Decimal>().unwrap(), 2).unwrap();
         Bar::new(
             bar_type,
-            Price::from(open),
-            Price::from(high),
-            Price::from(low),
-            Price::from(close),
+            price(open),
+            price(high),
+            price(low),
+            price(close),
             Quantity::from(100),
             UnixNanos::from(timestamp),
             UnixNanos::from(timestamp),
@@ -2708,6 +2771,64 @@ mod tests {
             close,
             timestamp,
         )
+    }
+
+    #[test]
+    fn warmup_ignores_invalid_in_progress_bar() {
+        let bars = parse_warmup_bars(
+            "QQQ.US",
+            Period::FiveMinute,
+            BarType::from("QQQ.US.LONGBRIDGE-5-MINUTE-LAST-EXTERNAL"),
+            vec![
+                sdk_candlestick(
+                    "100.00",
+                    "101.00",
+                    "99.00",
+                    "100.50",
+                    "2026-09-04T13:25:00Z",
+                ),
+                sdk_candlestick("0.00", "101.00", "100.00", "100.50", "2026-09-04T13:30:00Z"),
+            ],
+            1,
+            time::macros::datetime!(2026-09-04 13:31 UTC),
+        )
+        .unwrap();
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(
+            bars[0].ts_event,
+            UnixNanos::from(
+                u64::try_from(
+                    time::macros::datetime!(2026-09-04 13:25 UTC).unix_timestamp_nanos(),
+                )
+                .unwrap(),
+            ),
+        );
+    }
+
+    #[test]
+    fn invalid_completed_warmup_bar_identifies_symbol_and_bar_type() {
+        let bar_type = BarType::from("QQQ.US.LONGBRIDGE-5-MINUTE-LAST-EXTERNAL");
+        let error = parse_warmup_bars(
+            "QQQ.US",
+            Period::FiveMinute,
+            bar_type,
+            vec![sdk_candlestick(
+                "0.00",
+                "101.00",
+                "100.00",
+                "100.50",
+                "2026-09-04T13:25:00Z",
+            )],
+            1,
+            time::macros::datetime!(2026-09-04 13:31 UTC),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("symbol=QQQ.US"));
+        assert!(message.contains(&format!("bar_type={bar_type}")));
+        assert!(message.contains("low <= open"));
     }
 
     fn quote(bid: &str, ask: &str, timestamp: u64) -> QuoteTick {
