@@ -33,6 +33,10 @@
 //!
 //! Required environment variable:
 //! - `LONGBRIDGE_OAUTH_CLIENT_ID`: OAuth 2.0 public client ID.
+//!
+//! Configure one or more US equities with `LONGBRIDGE_SLC_INSTRUMENT_IDS`, separated by commas,
+//! for example `QQQ.US.LONGBRIDGE,AAPL.US.LONGBRIDGE,MSFT.US.LONGBRIDGE`. The legacy
+//! `LONGBRIDGE_SLC_INSTRUMENT_ID` remains supported for a single instrument.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -130,7 +134,7 @@ impl SessionRules {
 
 #[derive(Clone, Debug)]
 struct AppConfig {
-    instrument_id: InstrumentId,
+    instrument_ids: Vec<InstrumentId>,
     price_increment: Price,
     papertrading: bool,
     risk_amount: Decimal,
@@ -162,13 +166,7 @@ impl AppConfig {
         )?;
         validate_realtime_candlesticks()?;
 
-        let instrument_id: InstrumentId =
-            env_parse("LONGBRIDGE_SLC_INSTRUMENT_ID", "QQQ.US.LONGBRIDGE")?;
-        anyhow::ensure!(
-            instrument_id.venue.as_str() == "LONGBRIDGE"
-                && instrument_id.symbol.as_str().ends_with(".US"),
-            "SLC live example currently requires a US equity on venue LONGBRIDGE",
-        );
+        let instrument_ids = env_instrument_ids()?;
 
         let price_increment = env_parse("LONGBRIDGE_SLC_PRICE_INCREMENT", "0.01")?;
         anyhow::ensure!(
@@ -243,7 +241,7 @@ impl AppConfig {
         session.validate()?;
 
         Ok(Self {
-            instrument_id,
+            instrument_ids,
             price_increment,
             papertrading,
             risk_amount,
@@ -267,20 +265,23 @@ impl AppConfig {
         })
     }
 
-    fn five_minute_bar_type(&self) -> BarType {
-        BarType::from(format!("{}-5-MINUTE-LAST-EXTERNAL", self.instrument_id).as_str())
+    fn five_minute_bar_type(instrument_id: InstrumentId) -> BarType {
+        BarType::from(format!("{}-5-MINUTE-LAST-EXTERNAL", instrument_id).as_str())
     }
 
-    fn four_hour_bar_type(&self) -> BarType {
-        BarType::from(format!("{}-4-HOUR-LAST-EXTERNAL", self.instrument_id).as_str())
+    fn four_hour_bar_type(instrument_id: InstrumentId) -> BarType {
+        BarType::from(format!("{}-4-HOUR-LAST-EXTERNAL", instrument_id).as_str())
     }
 
     fn data_config(&self) -> LongbridgeDataClientConfig {
         LongbridgeDataClientConfig {
-            instrument_price_increments: HashMap::from([(
-                self.instrument_id.to_string(),
-                self.price_increment.to_string(),
-            )]),
+            instrument_price_increments: self
+                .instrument_ids
+                .iter()
+                .map(|instrument_id| {
+                    (instrument_id.to_string(), self.price_increment.to_string())
+                })
+                .collect(),
             ..Default::default()
         }
     }
@@ -299,6 +300,42 @@ where
     value
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid {name}={value:?}: {e}"))
+}
+
+fn parse_instrument_ids(value: &str) -> anyhow::Result<Vec<InstrumentId>> {
+    let mut instrument_ids = Vec::new();
+    for raw in value.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        let instrument_id: InstrumentId = raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid Longbridge instrument {raw:?}: {e}"))?;
+        anyhow::ensure!(
+            instrument_id.venue.as_str() == "LONGBRIDGE"
+                && instrument_id.symbol.as_str().ends_with(".US"),
+            "SLC live example currently requires US equities on venue LONGBRIDGE: {instrument_id}",
+        );
+        anyhow::ensure!(
+            !instrument_ids.contains(&instrument_id),
+            "duplicate Longbridge instrument configured: {instrument_id}",
+        );
+        instrument_ids.push(instrument_id);
+    }
+
+    anyhow::ensure!(
+        !instrument_ids.is_empty(),
+        "LONGBRIDGE_SLC_INSTRUMENT_IDS must contain at least one instrument",
+    );
+    anyhow::ensure!(
+        instrument_ids.len() <= 500,
+        "LONGBRIDGE_SLC_INSTRUMENT_IDS supports at most 500 instruments",
+    );
+    Ok(instrument_ids)
+}
+
+fn env_instrument_ids() -> anyhow::Result<Vec<InstrumentId>> {
+    let value = env::var("LONGBRIDGE_SLC_INSTRUMENT_IDS")
+        .or_else(|_| env::var("LONGBRIDGE_SLC_INSTRUMENT_ID"))
+        .unwrap_or_else(|_| "QQQ.US.LONGBRIDGE".to_string());
+    parse_instrument_ids(&value)
 }
 
 fn env_time(name: &str, default: &str) -> anyhow::Result<u16> {
@@ -775,6 +812,7 @@ struct SlcStrategy {
 impl SlcStrategy {
     fn new(
         app_config: &AppConfig,
+        instrument_id: InstrumentId,
         instrument: InstrumentAny,
         five_minute_bars: Vec<Bar>,
         four_hour_bars: Vec<Bar>,
@@ -784,17 +822,19 @@ impl SlcStrategy {
         signals.warm_up(five_minute_bars, four_hour_bars);
         Self {
             core: StrategyCore::new(StrategyConfig {
-                strategy_id: Some(StrategyId::from(STRATEGY_ID)),
+                strategy_id: Some(StrategyId::from(
+                    format!("{STRATEGY_ID}-{}", instrument_id.symbol).as_str(),
+                )),
                 order_id_tag: Some(ORDER_ID_TAG.to_string()),
-                external_order_claims: Some(vec![app_config.instrument_id]),
+                external_order_claims: Some(vec![instrument_id]),
                 market_exit_time_in_force: TimeInForce::Day,
                 market_exit_reduce_only: false,
                 ..Default::default()
             }),
             config: SlcStrategyConfig {
-                instrument_id: app_config.instrument_id,
-                five_minute_bar_type: app_config.five_minute_bar_type(),
-                four_hour_bar_type: app_config.four_hour_bar_type(),
+                instrument_id,
+                five_minute_bar_type: AppConfig::five_minute_bar_type(instrument_id),
+                four_hour_bar_type: AppConfig::four_hour_bar_type(instrument_id),
                 timezone: app_config.timezone.clone(),
                 entry_start_minute: app_config.session.entry_start_minute,
                 entry_end_minute: app_config.session.entry_end_minute.min(flatten_minute),
@@ -1295,6 +1335,7 @@ fn risk_sized_quantity(
 }
 
 struct PreparedInputs {
+    instrument_id: InstrumentId,
     instrument: InstrumentAny,
     five_minute_bars: Vec<Bar>,
     four_hour_bars: Vec<Bar>,
@@ -1302,53 +1343,70 @@ struct PreparedInputs {
     market_close_minute: u16,
 }
 
-async fn prepare_inputs(config: &AppConfig) -> anyhow::Result<PreparedInputs> {
-    let sdk_config = config.data_config().sdk_config().await?;
-    let (context, _receiver) = QuoteContext::new(sdk_config);
-    let symbol = config.instrument_id.symbol.as_str();
-    let mut static_info = context
-        .static_info([symbol])
+async fn prepare_inputs(
+    config: &AppConfig,
+    context: &QuoteContext,
+) -> anyhow::Result<Vec<PreparedInputs>> {
+    let symbols = config
+        .instrument_ids
+        .iter()
+        .map(|instrument_id| instrument_id.symbol.as_str())
+        .collect::<Vec<_>>();
+    let static_info = context
+        .static_info(symbols.clone())
         .await
         .context("failed to request Longbridge static security info")?;
-    anyhow::ensure!(
-        static_info.len() == 1 && static_info[0].symbol == symbol,
-        "Longbridge did not return exact static security info for {symbol}",
-    );
-    let instrument = parse_instrument(
-        &static_info.remove(0),
-        config.price_increment,
-        UnixNanos::default(),
-    )?;
-    anyhow::ensure!(
-        instrument.quote_currency() == Currency::USD(),
-        "SLC risk controls currently require a USD-quoted equity",
-    );
+    let mut static_info_by_symbol = static_info
+        .into_iter()
+        .map(|info| (info.symbol.clone(), info))
+        .collect::<HashMap<_, _>>();
 
-    let five_minute_bars = load_warmup_bars(
-        &context,
-        symbol,
-        Period::FiveMinute,
-        config.five_minute_bar_type(),
-        config.five_minute_warmup,
-    )
-    .await?;
-    let four_hour_bars = load_warmup_bars(
-        &context,
-        symbol,
-        Period::FourHour,
-        config.four_hour_bar_type(),
-        config.four_hour_warmup,
-    )
-    .await?;
-    let (market_close, market_close_minute) = current_us_market_close(&context).await?;
+    let (market_close, market_close_minute) = current_us_market_close(context).await?;
+    let mut prepared = Vec::with_capacity(config.instrument_ids.len());
 
-    Ok(PreparedInputs {
-        instrument,
-        five_minute_bars,
-        four_hour_bars,
-        market_close,
-        market_close_minute,
-    })
+    for instrument_id in &config.instrument_ids {
+        let symbol = instrument_id.symbol.as_str();
+        let static_security_info = static_info_by_symbol
+            .remove(symbol)
+            .with_context(|| format!("Longbridge did not return exact static security info for {symbol}"))?;
+        let instrument = parse_instrument(
+            &static_security_info,
+            config.price_increment,
+            UnixNanos::default(),
+        )?;
+        anyhow::ensure!(
+            instrument.quote_currency() == Currency::USD(),
+            "SLC risk controls currently require a USD-quoted equity: {instrument_id}",
+        );
+
+        let five_minute_bars = load_warmup_bars(
+            context,
+            symbol,
+            Period::FiveMinute,
+            AppConfig::five_minute_bar_type(*instrument_id),
+            config.five_minute_warmup,
+        )
+        .await?;
+        let four_hour_bars = load_warmup_bars(
+            context,
+            symbol,
+            Period::FourHour,
+            AppConfig::four_hour_bar_type(*instrument_id),
+            config.four_hour_warmup,
+        )
+        .await?;
+
+        prepared.push(PreparedInputs {
+            instrument_id: *instrument_id,
+            instrument,
+            five_minute_bars,
+            four_hour_bars,
+            market_close,
+            market_close_minute,
+        });
+    }
+
+    Ok(prepared)
 }
 
 async fn load_warmup_bars(
@@ -1464,10 +1522,13 @@ fn risk_engine_config(config: &AppConfig) -> LiveRiskEngineConfig {
         bypass: false,
         max_order_submit_rate: "6/00:00:01".to_string(),
         max_order_modify_rate: "6/00:00:01".to_string(),
-        max_notional_per_order: HashMap::from([(
-            config.instrument_id.to_string(),
-            config.max_order_notional.to_string(),
-        )]),
+        max_notional_per_order: config
+            .instrument_ids
+            .iter()
+            .map(|instrument_id| {
+                (instrument_id.to_string(), config.max_order_notional.to_string())
+            })
+            .collect(),
         ..Default::default()
     }
 }
@@ -1475,9 +1536,20 @@ fn risk_engine_config(config: &AppConfig) -> LiveRiskEngineConfig {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = AppConfig::from_env()?;
-    let prepared = prepare_inputs(&config).await?;
-    let flatten_minute = prepared
-        .market_close_minute
+    let prepared = {
+        let sdk_config = config.data_config().sdk_config().await?;
+        let (context, _receiver) = QuoteContext::new(sdk_config);
+        prepare_inputs(&config, &context).await?
+    };
+    let market_close = prepared
+        .first()
+        .context("SLC requires at least one prepared instrument")?
+        .market_close;
+    let market_close_minute = prepared
+        .first()
+        .expect("prepared instruments checked above")
+        .market_close_minute;
+    let flatten_minute = market_close_minute
         .checked_sub(config.session.flatten_before_close_minutes)
         .context("flatten buffer exceeds the current US trading session")?;
     anyhow::ensure!(
@@ -1494,7 +1566,13 @@ async fn main() -> anyhow::Result<()> {
     let account_id = AccountId::from(ACCOUNT_ID);
     let exec_engine_config = LiveExecEngineConfig {
         reconciliation_lookback_mins: Some(24 * 60),
-        reconciliation_instrument_ids: Some(vec![config.instrument_id.to_string()]),
+        reconciliation_instrument_ids: Some(
+            config
+                .instrument_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
         open_check_interval_secs: Some(10.0),
         position_check_interval_secs: Some(15.0),
         ..Default::default()
@@ -1519,18 +1597,21 @@ async fn main() -> anyhow::Result<()> {
         )?
         .build()?;
 
-    node.kernel()
-        .cache()
-        .borrow_mut()
-        .add_instrument(prepared.instrument.clone())?;
-    node.add_strategy(SlcStrategy::new(
-        &config,
-        prepared.instrument,
-        prepared.five_minute_bars,
-        prepared.four_hour_bars,
-        flatten_minute,
-    ))?;
-    schedule_market_close_stop(&node, prepared.market_close)?;
+    for prepared in prepared {
+        node.kernel()
+            .cache()
+            .borrow_mut()
+            .add_instrument(prepared.instrument.clone())?;
+        node.add_strategy(SlcStrategy::new(
+            &config,
+            prepared.instrument_id,
+            prepared.instrument,
+            prepared.five_minute_bars,
+            prepared.four_hour_bars,
+            flatten_minute,
+        ))?;
+    }
+    schedule_market_close_stop(&node, market_close)?;
     node.run().await
 }
 
@@ -1567,6 +1648,29 @@ mod tests {
             close,
             timestamp,
         )
+    }
+
+    #[rstest::rstest]
+    fn test_parse_multiple_instrument_ids() {
+        let instruments = parse_instrument_ids(
+            "QQQ.US.LONGBRIDGE, AAPL.US.LONGBRIDGE, MSFT.US.LONGBRIDGE",
+        )
+        .unwrap();
+
+        assert_eq!(instruments.len(), 3);
+        assert_eq!(instruments[0].symbol.as_str(), "QQQ.US");
+        assert_eq!(instruments[1].symbol.as_str(), "AAPL.US");
+        assert_eq!(instruments[2].symbol.as_str(), "MSFT.US");
+    }
+
+    #[rstest::rstest]
+    fn test_parse_instrument_ids_rejects_duplicates() {
+        assert!(parse_instrument_ids("QQQ.US.LONGBRIDGE,QQQ.US.LONGBRIDGE").is_err());
+    }
+
+    #[rstest::rstest]
+    fn test_parse_instrument_ids_rejects_non_us_equities() {
+        assert!(parse_instrument_ids("0700.HK.LONGBRIDGE").is_err());
     }
 
     #[rstest::rstest]
