@@ -1381,6 +1381,7 @@ struct PendingEntry {
 struct ActiveTrade {
     side: OrderSide,
     target: Price,
+    first_fill_ts: UnixNanos,
     filled_qty: Decimal,
     protected_qty: Decimal,
     fill_notional: Decimal,
@@ -1691,6 +1692,9 @@ impl SlcStrategy {
             .active_trade
             .as_ref()
             .map_or(Decimal::ZERO, |active| active.fill_notional);
+        let first_fill_ts = self.active_trade.as_ref().map_or(event.ts_event, |active| {
+            active.first_fill_ts.min(event.ts_event)
+        });
         let filled_qty = previous_qty + event.last_qty.as_decimal();
         let fill_notional =
             previous_notional + event.last_px.as_decimal() * event.last_qty.as_decimal();
@@ -1733,6 +1737,7 @@ impl SlcStrategy {
         self.active_trade = Some(ActiveTrade {
             side: pending.side,
             target,
+            first_fill_ts,
             filled_qty,
             protected_qty,
             fill_notional,
@@ -1786,14 +1791,9 @@ impl SlcStrategy {
     /// Returns whether a completed bar traded through the actual-fill-based 2R target.
     fn target_reached(&self, bar: Bar) -> bool {
         !self.exit_pending
-            && self
-                .active_trade
-                .as_ref()
-                .is_some_and(|active| match active.side {
-                    OrderSide::Buy => bar.high >= active.target,
-                    OrderSide::Sell => bar.low <= active.target,
-                    OrderSide::NoOrderSide => false,
-                })
+            && self.active_trade.as_ref().is_some_and(|active| {
+                bar_reaches_target(active.side, active.target, active.first_fill_ts, bar)
+            })
     }
 
     /// Clears a terminal entry and releases risk only when no fill created exposure.
@@ -2033,7 +2033,7 @@ nautilus_strategy!(SlcStrategy, {
 });
 
 impl DataActor for SlcStrategy {
-    /// Validates data contracts, restores shared risk state, and starts both bar subscriptions.
+    /// Validates data contracts, restores shared risk state, and starts market-data subscriptions.
     fn on_start(&mut self) -> anyhow::Result<()> {
         validate_bar_type(self.config.five_minute_bar_type, 5, BarAggregation::Minute)?;
         validate_bar_type(self.config.four_hour_bar_type, 4, BarAggregation::Hour)?;
@@ -2084,7 +2084,7 @@ impl DataActor for SlcStrategy {
         Ok(())
     }
 
-    /// Removes subscriptions after managed-stop has reconciled orders and positions.
+    /// Removes market-data subscriptions after managed stop reconciles orders and positions.
     fn on_stop(&mut self) -> anyhow::Result<()> {
         self.unsubscribe_bars(self.config.five_minute_bar_type, None, None);
         self.unsubscribe_bars(self.config.four_hour_bar_type, None, None);
@@ -2098,7 +2098,6 @@ impl DataActor for SlcStrategy {
             || self.faulted
             || self.exit_pending
             || self.is_exiting()
-            || !self.has_open_position()
         {
             return Ok(());
         }
@@ -2334,6 +2333,16 @@ fn quote_reaches_target(side: OrderSide, target: Price, quote: &QuoteTick) -> bo
         OrderSide::Sell => quote.ask_price <= target,
         OrderSide::NoOrderSide => false,
     }
+}
+
+/// Returns whether a completed bar not predating the first fill reached the target.
+fn bar_reaches_target(side: OrderSide, target: Price, first_fill_ts: UnixNanos, bar: Bar) -> bool {
+    bar.ts_event >= first_fill_ts
+        && match side {
+            OrderSide::Buy => bar.high >= target,
+            OrderSide::Sell => bar.low <= target,
+            OrderSide::NoOrderSide => false,
+        }
 }
 
 /// Returns the largest lot-aligned quantity whose worst-price stop risk fits the budget.
@@ -3068,6 +3077,39 @@ mod tests {
             OrderSide::Sell,
             target,
             &quote("99.95", "100.00", 4),
+        ));
+    }
+
+    #[rstest::rstest]
+    fn test_bar_target_fallback_ignores_prices_before_first_fill() {
+        let target = Price::from("100.00");
+        let first_fill_ts = UnixNanos::from(100);
+        let fill_bar = five_minute_bar("99.00", "101.00", "98.00", "100.00", 90);
+        let later_bar = five_minute_bar("99.00", "100.00", "99.00", "100.00", 101);
+
+        assert!(!bar_reaches_target(
+            OrderSide::Buy,
+            target,
+            first_fill_ts,
+            fill_bar,
+        ));
+        assert!(bar_reaches_target(
+            OrderSide::Buy,
+            target,
+            first_fill_ts,
+            later_bar,
+        ));
+        assert!(!bar_reaches_target(
+            OrderSide::Sell,
+            target,
+            first_fill_ts,
+            fill_bar,
+        ));
+        assert!(bar_reaches_target(
+            OrderSide::Sell,
+            target,
+            first_fill_ts,
+            later_bar,
         ));
     }
 

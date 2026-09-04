@@ -109,7 +109,7 @@ impl RateLimiter {
                 };
 
                 let interval_wait = state.last_call.map_or(Duration::ZERO, |timestamp| {
-                    (*timestamp + self.min_interval).saturating_duration_since(now)
+                    (timestamp + self.min_interval).saturating_duration_since(now)
                 });
 
                 window_wait.max(interval_wait)
