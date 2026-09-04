@@ -107,7 +107,6 @@ const TRADER_ID: &str = "SLC-TRADER-001";
 const ACCOUNT_ID: &str = "LONGBRIDGE-001";
 const NODE_NAME: &str = "LONGBRIDGE-SLC-001";
 const STRATEGY_ID: &str = "SLC-001";
-const ORDER_ID_TAG: &str = "201";
 const US_TIMEZONE: &str = "America/New_York";
 const RTH_OPEN_MINUTE: u16 = 9 * 60 + 30;
 const RTH_CLOSE_MINUTE: u16 = 16 * 60;
@@ -1402,6 +1401,21 @@ struct SlcStrategy {
     faulted: bool,
 }
 
+/// Builds the stable per-symbol routing identity and shared strategy behavior.
+fn slc_strategy_config(instrument_id: InstrumentId) -> StrategyConfig {
+    StrategyConfig {
+        strategy_id: Some(StrategyId::from(
+            format!("{STRATEGY_ID}-{}", instrument_id.symbol).as_str(),
+        )),
+        external_order_claims: Some(vec![instrument_id]),
+        manage_stop: true,
+        market_exit_max_attempts: 300,
+        market_exit_time_in_force: TimeInForce::Day,
+        market_exit_reduce_only: false,
+        ..Default::default()
+    }
+}
+
 impl SlcStrategy {
     /// Creates one isolated per-symbol strategy sharing only the account risk ledger.
     fn new(
@@ -1441,18 +1455,7 @@ impl SlcStrategy {
             signals.structure.trend(),
         );
         Ok(Self {
-            core: StrategyCore::new(StrategyConfig {
-                strategy_id: Some(StrategyId::from(
-                    format!("{STRATEGY_ID}-{}", instrument_id.symbol).as_str(),
-                )),
-                order_id_tag: Some(ORDER_ID_TAG.to_string()),
-                external_order_claims: Some(vec![instrument_id]),
-                manage_stop: true,
-                market_exit_max_attempts: 300,
-                market_exit_time_in_force: TimeInForce::Day,
-                market_exit_reduce_only: false,
-                ..Default::default()
-            }),
+            core: StrategyCore::new(slc_strategy_config(instrument_id)),
             config: SlcStrategyConfig {
                 instrument_id,
                 five_minute_bar_type,
@@ -2902,6 +2905,17 @@ open_updated = true
         assert!(!signals.structure.initialized());
         assert_eq!(signals.structure.trend(), Trend::Neutral);
         assert!(signals.indicators_initialized());
+    }
+
+    #[test]
+    fn configured_symbols_have_unique_order_id_tags() {
+        let qqq = StrategyCore::new(slc_strategy_config(InstrumentId::from("QQQ.US.LONGBRIDGE")));
+        let aapl = StrategyCore::new(slc_strategy_config(InstrumentId::from(
+            "AAPL.US.LONGBRIDGE",
+        )));
+
+        assert_eq!(qqq.order_id_tag(), Some("QQQ.US"));
+        assert_eq!(aapl.order_id_tag(), Some("AAPL.US"));
     }
 
     #[rstest::rstest]
