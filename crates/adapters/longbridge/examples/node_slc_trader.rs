@@ -878,9 +878,9 @@ impl SlcSignalState {
         }
     }
 
-    /// Returns whether every indicator and higher-timeframe structure input is initialized.
-    fn ready(&self) -> bool {
-        self.atr.initialized() && self.stochastics.initialized() && self.structure.initialized()
+    /// Returns whether the five-minute indicators are initialized for signal evaluation.
+    fn indicators_initialized(&self) -> bool {
+        self.atr.initialized() && self.stochastics.initialized()
     }
 
     /// Finalizes the pending four-hour update when a newer timestamp arrives.
@@ -1413,16 +1413,31 @@ impl SlcStrategy {
         flatten_minute: u16,
         account_risk: Arc<AccountRisk>,
     ) -> anyhow::Result<Self> {
+        let five_minute_bar_type = AppConfig::five_minute_bar_type(instrument_id);
+        let four_hour_bar_type = AppConfig::four_hour_bar_type(instrument_id);
         let five_minute_warmup_count = five_minute_bars.len();
         let four_hour_warmup_count = four_hour_bars.len();
         let mut signals = SlcSignalState::new(app_config);
         signals.warm_up(five_minute_bars, four_hour_bars);
         anyhow::ensure!(
-            signals.ready(),
-            "SLC warmup did not initialize indicators and 4h pivots for {instrument_id}",
+            signals.indicators_initialized(),
+            "SLC warmup did not initialize 5m indicators for {instrument_id}: bar_type={five_minute_bar_type}, received_bars={five_minute_warmup_count}, atr_initialized={}, stochastic_initialized={}",
+            signals.atr.initialized(),
+            signals.stochastics.initialized(),
         );
+        if !signals.structure.initialized() {
+            log::warn!(
+                "[{instrument_id}] SLC 4h structure is not initialized: bar_type={four_hour_bar_type}, received_bars={four_hour_warmup_count}, confirmed_pivot_highs={}, confirmed_pivot_lows={}; the 4h trend remains Neutral and cannot authorize entries",
+                signals.structure.highs.len(),
+                signals.structure.lows.len(),
+            );
+        }
         log::info!(
-            "[{instrument_id}] SLC warmup complete: 5m_bars={five_minute_warmup_count}, 4h_bars={four_hour_warmup_count}, initial_4h_trend={:?}",
+            "[{instrument_id}] SLC warmup complete: 5m_bar_type={five_minute_bar_type}, 5m_bars={five_minute_warmup_count}, indicators_initialized={}, 4h_bar_type={four_hour_bar_type}, 4h_bars={four_hour_warmup_count}, structure_initialized={}, confirmed_pivot_highs={}, confirmed_pivot_lows={}, initial_4h_trend={:?}",
+            signals.indicators_initialized(),
+            signals.structure.initialized(),
+            signals.structure.highs.len(),
+            signals.structure.lows.len(),
             signals.structure.trend(),
         );
         Ok(Self {
@@ -1440,8 +1455,8 @@ impl SlcStrategy {
             }),
             config: SlcStrategyConfig {
                 instrument_id,
-                five_minute_bar_type: AppConfig::five_minute_bar_type(instrument_id),
-                four_hour_bar_type: AppConfig::four_hour_bar_type(instrument_id),
+                five_minute_bar_type,
+                four_hour_bar_type,
                 timezone: app_config.timezone.clone(),
                 entry_start_minute: app_config.session.entry_start_minute,
                 entry_end_minute: app_config.session.entry_end_minute.min(flatten_minute),
@@ -2132,13 +2147,16 @@ impl DataActor for SlcStrategy {
             if (RTH_OPEN_MINUTE..RTH_CLOSE_MINUTE).contains(&minute) {
                 self.signals.process_four_hour(finalized);
                 log::info!(
-                    "[{}] 4h structure updated: start={}, open={}, high={}, low={}, close={}, trend={:?}",
+                    "[{}] 4h structure updated: start={}, open={}, high={}, low={}, close={}, structure_initialized={}, confirmed_pivot_highs={}, confirmed_pivot_lows={}, trend={:?}",
                     self.config.instrument_id,
                     local,
                     finalized.open,
                     finalized.high,
                     finalized.low,
                     finalized.close,
+                    self.signals.structure.initialized(),
+                    self.signals.structure.highs.len(),
+                    self.signals.structure.lows.len(),
                     self.signals.structure.trend(),
                 );
             }
@@ -2202,7 +2220,7 @@ impl DataActor for SlcStrategy {
             && !self.has_exposure();
         let signal = self.signals.process_five_minute(finalized, allow_signal);
         log::info!(
-            "[{}] 5m bar collected: start={}, open={}, high={}, low={}, close={}, volume={}, 4h_trend={:?}, atr={:.6}, stochastic_k={:.2}, demand_zones={}, supply_zones={}, data_ready={}, entries_disabled={}",
+            "[{}] 5m bar collected: start={}, open={}, high={}, low={}, close={}, volume={}, 4h_trend={:?}, atr={:.6}, stochastic_k={:.2}, demand_zones={}, supply_zones={}, indicators_initialized={}, structure_initialized={}, session_disabled={}",
             self.config.instrument_id,
             local,
             finalized.open,
@@ -2215,7 +2233,8 @@ impl DataActor for SlcStrategy {
             self.signals.stochastics.value_k,
             self.signals.demand.len(),
             self.signals.supply.len(),
-            self.signals.ready(),
+            self.signals.indicators_initialized(),
+            self.signals.structure.initialized(),
             self.session_disabled,
         );
         self.cancel_stale_entry(finalized)?;
@@ -2853,6 +2872,36 @@ open_updated = true
             oversold: 20.0,
             overbought: 80.0,
         }
+    }
+
+    #[test]
+    fn five_minute_indicators_initialize_without_four_hour_structure() {
+        let mut signals = SlcSignalState {
+            five_minute_bars: FinalBarBuffer::default(),
+            four_hour_bars: FinalBarBuffer::default(),
+            structure: PivotStructure::new(2),
+            atr: AverageTrueRange::new(1, Some(MovingAverageType::Wilder), Some(true), None),
+            stochastics: Stochastics::new_with_params(
+                1,
+                1,
+                1,
+                MovingAverageType::Simple,
+                StochasticsDMethod::MovingAverage,
+            ),
+            previous_five_minute_bar: None,
+            previous_k: None,
+            demand: VecDeque::new(),
+            supply: VecDeque::new(),
+            rules: signal_rules(),
+        };
+
+        let _ = signals.process_five_minute(five_minute_bar("100", "101", "99", "100", 1), false);
+
+        assert!(signals.atr.initialized());
+        assert!(signals.stochastics.initialized());
+        assert!(!signals.structure.initialized());
+        assert_eq!(signals.structure.trend(), Trend::Neutral);
+        assert!(signals.indicators_initialized());
     }
 
     #[rstest::rstest]
