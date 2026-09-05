@@ -67,7 +67,7 @@ use crate::{
             parse_trades, period_from_bar_type,
         },
         rate_limit::{
-            MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, quote_api_call,
+            MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, quote_api_call_with_retry,
             try_acquire_quote_connection,
         },
     },
@@ -201,7 +201,7 @@ async fn load_instruments(
             .iter()
             .map(|id| id.symbol.as_str().to_string())
             .collect::<Vec<_>>();
-        let static_info = quote_api_call(context.static_info(symbols))
+        let static_info = quote_api_call_with_retry(|| context.static_info(symbols.clone()))
             .await
             .context("failed to request Longbridge static security info")?;
 
@@ -286,48 +286,56 @@ async fn request_historical_bars(
     let candlesticks = if let (Some(start), Some(end)) = (start, end) {
         let start_date = history_date(&symbol, start)?;
         let end_date = history_date(&symbol, end)?;
-        quote_api_call(context.history_candlesticks_by_date(
-            symbol,
-            period,
-            AdjustType::NoAdjust,
-            Some(start_date),
-            Some(end_date),
-            TradeSessions::All,
-        ))
+        quote_api_call_with_retry(|| {
+            context.history_candlesticks_by_date(
+                symbol.clone(),
+                period,
+                AdjustType::NoAdjust,
+                Some(start_date),
+                Some(end_date),
+                TradeSessions::All,
+            )
+        })
         .await?
     } else if let Some(end) = end {
         let end = history_datetime(&symbol, end)?;
-        quote_api_call(context.history_candlesticks_by_offset(
-            symbol,
-            period,
-            AdjustType::NoAdjust,
-            false,
-            Some(end),
-            limit,
-            TradeSessions::All,
-        ))
+        quote_api_call_with_retry(|| {
+            context.history_candlesticks_by_offset(
+                symbol.clone(),
+                period,
+                AdjustType::NoAdjust,
+                false,
+                Some(end),
+                limit,
+                TradeSessions::All,
+            )
+        })
         .await?
     } else if start.is_none() {
-        quote_api_call(context.candlesticks(
-            symbol,
-            period,
-            limit,
-            AdjustType::NoAdjust,
-            TradeSessions::All,
-        ))
+        quote_api_call_with_retry(|| {
+            context.candlesticks(
+                symbol.clone(),
+                period,
+                limit,
+                AdjustType::NoAdjust,
+                TradeSessions::All,
+            )
+        })
         .await?
     } else {
         let start_date = start
             .map(|value| history_date(&symbol, value))
             .transpose()?;
-        quote_api_call(context.history_candlesticks_by_date(
-            symbol,
-            period,
-            AdjustType::NoAdjust,
-            start_date,
-            None,
-            TradeSessions::All,
-        ))
+        quote_api_call_with_retry(|| {
+            context.history_candlesticks_by_date(
+                symbol.clone(),
+                period,
+                AdjustType::NoAdjust,
+                start_date,
+                None,
+                TradeSessions::All,
+            )
+        })
         .await?
     };
 
@@ -403,7 +411,7 @@ impl DataClient for LongbridgeDataClient {
                 .context("only one Longbridge quote connection is allowed per process")?
         };
         let (context, mut receiver) = QuoteContext::new(sdk_config);
-        quote_api_call(context.subscriptions())
+        quote_api_call_with_retry(|| context.subscriptions())
             .await
             .context("failed to establish Longbridge quote session")?;
 
@@ -589,7 +597,7 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("quote subscription", async move {
-            quote_api_call(context.subscribe([symbol], SubFlags::DEPTH)).await
+            quote_api_call_with_retry(|| context.subscribe([symbol.clone()], SubFlags::DEPTH)).await
         });
         Ok(())
     }
@@ -607,7 +615,7 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("depth subscription", async move {
-            quote_api_call(context.subscribe([symbol], SubFlags::DEPTH)).await
+            quote_api_call_with_retry(|| context.subscribe([symbol.clone()], SubFlags::DEPTH)).await
         });
         Ok(())
     }
@@ -624,7 +632,7 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("trade subscription", async move {
-            quote_api_call(context.subscribe([symbol], SubFlags::TRADE)).await
+            quote_api_call_with_retry(|| context.subscribe([symbol.clone()], SubFlags::TRADE)).await
         });
         Ok(())
     }
@@ -649,9 +657,11 @@ impl DataClient for LongbridgeDataClient {
             return Ok(());
         }
         self.spawn_result("bar subscription", async move {
-            quote_api_call(context.subscribe_candlesticks(symbol, period, TradeSessions::All))
-                .await
-                .map(|_| ())
+            quote_api_call_with_retry(|| {
+                context.subscribe_candlesticks(symbol.clone(), period, TradeSessions::All)
+            })
+            .await
+            .map(|_| ())
         });
         Ok(())
     }
@@ -666,7 +676,8 @@ impl DataClient for LongbridgeDataClient {
         if removed && !retain_depth {
             let symbol = cmd.instrument_id.symbol.as_str().to_string();
             self.spawn_result("quote unsubscription", async move {
-                quote_api_call(context.unsubscribe([symbol], SubFlags::DEPTH)).await
+                quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], SubFlags::DEPTH))
+                    .await
             });
         }
         Ok(())
@@ -682,7 +693,8 @@ impl DataClient for LongbridgeDataClient {
         if removed && !retain_depth {
             let symbol = cmd.instrument_id.symbol.as_str().to_string();
             self.spawn_result("depth unsubscription", async move {
-                quote_api_call(context.unsubscribe([symbol], SubFlags::DEPTH)).await
+                quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], SubFlags::DEPTH))
+                    .await
             });
         }
         Ok(())
@@ -702,7 +714,8 @@ impl DataClient for LongbridgeDataClient {
         }
         let symbol = cmd.instrument_id.symbol.as_str().to_string();
         self.spawn_result("trade unsubscription", async move {
-            quote_api_call(context.unsubscribe([symbol], SubFlags::TRADE)).await
+            quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], SubFlags::TRADE))
+                .await
         });
         Ok(())
     }
@@ -722,7 +735,8 @@ impl DataClient for LongbridgeDataClient {
             return Ok(());
         }
         self.spawn_result("bar unsubscription", async move {
-            quote_api_call(context.unsubscribe_candlesticks(symbol, period)).await
+            quote_api_call_with_retry(|| context.unsubscribe_candlesticks(symbol.clone(), period))
+                .await
         });
         Ok(())
     }

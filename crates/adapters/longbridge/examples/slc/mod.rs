@@ -83,7 +83,7 @@ use nautilus_longbridge::{
     LongbridgeExecutionClientFactory,
     common::{
         parse::{parse_bar_with_price_precision, parse_instrument},
-        rate_limit::{MAX_QUOTE_SUBSCRIPTION_SYMBOLS, quote_api_call},
+        rate_limit::{MAX_QUOTE_SUBSCRIPTION_SYMBOLS, quote_api_call_with_retry},
     },
 };
 use nautilus_model::{
@@ -2586,7 +2586,7 @@ async fn load_instruments(
         .iter()
         .map(|instrument| instrument.instrument_id.symbol.as_str())
         .collect::<Vec<_>>();
-    let static_info = quote_api_call(context.static_info(symbols.clone()))
+    let static_info = quote_api_call_with_retry(|| context.static_info(symbols.clone()))
         .await
         .context("failed to request Longbridge static security info")?;
     let mut static_info_by_symbol = static_info
@@ -2669,13 +2669,15 @@ async fn load_warmup_bars(
         .checked_add(1)
         .filter(|request_count| *request_count <= MAX_WARMUP_BARS)
         .context("warmup count must leave room for one in-progress Longbridge bar")?;
-    let candlesticks = quote_api_call(context.candlesticks(
-        symbol,
-        period,
-        request_count,
-        AdjustType::NoAdjust,
-        TradeSessions::Intraday,
-    ))
+    let candlesticks = quote_api_call_with_retry(|| {
+        context.candlesticks(
+            symbol,
+            period,
+            request_count,
+            AdjustType::NoAdjust,
+            TradeSessions::Intraday,
+        )
+    })
     .await
     .with_context(|| format!("failed to request {period:?} warmup bars for {symbol}"))?;
     let bars = parse_warmup_bars(
@@ -2760,10 +2762,11 @@ async fn prepare_backtest_inputs(
 ) -> anyhow::Result<Vec<PreparedBacktestInputs>> {
     let start_date = us_market_date(config.start)?;
     let end_date = us_market_date(config.end)?;
-    let half_days = quote_api_call(context.trading_days(Market::US, start_date, end_date))
-        .await
-        .context("failed to query US half trading days for the SLC backtest")?
-        .half_trading_days;
+    let half_days =
+        quote_api_call_with_retry(|| context.trading_days(Market::US, start_date, end_date))
+            .await
+            .context("failed to query US half trading days for the SLC backtest")?
+            .half_trading_days;
     let mut prepared = Vec::with_capacity(config.strategy.instruments.len());
     for (instrument_id, instrument) in load_instruments(&config.strategy, context).await? {
         let symbol = instrument_id.symbol.as_str();
@@ -2856,15 +2859,18 @@ async fn load_backtest_warmup_bars(
         .checked_add(1)
         .filter(|request_count| *request_count <= MAX_WARMUP_BARS)
         .context("warmup count must leave room for the first non-warmup bar")?;
-    let candlesticks = quote_api_call(context.history_candlesticks_by_offset(
-        symbol,
-        period,
-        AdjustType::NoAdjust,
-        false,
-        Some(us_market_datetime(start)?),
-        request_count,
-        TradeSessions::Intraday,
-    ))
+    let start_datetime = us_market_datetime(start)?;
+    let candlesticks = quote_api_call_with_retry(|| {
+        context.history_candlesticks_by_offset(
+            symbol,
+            period,
+            AdjustType::NoAdjust,
+            false,
+            Some(start_datetime),
+            request_count,
+            TradeSessions::Intraday,
+        )
+    })
     .await
     .with_context(|| format!("failed to request historical {period:?} warmup for {symbol}"))?;
     parse_warmup_bars(
@@ -2897,14 +2903,16 @@ async fn load_backtest_bars(
             .unwrap_or(end_date)
             .min(end_date);
         candlesticks.extend(
-            quote_api_call(context.history_candlesticks_by_date(
-                symbol,
-                period,
-                AdjustType::NoAdjust,
-                Some(cursor),
-                Some(chunk_end),
-                TradeSessions::Intraday,
-            ))
+            quote_api_call_with_retry(|| {
+                context.history_candlesticks_by_date(
+                    symbol,
+                    period,
+                    AdjustType::NoAdjust,
+                    Some(cursor),
+                    Some(chunk_end),
+                    TradeSessions::Intraday,
+                )
+            })
             .await
             .with_context(|| {
                 format!(
@@ -2999,9 +3007,10 @@ fn us_market_datetime(timestamp: Timestamp) -> anyhow::Result<PrimitiveDateTime>
 async fn current_us_market_close(context: &QuoteContext) -> anyhow::Result<(Timestamp, u16)> {
     let now = Timestamp::now();
     let market_date = us_market_date(now)?;
-    let trading_days = quote_api_call(context.trading_days(Market::US, market_date, market_date))
-        .await
-        .context("failed to query the current US trading day from Longbridge")?;
+    let trading_days =
+        quote_api_call_with_retry(|| context.trading_days(Market::US, market_date, market_date))
+            .await
+            .context("failed to query the current US trading day from Longbridge")?;
     if !trading_days.trading_days.contains(&market_date) {
         anyhow::bail!("{market_date} is not a US trading day");
     }
@@ -3009,7 +3018,7 @@ async fn current_us_market_close(context: &QuoteContext) -> anyhow::Result<(Time
     let close_time = if trading_days.half_trading_days.contains(&market_date) {
         time::macros::time!(13:00)
     } else {
-        quote_api_call(context.trading_session())
+        quote_api_call_with_retry(|| context.trading_session())
             .await
             .context("failed to query the current US trading session from Longbridge")?
             .into_iter()

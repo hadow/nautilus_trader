@@ -29,9 +29,11 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const QUOTE_MAX_CALLS: usize = 10;
-// Leave room for network arrival jitter above Longbridge's strict one-second boundary.
+// Leave room for network arrival jitter above Longbridge's strict one-second boundary
 const QUOTE_WINDOW: Duration = Duration::from_millis(1_100);
 const QUOTE_MAX_CONCURRENCY: usize = 5;
+const QUOTE_RATE_LIMIT_ERROR_CODE: i64 = 301606;
+const QUOTE_RATE_LIMIT_MAX_RETRIES: usize = 3;
 const TRADE_MAX_CALLS: usize = 30;
 const TRADE_WINDOW: Duration = Duration::from_secs(30);
 // Leave room for network and server clock granularity above Longbridge's strict 20ms boundary.
@@ -179,6 +181,33 @@ where
     call.await
 }
 
+/// Executes a repeatable quote API call with bounded rate-limit retries.
+#[doc(hidden)]
+#[allow(clippy::result_large_err)] // Preserve the SDK error type for existing adapter callers
+pub async fn quote_api_call_with_retry<F, Fut, T>(mut call: F) -> longbridge::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = longbridge::Result<T>>,
+{
+    let mut retries = 0;
+    loop {
+        match quote_api_call(call()).await {
+            Err(e)
+                if e.openapi_error_code() == Some(QUOTE_RATE_LIMIT_ERROR_CODE)
+                    && retries < QUOTE_RATE_LIMIT_MAX_RETRIES =>
+            {
+                retries += 1;
+                log::warn!(
+                    "Longbridge quote API rate limited; retrying in {} ms ({retries}/{QUOTE_RATE_LIMIT_MAX_RETRIES})",
+                    QUOTE_WINDOW.as_millis(),
+                );
+                tokio::time::sleep(QUOTE_WINDOW).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Executes one trade API call after acquiring the process-wide trade limits.
 pub(crate) async fn trade_api_call<F>(call: F) -> F::Output
 where
@@ -259,6 +288,30 @@ mod tests {
                 .is_ok()
         );
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn test_quote_api_call_retries_rate_limit_response() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = quote_api_call_with_retry(|| async {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(longbridge::Error::WsClient(
+                    longbridge::wsclient::WsClientError::ResponseError {
+                        status: 3,
+                        detail: Some(longbridge::wsclient::WsResponseErrorDetail {
+                            code: 301606,
+                            msg: "request rate limit".to_string(),
+                        }),
+                    },
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
