@@ -24,9 +24,9 @@
 //! reclaim/retest levels, and
 //! configurable Stochastics re-entry from the 20/80 bands. Each signal submits a one-bar marketable
 //! limit entry sized at its worst allowed price. Every fill receives a broker-hosted Longbridge
-//! market-if-touched stop in live trading or an equivalent stop-market order in backtests. The 2R
-//! target is recalculated from average fill price and checked against executable top-of-book quotes.
-//! Completed bars provide a conservative fallback trigger.
+//! market-if-touched stop in live trading. Backtests submit a linked stop-market and resting 2R
+//! limit target for every fill. Live targets are recalculated from average fill price and checked
+//! against executable top-of-book quotes, with completed bars as a conservative fallback trigger.
 //! Per-symbol strategies share a persisted SLC-owned risk ledger. Managed stop coordinates
 //! cancellation and position close before the regular session ends.
 //!
@@ -66,7 +66,7 @@ use nautilus_backtest::{
 };
 use nautilus_common::{actor::DataActor, enums::Environment, live::get_runtime};
 use nautilus_core::{
-    UnixNanos,
+    UUID4, UnixNanos,
     datetime::get_timezone,
     serialization::{deserialize_decimal_from_str, serialize_decimal_as_str},
 };
@@ -91,16 +91,16 @@ use nautilus_longbridge::{
 use nautilus_model::{
     data::{Bar, BarType, Data, QuoteTick},
     enums::{
-        AccountType, AggregationSource, BarAggregation, BookType, OmsType, OrderSide, OrderType,
-        PriceType, TimeInForce,
+        AccountType, AggregationSource, BarAggregation, BookType, ContingencyType, OmsType,
+        OrderSide, OrderType, PriceType, TimeInForce, TriggerType,
     },
     events::{
         OrderCancelRejected, OrderCanceled, OrderDenied, OrderExpired, OrderFilled, OrderRejected,
         PositionClosed,
     },
-    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId},
     instruments::{Instrument, InstrumentAny},
-    orders::Order,
+    orders::{LimitOrder, Order, OrderAny, StopMarketOrder},
     types::{Currency, Money, Price, Quantity},
 };
 use nautilus_trading::{
@@ -1523,6 +1523,76 @@ fn protective_stop_order_type(is_backtest: bool) -> OrderType {
     }
 }
 
+/// Builds an exit-only OUO pair so either backtest fill resizes or cancels its sibling.
+fn backtest_protective_orders(
+    event: &OrderFilled,
+    exit_side: OrderSide,
+    stop: Price,
+    target: Price,
+    order_list_id: OrderListId,
+    stop_order_id: ClientOrderId,
+    target_order_id: ClientOrderId,
+) -> anyhow::Result<Vec<OrderAny>> {
+    let stop_order = StopMarketOrder::new_checked(
+        event.trader_id,
+        event.strategy_id,
+        event.instrument_id,
+        stop_order_id,
+        exit_side,
+        event.last_qty,
+        stop,
+        TriggerType::Default,
+        TimeInForce::Day,
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        Some(ContingencyType::Ouo),
+        Some(order_list_id),
+        Some(vec![target_order_id]),
+        None,
+        None,
+        None,
+        None,
+        Some(vec![Ustr::from("SLC_STOP")]),
+        UUID4::new(),
+        event.ts_init,
+    )?;
+    let target_order = LimitOrder::new_checked(
+        event.trader_id,
+        event.strategy_id,
+        event.instrument_id,
+        target_order_id,
+        exit_side,
+        event.last_qty,
+        target,
+        TimeInForce::Day,
+        None,
+        false,
+        true,
+        false,
+        None,
+        None,
+        None,
+        Some(ContingencyType::Ouo),
+        Some(order_list_id),
+        Some(vec![stop_order_id]),
+        None,
+        None,
+        None,
+        None,
+        Some(vec![Ustr::from("SLC_TARGET")]),
+        UUID4::new(),
+        event.ts_init,
+    )?;
+    Ok(vec![
+        OrderAny::StopMarket(stop_order),
+        OrderAny::Limit(target_order),
+    ])
+}
+
 #[derive(Clone, Debug)]
 struct SlcStrategyConfig {
     instrument_id: InstrumentId,
@@ -1940,7 +2010,7 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Protects each entry fill immediately and derives the 2R target from average fill price.
+    /// Protects each fill immediately; backtests rest a linked per-fill 2R target at the venue.
     fn protect_entry_fill(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
         let Some(pending) = self.pending_entry else {
             return Ok(());
@@ -1987,45 +2057,62 @@ impl SlcStrategy {
             self.instrument.price_precision(),
             self.config.risk_reward,
         )?;
-        let stop_order = match protective_stop_order_type(self.backtest_four_hour_bars.is_some()) {
-            OrderType::StopMarket => self.order().stop_market(
-                self.config.instrument_id,
-                exit_side,
-                event.last_qty,
+        let is_backtest = self.backtest_four_hour_bars.is_some();
+        let protective_target = if is_backtest {
+            target_price(
+                pending.side,
+                event.last_px.as_decimal(),
                 pending.stop,
-                None,
-                Some(TimeInForce::Day),
-                None,
-                Some(false),
-                Some(false),
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(vec![Ustr::from("SLC_STOP")]),
-                None,
-            ),
-            OrderType::MarketIfTouched => self.order().market_if_touched(
-                self.config.instrument_id,
-                exit_side,
-                event.last_qty,
-                pending.stop,
-                None,
-                Some(TimeInForce::Day),
-                None,
-                Some(false),
-                Some(false),
-                None,
-                None,
-                None,
-                None,
-                Some(vec![Ustr::from("SLC_STOP")]),
-                None,
-            ),
-            _ => unreachable!("unsupported SLC protective stop order type"),
+                self.instrument.price_increment(),
+                self.instrument.price_precision(),
+                self.config.risk_reward,
+            )?
+        } else {
+            target
         };
-        self.submit_order(stop_order, None, None, None)?;
+        match protective_stop_order_type(is_backtest) {
+            OrderType::StopMarket => {
+                let (order_list_id, stop_order_id, target_order_id) = {
+                    let orders = self.order();
+                    (
+                        orders.generate_order_list_id(),
+                        orders.generate_client_order_id(),
+                        orders.generate_client_order_id(),
+                    )
+                };
+                let protective_orders = backtest_protective_orders(
+                    event,
+                    exit_side,
+                    pending.stop,
+                    protective_target,
+                    order_list_id,
+                    stop_order_id,
+                    target_order_id,
+                )?;
+                self.submit_order_list(protective_orders, event.position_id, None, None)?;
+            }
+            OrderType::MarketIfTouched => {
+                let stop_order = self.order().market_if_touched(
+                    self.config.instrument_id,
+                    exit_side,
+                    event.last_qty,
+                    pending.stop,
+                    None,
+                    Some(TimeInForce::Day),
+                    None,
+                    Some(false),
+                    Some(false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(vec![Ustr::from("SLC_STOP")]),
+                    None,
+                );
+                self.submit_order(stop_order, None, None, None)?;
+            }
+            _ => unreachable!("unsupported SLC protective stop order type"),
+        }
         let protected_qty = self
             .active_trade
             .as_ref()
@@ -2052,13 +2139,18 @@ impl SlcStrategy {
             self.pending_entry = None;
         }
         log::info!(
-            "[{}] Protected SLC entry fill: last_quantity={}, total_quantity={}, average_fill={}, stop={}, target={}",
+            "[{}] Protected SLC entry fill: last_quantity={}, total_quantity={}, average_fill={}, stop={}, target={}, target_execution={}",
             self.config.instrument_id,
             event.last_qty,
             filled_qty,
             average_fill,
             pending.stop,
-            target,
+            protective_target,
+            if is_backtest {
+                "resting OUO limit"
+            } else {
+                "executable quote trigger"
+            },
         );
         if self.exit_pending {
             self.cancel_all_orders(self.config.instrument_id, None, None, None)?;
@@ -2089,11 +2181,26 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Returns whether a completed bar traded through the actual-fill-based 2R target.
+    /// Returns whether a completed live bar reached the quote-trigger fallback target.
     fn target_reached(&self, bar: Bar) -> bool {
         !self.exit_pending
             && self.active_trade.as_ref().is_some_and(|active| {
                 bar_reaches_target(active.side, active.target, active.first_fill_ts, bar)
+            })
+    }
+
+    /// Recognizes the normal OUO sibling cancellation after its paired exit order fills.
+    fn expected_protective_cancel(&self, client_order_id: ClientOrderId) -> bool {
+        let Some(order) = self.cache().order(&client_order_id) else {
+            return false;
+        };
+        order.contingency_type() == Some(ContingencyType::Ouo)
+            && order.linked_order_ids().is_some_and(|linked_order_ids| {
+                linked_order_ids.iter().any(|linked_order_id| {
+                    self.cache()
+                        .order(linked_order_id)
+                        .is_some_and(|linked_order| !linked_order.filled_qty().is_zero())
+                })
             })
     }
 
@@ -2118,7 +2225,7 @@ impl SlcStrategy {
         Ok(true)
     }
 
-    /// Cancels all entry and stop orders before submitting a position-closing market order.
+    /// Cancels all entry and protective orders before submitting a position-closing market order.
     fn request_exit(&mut self, reason: &str) -> anyhow::Result<()> {
         self.exit_pending = true;
         log::info!(
@@ -2146,7 +2253,7 @@ impl SlcStrategy {
             return Ok(());
         }
         log::info!(
-            "[{}] All SLC stop orders canceled; submitting market exit",
+            "[{}] All SLC protective orders canceled; submitting market exit",
             self.config.instrument_id,
         );
         self.close_positions()
@@ -2215,7 +2322,7 @@ nautilus_strategy!(SlcStrategy, {
             ),
             Ok(false) if self.has_exposure() => {
                 self.disable_after_order_failure(
-                    "a live SLC order expired while exposure remained",
+                    "a protective SLC order expired while exposure remained",
                 );
             }
             Ok(false) => {}
@@ -2249,8 +2356,14 @@ nautilus_strategy!(SlcStrategy, {
                     self.active_trade.is_some(),
                 );
             }
+        } else if self.expected_protective_cancel(event.client_order_id) {
+            log::info!(
+                "[{}] SLC protective OUO sibling canceled after its paired exit filled: {}",
+                self.config.instrument_id,
+                event.client_order_id,
+            );
         } else if !self.is_exiting() && self.has_open_position() {
-            self.disable_after_order_failure("a protective SLC stop was canceled unexpectedly");
+            self.disable_after_order_failure("a protective SLC order was canceled unexpectedly");
         }
     }
 
@@ -2557,7 +2670,7 @@ impl DataActor for SlcStrategy {
             }
             return Ok(());
         }
-        if self.target_reached(finalized) {
+        if self.backtest_four_hour_bars.is_none() && self.target_reached(finalized) {
             self.request_exit("five-minute bar traded through the actual-fill-based 2R target")?;
             return Ok(());
         }
@@ -3457,6 +3570,10 @@ async fn run_live() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nautilus_model::{
+        enums::LiquiditySide,
+        identifiers::{TradeId, VenueOrderId},
+    };
 
     fn sdk_candlestick(
         open: &str,
@@ -3707,6 +3824,59 @@ open_updated = true
             protective_stop_order_type(false),
             OrderType::MarketIfTouched,
         );
+    }
+
+    #[test]
+    fn backtest_protection_links_resting_target_and_stop() {
+        let event = OrderFilled::new(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("SLC-001"),
+            InstrumentId::from("QQQ.US.LONGBRIDGE"),
+            ClientOrderId::from("ENTRY-001"),
+            VenueOrderId::from("VENUE-001"),
+            AccountId::from("ACCOUNT-001"),
+            TradeId::from("TRADE-001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from(10),
+            Price::from("100.00"),
+            Currency::USD(),
+            LiquiditySide::Taker,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            false,
+            None,
+            None,
+            None,
+        );
+        let stop_order_id = ClientOrderId::from("STOP-001");
+        let target_order_id = ClientOrderId::from("TARGET-001");
+        let orders = backtest_protective_orders(
+            &event,
+            OrderSide::Sell,
+            Price::from("99.00"),
+            Price::from("102.00"),
+            OrderListId::from("OL-001"),
+            stop_order_id,
+            target_order_id,
+        )
+        .unwrap();
+
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].order_type(), OrderType::StopMarket);
+        assert_eq!(orders[0].trigger_price(), Some(Price::from("99.00")));
+        assert_eq!(orders[0].linked_order_ids(), Some(&[target_order_id][..]));
+        assert_eq!(orders[1].order_type(), OrderType::Limit);
+        assert_eq!(orders[1].price(), Some(Price::from("102.00")));
+        assert_eq!(orders[1].linked_order_ids(), Some(&[stop_order_id][..]));
+        assert!(orders.iter().all(|order| {
+            order.contingency_type() == Some(ContingencyType::Ouo)
+                && order.order_list_id() == Some(OrderListId::from("OL-001"))
+                && order.is_reduce_only()
+                && order.time_in_force() == TimeInForce::Day
+                && order.parent_order_id().is_none()
+        }));
     }
 
     #[test]
