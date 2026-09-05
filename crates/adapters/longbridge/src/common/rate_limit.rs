@@ -29,7 +29,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const QUOTE_MAX_CALLS: usize = 10;
-const QUOTE_WINDOW: Duration = Duration::from_secs(1);
+// Leave room for network arrival jitter above Longbridge's strict one-second boundary.
+const QUOTE_WINDOW: Duration = Duration::from_millis(1_100);
 const QUOTE_MAX_CONCURRENCY: usize = 5;
 const TRADE_MAX_CALLS: usize = 30;
 const TRADE_WINDOW: Duration = Duration::from_secs(30);
@@ -233,6 +234,11 @@ mod tests {
     #[test]
     fn test_trade_rate_limiter_keeps_margin_above_server_boundary() {
         assert!(TRADE_MIN_INTERVAL > Duration::from_millis(20));
+    }
+
+    #[test]
+    fn test_quote_rate_limiter_keeps_margin_above_server_boundary() {
+        assert!(QUOTE_WINDOW > Duration::from_secs(1));
     }
 
     #[tokio::test]
