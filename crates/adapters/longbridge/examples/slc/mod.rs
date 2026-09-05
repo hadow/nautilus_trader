@@ -82,7 +82,7 @@ use nautilus_longbridge::{
     LongbridgeDataClientConfig, LongbridgeDataClientFactory, LongbridgeExecClientConfig,
     LongbridgeExecutionClientFactory,
     common::{
-        parse::{parse_bar, parse_instrument},
+        parse::{parse_bar_with_price_precision, parse_instrument},
         rate_limit::{MAX_QUOTE_SUBSCRIPTION_SYMBOLS, quote_api_call},
     },
 };
@@ -1423,6 +1423,16 @@ fn has_five_minute_gap(previous: UnixNanos, current: UnixNanos) -> bool {
     current.as_u64().saturating_sub(previous.as_u64()) != FIVE_MINUTE_NANOS
 }
 
+/// Requests the pre-close exit once, and only while the strategy still owns exposure.
+fn should_request_preclose_exit(
+    close_minute: u16,
+    flatten_minute: u16,
+    has_exposure: bool,
+    exit_pending: bool,
+) -> bool {
+    close_minute >= flatten_minute && has_exposure && !exit_pending
+}
+
 #[derive(Clone, Debug)]
 struct SlcStrategyConfig {
     instrument_id: InstrumentId,
@@ -2403,7 +2413,14 @@ impl DataActor for SlcStrategy {
         self.cancel_stale_entry(finalized)?;
         if close_minute >= self.config.flatten_minute {
             self.session_disabled = true;
-            self.request_exit("pre-close risk cutoff")?;
+            if should_request_preclose_exit(
+                close_minute,
+                self.config.flatten_minute,
+                self.has_exposure(),
+                self.exit_pending,
+            ) {
+                self.request_exit("pre-close risk cutoff")?;
+            }
             return Ok(());
         }
         if self.target_reached(finalized) {
@@ -2613,6 +2630,7 @@ async fn prepare_inputs(
             Period::FiveMinute,
             AppConfig::five_minute_bar_type(instrument_id),
             config.five_minute_warmup,
+            instrument.price_precision(),
         )
         .await?;
         let four_hour_bars = load_warmup_bars(
@@ -2621,6 +2639,7 @@ async fn prepare_inputs(
             Period::FourHour,
             AppConfig::four_hour_bar_type(instrument_id),
             config.four_hour_warmup,
+            instrument.price_precision(),
         )
         .await?;
 
@@ -2644,6 +2663,7 @@ async fn load_warmup_bars(
     period: Period,
     bar_type: BarType,
     count: usize,
+    price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let request_count = count
         .checked_add(1)
@@ -2665,6 +2685,7 @@ async fn load_warmup_bars(
         candlesticks,
         count,
         OffsetDateTime::now_utc(),
+        price_precision,
     )?;
     let latest = bars
         .last()
@@ -2686,6 +2707,7 @@ fn parse_warmup_bars(
     candlesticks: Vec<Candlestick>,
     count: usize,
     now: OffsetDateTime,
+    price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let bar_duration = match period {
         Period::FiveMinute => time::Duration::minutes(5),
@@ -2700,7 +2722,14 @@ fn parse_warmup_bars(
                 .checked_add(bar_duration)
                 .is_some_and(|closed_at| closed_at <= now)
         })
-        .map(|candlestick| parse_bar(bar_type, candlestick, UnixNanos::default()))
+        .map(|candlestick| {
+            parse_bar_with_price_precision(
+                bar_type,
+                candlestick,
+                UnixNanos::default(),
+                price_precision,
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     bars.sort_unstable_by_key(|bar| bar.ts_event);
     bars.dedup_by_key(|bar| bar.ts_event);
@@ -2747,6 +2776,7 @@ async fn prepare_backtest_inputs(
             five_minute_bar_type,
             config.strategy.five_minute_warmup,
             config.start,
+            instrument.price_precision(),
         )
         .await?;
         let four_hour_warmup = load_backtest_warmup_bars(
@@ -2756,6 +2786,7 @@ async fn prepare_backtest_inputs(
             four_hour_bar_type,
             config.strategy.four_hour_warmup,
             config.start,
+            instrument.price_precision(),
         )
         .await?;
         let downloaded_five_minute_bars = load_backtest_bars(
@@ -2765,6 +2796,7 @@ async fn prepare_backtest_inputs(
             five_minute_bar_type,
             config.start,
             config.end,
+            instrument.price_precision(),
         )
         .await?;
         let mut five_minute_bars = Vec::with_capacity(downloaded_five_minute_bars.len());
@@ -2787,6 +2819,7 @@ async fn prepare_backtest_inputs(
             four_hour_bar_type,
             config.start,
             config.end,
+            instrument.price_precision(),
         )
         .await?;
         log::info!(
@@ -2817,6 +2850,7 @@ async fn load_backtest_warmup_bars(
     bar_type: BarType,
     count: usize,
     start: Timestamp,
+    price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let request_count = count
         .checked_add(1)
@@ -2840,6 +2874,7 @@ async fn load_backtest_warmup_bars(
         candlesticks,
         count,
         OffsetDateTime::from_unix_timestamp_nanos(start.as_nanosecond())?,
+        price_precision,
     )
 }
 
@@ -2851,6 +2886,7 @@ async fn load_backtest_bars(
     bar_type: BarType,
     start: Timestamp,
     end: Timestamp,
+    price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let mut candlesticks = Vec::new();
     let mut cursor = us_market_date(start)?;
@@ -2883,7 +2919,15 @@ async fn load_backtest_bars(
             .next_day()
             .context("historical date range exceeded the supported calendar")?;
     }
-    parse_backtest_bars(symbol, period, bar_type, candlesticks, start, end)
+    parse_backtest_bars(
+        symbol,
+        period,
+        bar_type,
+        candlesticks,
+        start,
+        end,
+        price_precision,
+    )
 }
 
 /// Parses complete historical candles and assigns their close as the replay arrival timestamp.
@@ -2894,6 +2938,7 @@ fn parse_backtest_bars(
     candlesticks: Vec<Candlestick>,
     start: Timestamp,
     end: Timestamp,
+    price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let duration = match period {
         Period::FiveMinute => FIVE_MINUTE_NANOS,
@@ -2904,7 +2949,14 @@ fn parse_backtest_bars(
     let end = UnixNanos::from(end);
     let mut bars = candlesticks
         .into_iter()
-        .map(|candlestick| parse_bar(bar_type, candlestick, UnixNanos::default()))
+        .map(|candlestick| {
+            parse_bar_with_price_precision(
+                bar_type,
+                candlestick,
+                UnixNanos::default(),
+                price_precision,
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     bars.sort_unstable_by_key(|bar| bar.ts_event);
     bars.dedup_by_key(|bar| bar.ts_event);
@@ -3328,6 +3380,7 @@ open_updated = true
             ],
             1,
             time::macros::datetime!(2026-09-04 13:31 UTC),
+            2,
         )
         .unwrap();
 
@@ -3359,6 +3412,7 @@ open_updated = true
             )],
             1,
             time::macros::datetime!(2026-09-04 13:31 UTC),
+            2,
         )
         .unwrap_err();
         let message = format!("{error:#}");
@@ -3386,24 +3440,24 @@ open_updated = true
                     "2026-09-04T13:20:00Z",
                 ),
                 sdk_candlestick(
-                    "100.00",
-                    "101.00",
-                    "99.00",
-                    "100.50",
+                    "100.123",
+                    "101.234",
+                    "99.012",
+                    "100.567",
                     "2026-09-04T13:25:00Z",
                 ),
                 sdk_candlestick(
-                    "100.00",
-                    "102.00",
-                    "99.00",
-                    "101.50",
+                    "100.123",
+                    "102.345",
+                    "99.012",
+                    "101.567",
                     "2026-09-04T13:25:00Z",
                 ),
                 sdk_candlestick(
-                    "101.50",
-                    "102.00",
-                    "101.00",
-                    "101.75",
+                    "101.567",
+                    "102.345",
+                    "101.123",
+                    "101.789",
                     "2026-09-04T13:30:00Z",
                 ),
                 sdk_candlestick(
@@ -3416,10 +3470,16 @@ open_updated = true
             ],
             start,
             end,
+            2,
         )
         .unwrap();
 
         assert_eq!(bars.len(), 2);
+        assert!(bars.iter().all(|bar| {
+            [bar.open, bar.high, bar.low, bar.close]
+                .iter()
+                .all(|price| price.precision == 2)
+        }));
         assert_eq!(bars[0].ts_event, UnixNanos::from(start));
         assert_eq!(
             bars[0].ts_init,
@@ -3584,6 +3644,23 @@ open_updated = true
             first,
             UnixNanos::from(first.as_u64() + FIVE_MINUTE_NANOS * 2),
         ));
+    }
+
+    #[rstest::rstest]
+    #[case(949, true, false, false)]
+    #[case(950, false, false, false)]
+    #[case(950, true, true, false)]
+    #[case(950, true, false, true)]
+    fn preclose_exit_requires_unmanaged_exposure(
+        #[case] close_minute: u16,
+        #[case] has_exposure: bool,
+        #[case] exit_pending: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            should_request_preclose_exit(close_minute, 950, has_exposure, exit_pending),
+            expected,
+        );
     }
 
     #[rstest::rstest]

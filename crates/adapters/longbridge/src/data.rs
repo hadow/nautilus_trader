@@ -63,8 +63,8 @@ use crate::{
     common::{
         consts::LONGBRIDGE_VENUE,
         parse::{
-            instrument_id, parse_bar, parse_depth, parse_instrument, parse_trades,
-            period_from_bar_type,
+            instrument_id, parse_bar_with_price_precision, parse_depth, parse_instrument,
+            parse_trades, period_from_bar_type,
         },
         rate_limit::{
             MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, quote_api_call,
@@ -79,7 +79,7 @@ struct SubscriptionState {
     quotes: AHashSet<InstrumentId>,
     depth10: AHashSet<InstrumentId>,
     trades: AHashSet<InstrumentId>,
-    bars: AHashMap<(String, i32), BarType>,
+    bars: AHashMap<(String, i32), (BarType, u8)>,
     // ponytail: Retain slots until reset to avoid async unsubscribe/subscribe races exceeding 500;
     // reclaim after confirmed unsubscriptions if rotating through more than 500 symbols is needed.
     reserved_symbols: AHashSet<String>,
@@ -279,6 +279,7 @@ async fn request_historical_bars(
     end: Option<UnixNanos>,
     limit: usize,
     ts_init: UnixNanos,
+    price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let period = validate_historical_bar_request(bar_type, start, end, limit)?;
     let symbol = bar_type.instrument_id().symbol.as_str().to_string();
@@ -332,7 +333,9 @@ async fn request_historical_bars(
 
     let mut bars = candlesticks
         .into_iter()
-        .map(|candlestick| parse_bar(bar_type, candlestick, ts_init))
+        .map(|candlestick| {
+            parse_bar_with_price_precision(bar_type, candlestick, ts_init, price_precision)
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     bars.sort_unstable_by_key(|bar| bar.ts_event);
     bars.dedup_by_key(|bar| bar.ts_event);
@@ -475,15 +478,20 @@ impl DataClient for LongbridgeDataClient {
                             }
                             PushEventDetail::Candlestick(update) => {
                                 let key = (event.symbol.clone(), update.period as i32);
-                                let bar_type = subscriptions
+                                let bar_subscription = subscriptions
                                     .lock()
                                     .expect(MUTEX_POISONED)
                                     .bars
                                     .get(&key)
                                     .copied();
 
-                                if let Some(bar_type) = bar_type {
-                                    match parse_bar(bar_type, update.candlestick, ts_init) {
+                                if let Some((bar_type, price_precision)) = bar_subscription {
+                                    match parse_bar_with_price_precision(
+                                        bar_type,
+                                        update.candlestick,
+                                        ts_init,
+                                        price_precision,
+                                    ) {
                                         Ok(bar) => {
                                             if let Err(e) = sender.send(DataEvent::Data(Data::Bar(bar))) {
                                                 log::error!("Failed to dispatch Longbridge bar: {e}");
@@ -624,12 +632,17 @@ impl DataClient for LongbridgeDataClient {
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
         let context = self.context()?;
         let period = period_from_bar_type(cmd.bar_type)?;
+        let price_precision = self
+            .config
+            .price_increment(cmd.bar_type.instrument_id())?
+            .precision;
         let symbol = cmd.bar_type.instrument_id().symbol.as_str().to_string();
         let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
         state.reserve_subscription(&symbol)?;
-        let previous = state
-            .bars
-            .insert((symbol.clone(), period as i32), cmd.bar_type);
+        let previous = state.bars.insert(
+            (symbol.clone(), period as i32),
+            (cmd.bar_type, price_precision),
+        );
         drop(state);
 
         if previous.is_some() {
@@ -809,6 +822,10 @@ impl DataClient for LongbridgeDataClient {
             .limit
             .map_or(MAX_HISTORICAL_BARS, |value| value.get());
         validate_historical_bar_request(request.bar_type, start, end, limit)?;
+        let price_precision = self
+            .config
+            .price_increment(request.bar_type.instrument_id())?
+            .precision;
         let sender = self.data_sender.clone();
         let client_id = request.client_id.unwrap_or(self.client_id);
         let clock = self.clock;
@@ -821,6 +838,7 @@ impl DataClient for LongbridgeDataClient {
                 end,
                 limit,
                 clock.get_time_ns(),
+                price_precision,
             )
             .await
             {

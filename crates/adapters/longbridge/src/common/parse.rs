@@ -287,7 +287,7 @@ pub fn parse_trades(
         .collect()
 }
 
-/// Parses a Longbridge candlestick using the subscribed Nautilus bar type.
+/// Parses a Longbridge candlestick using its source price precision.
 ///
 /// # Errors
 ///
@@ -298,6 +298,30 @@ pub fn parse_bar(
     candlestick: Candlestick,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
+    parse_bar_inner(bar_type, candlestick, ts_init, None)
+}
+
+/// Parses a Longbridge candlestick at the configured instrument price precision.
+///
+/// # Errors
+///
+/// Returns an error with symbol, bar type, timestamp, and OHLC context if a value cannot be
+/// represented or the candlestick violates Nautilus OHLC invariants.
+pub fn parse_bar_with_price_precision(
+    bar_type: BarType,
+    candlestick: Candlestick,
+    ts_init: UnixNanos,
+    price_precision: u8,
+) -> anyhow::Result<Bar> {
+    parse_bar_inner(bar_type, candlestick, ts_init, Some(price_precision))
+}
+
+fn parse_bar_inner(
+    bar_type: BarType,
+    candlestick: Candlestick,
+    ts_init: UnixNanos,
+    price_precision: Option<u8>,
+) -> anyhow::Result<Bar> {
     let (timestamp, open, high, low, close) = (
         candlestick.timestamp,
         candlestick.open,
@@ -305,13 +329,17 @@ pub fn parse_bar(
         candlestick.low,
         candlestick.close,
     );
+    let price = |value| match price_precision {
+        Some(precision) => Price::from_decimal_dp(value, precision),
+        None => Price::from_decimal(value),
+    };
     (|| {
         Bar::new_checked(
             bar_type,
-            Price::from_decimal(open)?,
-            Price::from_decimal(high)?,
-            Price::from_decimal(low)?,
-            Price::from_decimal(close)?,
+            price(open)?,
+            price(high)?,
+            price(low)?,
+            price(close)?,
             Quantity::from_decimal(Decimal::from(candlestick.volume))?,
             unix_nanos(timestamp)?,
             ts_init,
