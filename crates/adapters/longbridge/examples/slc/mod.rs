@@ -20,7 +20,8 @@
 //!
 //! The strategy trades completed five-minute bars during the US regular session. It combines
 //! confirmed four-hour higher-high/higher-low or lower-high/lower-low structure, fresh supply or
-//! demand zones formed before ATR-sized displacement candles, one-break reclaim/retest levels, and
+//! demand zones formed before one-to-three-bar ATR-sized displacement moves, one-break
+//! reclaim/retest levels, and
 //! configurable Stochastics re-entry from the 20/80 bands. Each signal submits a one-bar marketable
 //! limit entry sized at its worst allowed price. Every fill receives a broker-hosted Longbridge
 //! market-if-touched stop in live trading or an equivalent stop-market order in backtests. The 2R
@@ -185,6 +186,7 @@ struct AppConfig {
     atr_period: usize,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
+    displacement_max_bars: usize,
     pivot_span: usize,
     zone_ttl_bars: usize,
     max_zones_per_side: usize,
@@ -284,13 +286,14 @@ impl AppConfig {
         anyhow::ensure!(risk_reward > Decimal::ZERO, "risk reward must be positive");
 
         let atr_period: usize = env_parse("LONGBRIDGE_SLC_ATR_PERIOD", "14")?;
-        let displacement_atr_multiple = env_parse("LONGBRIDGE_SLC_DISPLACEMENT_ATR", "1.5")?;
+        let displacement_atr_multiple = env_parse("LONGBRIDGE_SLC_DISPLACEMENT_ATR", "1.0")?;
         let displacement_close_fraction =
-            env_parse("LONGBRIDGE_SLC_DISPLACEMENT_CLOSE_FRACTION", "0.25")?;
+            env_parse("LONGBRIDGE_SLC_DISPLACEMENT_CLOSE_FRACTION", "0.35")?;
+        let displacement_max_bars = env_parse("LONGBRIDGE_SLC_DISPLACEMENT_MAX_BARS", "3")?;
         let pivot_span = env_parse("LONGBRIDGE_SLC_PIVOT_SPAN", "2")?;
-        let zone_ttl_bars = env_parse("LONGBRIDGE_SLC_ZONE_TTL_BARS", "78")?;
-        let max_zones_per_side = env_parse("LONGBRIDGE_SLC_MAX_ZONES_PER_SIDE", "3")?;
-        let confirmation_window_bars = env_parse("LONGBRIDGE_SLC_CONFIRMATION_WINDOW_BARS", "3")?;
+        let zone_ttl_bars = env_parse("LONGBRIDGE_SLC_ZONE_TTL_BARS", "234")?;
+        let max_zones_per_side = env_parse("LONGBRIDGE_SLC_MAX_ZONES_PER_SIDE", "8")?;
+        let confirmation_window_bars = env_parse("LONGBRIDGE_SLC_CONFIRMATION_WINDOW_BARS", "6")?;
         let stochastic_k_period: usize = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_PERIOD", "5")?;
         let stochastic_k_smoothing = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_SMOOTHING", "3")?;
         let stochastic_d_period = env_parse("LONGBRIDGE_SLC_STOCHASTIC_D_PERIOD", "3")?;
@@ -304,6 +307,10 @@ impl AppConfig {
         anyhow::ensure!(
             (0.0..=0.5).contains(&displacement_close_fraction),
             "displacement close fraction must be between 0 and 0.5",
+        );
+        anyhow::ensure!(
+            (1..=12).contains(&displacement_max_bars),
+            "displacement maximum bars must be between 1 and 12",
         );
         anyhow::ensure!(
             pivot_span > 0 && pivot_span <= (MAX_WARMUP_BARS - 1) / 2,
@@ -328,7 +335,7 @@ impl AppConfig {
         );
 
         let five_minute_warmup = env_parse("LONGBRIDGE_SLC_5M_WARMUP", "500")?;
-        let four_hour_warmup = env_parse("LONGBRIDGE_SLC_4H_WARMUP", "20")?;
+        let four_hour_warmup = env_parse("LONGBRIDGE_SLC_4H_WARMUP", "60")?;
         let minimum_five_minute_warmup = atr_period.max(
             stochastic_k_period
                 .saturating_add(stochastic_k_smoothing)
@@ -379,6 +386,7 @@ impl AppConfig {
             atr_period,
             displacement_atr_multiple,
             displacement_close_fraction,
+            displacement_max_bars,
             pivot_span,
             zone_ttl_bars,
             max_zones_per_side,
@@ -748,7 +756,8 @@ impl Zone {
     /// Starts the bounded stochastic confirmation window after a valid retest.
     fn begin_confirmation(&mut self, confirmation: Confirmation, window_bars: usize) {
         self.state = ZoneState::AwaitingConfirmation;
-        self.confirmation_armed = confirmation.extreme;
+        // A re-entry cross proves the immediately preceding %K value was already beyond the band.
+        self.confirmation_armed = confirmation.extreme || confirmation.reentry;
         self.confirmation_bars_left = window_bars + 1;
     }
 
@@ -874,8 +883,43 @@ struct SignalRules {
     confirmation_window_bars: usize,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
+    displacement_max_bars: usize,
     oversold: f64,
     overbought: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SignalFunnel {
+    five_minute_bars: u64,
+    directional_bars: u64,
+    zones_created: u64,
+    level_touches: u64,
+    stochastic_extremes: u64,
+    stochastic_reentries: u64,
+    signals: u64,
+}
+
+impl SignalFunnel {
+    /// Records confirmation events once per side and bar, rather than once per overlapping level.
+    fn record_confirmation(
+        &mut self,
+        zones: &VecDeque<Zone>,
+        bar: Bar,
+        confirmation: Confirmation,
+    ) {
+        let touched = zones.iter().any(|zone| {
+            matches!(zone.state, ZoneState::Fresh | ZoneState::Reclaimed)
+                && !zone.broken(bar)
+                && zone.intersects(bar)
+        });
+        let active = touched
+            || zones
+                .iter()
+                .any(|zone| zone.state == ZoneState::AwaitingConfirmation && !zone.broken(bar));
+        self.level_touches += u64::from(touched);
+        self.stochastic_extremes += u64::from(active && confirmation.extreme);
+        self.stochastic_reentries += u64::from(active && confirmation.reentry);
+    }
 }
 
 struct SlcSignalState {
@@ -884,10 +928,13 @@ struct SlcSignalState {
     structure: PivotStructure,
     atr: AverageTrueRange,
     stochastics: Stochastics,
-    previous_five_minute_bar: Option<Bar>,
+    recent_five_minute_bars: VecDeque<Bar>,
+    last_demand_source: Option<UnixNanos>,
+    last_supply_source: Option<UnixNanos>,
     previous_k: Option<f64>,
     demand: VecDeque<Zone>,
     supply: VecDeque<Zone>,
+    funnel: SignalFunnel,
     rules: SignalRules,
 }
 
@@ -911,16 +958,20 @@ impl SlcSignalState {
                 MovingAverageType::Simple,
                 StochasticsDMethod::MovingAverage,
             ),
-            previous_five_minute_bar: None,
+            recent_five_minute_bars: VecDeque::with_capacity(config.displacement_max_bars + 1),
+            last_demand_source: None,
+            last_supply_source: None,
             previous_k: None,
             demand: VecDeque::with_capacity(config.max_zones_per_side),
             supply: VecDeque::with_capacity(config.max_zones_per_side),
+            funnel: SignalFunnel::default(),
             rules: SignalRules {
                 zone_ttl_bars: config.zone_ttl_bars,
                 max_zones_per_side: config.max_zones_per_side,
                 confirmation_window_bars: config.confirmation_window_bars,
                 displacement_atr_multiple: config.displacement_atr_multiple,
                 displacement_close_fraction: config.displacement_close_fraction,
+                displacement_max_bars: config.displacement_max_bars,
                 oversold: config.oversold,
                 overbought: config.overbought,
             },
@@ -976,6 +1027,7 @@ impl SlcSignalState {
 
     /// Updates levels and indicators, then returns at most one trend-aligned confirmed signal.
     fn process_five_minute(&mut self, bar: Bar, allow_signal: bool) -> Option<Signal> {
+        self.funnel.five_minute_bars += 1;
         let atr_before = self.atr.value;
         let atr_initialized = self.atr.initialized();
         self.stochastics.handle_bar(&bar);
@@ -993,13 +1045,23 @@ impl SlcSignalState {
             && current_k < self.rules.overbought;
 
         let trend = self.structure.trend();
+        self.funnel.directional_bars += u64::from(trend != Trend::Neutral);
+        let long_confirmation = Confirmation {
+            extreme: stochastic_initialized && current_k <= self.rules.oversold,
+            reentry: long_cross,
+        };
+        let short_confirmation = Confirmation {
+            extreme: stochastic_initialized && current_k >= self.rules.overbought,
+            reentry: short_cross,
+        };
+        self.funnel
+            .record_confirmation(&self.demand, bar, long_confirmation);
+        self.funnel
+            .record_confirmation(&self.supply, bar, short_confirmation);
         let long_signal = observe_zones(
             &mut self.demand,
             bar,
-            Confirmation {
-                extreme: stochastic_initialized && current_k <= self.rules.oversold,
-                reentry: long_cross,
-            },
+            long_confirmation,
             trend == Trend::Up && allow_signal,
             OrderSide::Buy,
             self.rules,
@@ -1007,35 +1069,51 @@ impl SlcSignalState {
         let short_signal = observe_zones(
             &mut self.supply,
             bar,
-            Confirmation {
-                extreme: stochastic_initialized && current_k >= self.rules.overbought,
-                reentry: short_cross,
-            },
+            short_confirmation,
             trend == Trend::Down && allow_signal,
             OrderSide::Sell,
             self.rules,
         );
 
-        if atr_initialized && let Some(previous) = self.previous_five_minute_bar {
-            if is_up_displacement(previous, bar, atr_before, self.rules) {
+        if self
+            .recent_five_minute_bars
+            .back()
+            .is_some_and(|previous| has_five_minute_gap(previous.ts_event, bar.ts_event))
+        {
+            self.recent_five_minute_bars.clear();
+        }
+        self.recent_five_minute_bars.push_back(bar);
+        while self.recent_five_minute_bars.len() > self.rules.displacement_max_bars + 1 {
+            self.recent_five_minute_bars.pop_front();
+        }
+        if atr_initialized
+            && let Some((kind, source)) =
+                displacement_zone(&self.recent_five_minute_bars, atr_before, self.rules)
+        {
+            let last_source = match kind {
+                ZoneKind::Demand => &mut self.last_demand_source,
+                ZoneKind::Supply => &mut self.last_supply_source,
+            };
+            if *last_source != Some(source.ts_event) {
+                let zones = match kind {
+                    ZoneKind::Demand => &mut self.demand,
+                    ZoneKind::Supply => &mut self.supply,
+                };
                 push_zone(
-                    &mut self.demand,
-                    Zone::from_bar(ZoneKind::Demand, previous),
+                    zones,
+                    Zone::from_bar(kind, source),
                     self.rules.max_zones_per_side,
                 );
-            } else if is_down_displacement(previous, bar, atr_before, self.rules) {
-                push_zone(
-                    &mut self.supply,
-                    Zone::from_bar(ZoneKind::Supply, previous),
-                    self.rules.max_zones_per_side,
-                );
+                *last_source = Some(source.ts_event);
+                self.funnel.zones_created += 1;
             }
         }
 
         self.atr.handle_bar(&bar);
-        self.previous_five_minute_bar = Some(bar);
         self.previous_k = Some(current_k);
-        long_signal.or(short_signal)
+        let signal = long_signal.or(short_signal);
+        self.funnel.signals += u64::from(signal.is_some());
+        signal
     }
 }
 
@@ -1079,43 +1157,45 @@ fn push_zone(zones: &mut VecDeque<Zone>, zone: Zone, max_zones: usize) {
     zones.push_back(zone);
 }
 
-/// Returns whether an opposing base candle is followed by bullish ATR-sized displacement.
-fn is_up_displacement(previous: Bar, current: Bar, atr: f64, rules: SignalRules) -> bool {
-    previous.close < previous.open
-        && current.close > current.open
-        && displacement_body(current) >= atr * rules.displacement_atr_multiple
-        && close_fraction_from_high(current) <= rules.displacement_close_fraction
-}
-
-/// Returns whether an opposing base candle is followed by bearish ATR-sized displacement.
-fn is_down_displacement(previous: Bar, current: Bar, atr: f64, rules: SignalRules) -> bool {
-    previous.close > previous.open
-        && current.close < current.open
-        && displacement_body(current) >= atr * rules.displacement_atr_multiple
-        && close_fraction_from_low(current) <= rules.displacement_close_fraction
-}
-
-/// Returns the absolute candle body in quote-price units.
-fn displacement_body(bar: Bar) -> f64 {
-    (bar.close.as_f64() - bar.open.as_f64()).abs()
-}
-
-/// Returns the fraction of a candle range left above its close.
-fn close_fraction_from_high(bar: Bar) -> f64 {
-    let range = bar.high.as_f64() - bar.low.as_f64();
-    if range == 0.0 {
-        return 1.0;
+/// Finds the most recent opposing candle before an ATR-sized one-to-three-bar price expansion.
+fn displacement_zone(
+    bars: &VecDeque<Bar>,
+    atr: f64,
+    rules: SignalRules,
+) -> Option<(ZoneKind, Bar)> {
+    let current = *bars.back()?;
+    let first_source = bars.len().saturating_sub(rules.displacement_max_bars + 1);
+    for source_index in (first_source..bars.len().saturating_sub(1)).rev() {
+        let source = bars[source_index];
+        let mut impulse_high = f64::NEG_INFINITY;
+        let mut impulse_low = f64::INFINITY;
+        for impulse in bars.iter().skip(source_index + 1) {
+            impulse_high = impulse_high.max(impulse.high.as_f64());
+            impulse_low = impulse_low.min(impulse.low.as_f64());
+        }
+        let impulse_range = impulse_high - impulse_low;
+        if impulse_range <= 0.0 {
+            continue;
+        }
+        let required_move = atr * rules.displacement_atr_multiple;
+        if source.close < source.open
+            && current.close > source.high
+            && current.close.as_f64() - source.close.as_f64() >= required_move
+            && (impulse_high - current.close.as_f64()) / impulse_range
+                <= rules.displacement_close_fraction
+        {
+            return Some((ZoneKind::Demand, source));
+        }
+        if source.close > source.open
+            && current.close < source.low
+            && source.close.as_f64() - current.close.as_f64() >= required_move
+            && (current.close.as_f64() - impulse_low) / impulse_range
+                <= rules.displacement_close_fraction
+        {
+            return Some((ZoneKind::Supply, source));
+        }
     }
-    (bar.high.as_f64() - bar.close.as_f64()) / range
-}
-
-/// Returns the fraction of a candle range left below its close.
-fn close_fraction_from_low(bar: Bar) -> f64 {
-    let range = bar.high.as_f64() - bar.low.as_f64();
-    if range == 0.0 {
-        return 1.0;
-    }
-    (bar.close.as_f64() - bar.low.as_f64()) / range
+    None
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1498,6 +1578,8 @@ struct SlcStrategy {
     session_disabled: bool,
     exit_pending: bool,
     faulted: bool,
+    risk_rejections: u64,
+    entries_submitted: u64,
 }
 
 struct SlcRunConfig {
@@ -1563,6 +1645,7 @@ impl SlcStrategy {
             signals.structure.lows.len(),
             signals.structure.trend(),
         );
+        signals.funnel = SignalFunnel::default();
         Ok(Self {
             core: StrategyCore::new(slc_strategy_config(instrument_id)),
             config: SlcStrategyConfig {
@@ -1603,6 +1686,8 @@ impl SlcStrategy {
             session_disabled: false,
             exit_pending: false,
             faulted: false,
+            risk_rejections: 0,
+            entries_submitted: 0,
         })
     }
 
@@ -1759,12 +1844,20 @@ impl SlcStrategy {
             stop,
             self.config.risk_amount,
             self.config.max_order_quantity,
+            self.config.max_order_notional,
             lot_size,
         )?
         else {
+            self.risk_rejections += 1;
             log::warn!(
-                "[{}] Skipping SLC signal because risk sizing produced zero quantity",
+                "[{}] Skipping SLC signal because risk and notional sizing produced zero quantity: entry_limit={}, stop={}, risk_budget={}, max_quantity={}, max_notional={}, lot_size={}",
                 self.config.instrument_id,
+                entry_limit,
+                stop,
+                self.config.risk_amount,
+                self.config.max_order_quantity,
+                self.config.max_order_notional,
+                lot_size,
             );
             return Ok(());
         };
@@ -1773,15 +1866,10 @@ impl SlcStrategy {
             risk: (entry_limit.as_decimal() - stop.as_decimal()).abs() * quantity_decimal,
             notional: entry_limit.as_decimal() * quantity_decimal,
         };
-        if reservation.notional > self.config.max_order_notional {
-            log::warn!(
-                "[{}] Skipping SLC signal because order notional {} exceeds configured maximum {}",
-                self.config.instrument_id,
-                reservation.notional,
-                self.config.max_order_notional,
-            );
-            return Ok(());
-        }
+        anyhow::ensure!(
+            reservation.notional <= self.config.max_order_notional,
+            "SLC quantity sizing exceeded configured order notional",
+        );
         let symbol = self.config.instrument_id.symbol.to_string();
         let (outcome, snapshot) = self.account_risk.reserve_entry(
             &symbol,
@@ -1791,6 +1879,7 @@ impl SlcStrategy {
             self.config.account_risk_limits,
         )?;
         if outcome == ReservationOutcome::Rejected {
+            self.risk_rejections += 1;
             log::warn!(
                 "[{}] Skipping SLC signal after account risk check: halted={}, daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
                 self.config.instrument_id,
@@ -1836,6 +1925,7 @@ impl SlcStrategy {
             self.account_risk.release_unfilled(&symbol)?;
             return Err(e);
         }
+        self.entries_submitted += 1;
         log::info!(
             "[{}] Submitted SLC {} entry: quantity={}, signal_close={}, entry_limit={}, stop={}, reserved_risk={}, reserved_notional={}",
             self.config.instrument_id,
@@ -2314,6 +2404,19 @@ impl DataActor for SlcStrategy {
 
     /// Removes market-data subscriptions after managed stop reconciles orders and positions.
     fn on_stop(&mut self) -> anyhow::Result<()> {
+        log::info!(
+            "[{}] SLC signal funnel: 5m_bars={}, directional_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, risk_rejections={}, entries_submitted={}",
+            self.config.instrument_id,
+            self.signals.funnel.five_minute_bars,
+            self.signals.funnel.directional_bars,
+            self.signals.funnel.zones_created,
+            self.signals.funnel.level_touches,
+            self.signals.funnel.stochastic_extremes,
+            self.signals.funnel.stochastic_reentries,
+            self.signals.funnel.signals,
+            self.risk_rejections,
+            self.entries_submitted,
+        );
         self.unsubscribe_bars(self.config.five_minute_bar_type, None, None);
         if self.backtest_four_hour_bars.is_none() {
             self.unsubscribe_bars(self.config.four_hour_bar_type, None, None);
@@ -2574,14 +2677,16 @@ fn bar_reaches_target(side: OrderSide, target: Price, first_fill_ts: UnixNanos, 
         }
 }
 
-/// Returns the largest lot-aligned quantity whose worst-price stop risk fits the budget.
+/// Returns the largest lot-aligned quantity fitting risk, quantity, and worst-price notional caps.
 fn risk_sized_quantity(
     entry: Price,
     stop: Price,
     risk_amount: Decimal,
     max_quantity: Quantity,
+    max_notional: Decimal,
     lot_size: Quantity,
 ) -> anyhow::Result<Option<Quantity>> {
+    anyhow::ensure!(entry.as_decimal() > Decimal::ZERO, "entry must be positive");
     let risk_per_share = (entry.as_decimal() - stop.as_decimal()).abs();
     anyhow::ensure!(
         risk_per_share > Decimal::ZERO,
@@ -2589,8 +2694,15 @@ fn risk_sized_quantity(
     );
     let lot = lot_size.as_decimal();
     anyhow::ensure!(lot > Decimal::ZERO, "instrument lot size must be positive");
+    anyhow::ensure!(
+        max_notional > Decimal::ZERO,
+        "maximum notional must be positive"
+    );
     let risk_quantity = ((risk_amount / risk_per_share) / lot).floor() * lot;
-    let capped = risk_quantity.min(max_quantity.as_decimal());
+    let notional_quantity = ((max_notional / entry.as_decimal()) / lot).floor() * lot;
+    let capped = risk_quantity
+        .min(max_quantity.as_decimal())
+        .min(notional_quantity);
     let normalized = (capped / lot).floor() * lot;
     if normalized <= Decimal::ZERO {
         return Ok(None);
@@ -3544,11 +3656,12 @@ open_updated = true
 
     fn signal_rules() -> SignalRules {
         SignalRules {
-            zone_ttl_bars: 78,
-            max_zones_per_side: 3,
-            confirmation_window_bars: 3,
-            displacement_atr_multiple: 1.5,
-            displacement_close_fraction: 0.25,
+            zone_ttl_bars: 234,
+            max_zones_per_side: 8,
+            confirmation_window_bars: 6,
+            displacement_atr_multiple: 1.0,
+            displacement_close_fraction: 0.35,
+            displacement_max_bars: 3,
             oversold: 20.0,
             overbought: 80.0,
         }
@@ -3568,10 +3681,13 @@ open_updated = true
                 MovingAverageType::Simple,
                 StochasticsDMethod::MovingAverage,
             ),
-            previous_five_minute_bar: None,
+            recent_five_minute_bars: VecDeque::new(),
+            last_demand_source: None,
+            last_supply_source: None,
             previous_k: None,
             demand: VecDeque::new(),
             supply: VecDeque::new(),
+            funnel: SignalFunnel::default(),
             rules: signal_rules(),
         };
 
@@ -3720,18 +3836,40 @@ open_updated = true
         let bullish_base = five_minute_bar("100.0", "102.0", "99.0", "101.0", 3);
         let bearish_displacement = five_minute_bar("101.0", "101.0", "96.0", "96.5", 4);
 
-        assert!(is_up_displacement(
-            bearish_base,
-            bullish_displacement,
-            2.0,
-            rules,
-        ));
-        assert!(is_down_displacement(
-            bullish_base,
-            bearish_displacement,
-            2.0,
-            rules,
-        ));
+        assert_eq!(
+            displacement_zone(
+                &VecDeque::from([bearish_base, bullish_displacement]),
+                2.0,
+                rules,
+            ),
+            Some((ZoneKind::Demand, bearish_base)),
+        );
+        assert_eq!(
+            displacement_zone(
+                &VecDeque::from([bullish_base, bearish_displacement]),
+                2.0,
+                rules,
+            ),
+            Some((ZoneKind::Supply, bullish_base)),
+        );
+    }
+
+    #[rstest::rstest]
+    fn test_displacement_can_complete_across_three_bars() {
+        let rules = signal_rules();
+        let source = five_minute_bar("100.0", "101.0", "98.0", "99.0", 1);
+        let first = five_minute_bar("99.0", "100.0", "98.8", "99.8", 2);
+        let second = five_minute_bar("99.8", "100.8", "99.6", "100.6", 3);
+        let third = five_minute_bar("100.6", "102.0", "100.5", "101.8", 4);
+
+        assert_eq!(
+            displacement_zone(&VecDeque::from([source, first, second]), 2.0, rules),
+            None,
+        );
+        assert_eq!(
+            displacement_zone(&VecDeque::from([source, first, second, third]), 2.0, rules,),
+            Some((ZoneKind::Demand, source)),
+        );
     }
 
     #[rstest::rstest]
@@ -3776,15 +3914,13 @@ open_updated = true
     }
 
     #[rstest::rstest]
-    fn test_zone_requires_extreme_after_touch_before_reentry() {
+    fn test_zone_accepts_reentry_on_the_touch_bar() {
         let rules = signal_rules();
         let source = five_minute_bar("100", "101", "99", "100", 1);
         let touch_and_reentry = five_minute_bar("102", "102", "100", "101", 2);
-        let extreme = five_minute_bar("101", "102", "100", "101", 3);
-        let confirmed = five_minute_bar("101", "102", "100", "101", 4);
         let mut zones = VecDeque::from([Zone::from_bar(ZoneKind::Demand, source)]);
 
-        assert_eq!(
+        assert!(
             observe_zones(
                 &mut zones,
                 touch_and_reentry,
@@ -3795,37 +3931,10 @@ open_updated = true
                 true,
                 OrderSide::Buy,
                 rules,
-            ),
-            None,
-        );
-        assert_eq!(
-            observe_zones(
-                &mut zones,
-                extreme,
-                Confirmation {
-                    extreme: true,
-                    reentry: false,
-                },
-                true,
-                OrderSide::Buy,
-                rules,
-            ),
-            None,
-        );
-        assert!(
-            observe_zones(
-                &mut zones,
-                confirmed,
-                Confirmation {
-                    extreme: false,
-                    reentry: true,
-                },
-                true,
-                OrderSide::Buy,
-                rules,
             )
             .is_some(),
         );
+        assert!(zones.is_empty());
     }
 
     #[rstest::rstest]
@@ -3922,6 +4031,7 @@ open_updated = true
             stop,
             Decimal::from(25),
             Quantity::from(20),
+            Decimal::from(5_000),
             Quantity::from(1),
         )
         .unwrap();
@@ -3939,6 +4049,21 @@ open_updated = true
         assert_eq!(entry_limit, Price::from("100.05"));
         assert_eq!(target, Price::from("104.11"));
         assert_eq!(quantity, Some(Quantity::from(12)));
+    }
+
+    #[rstest::rstest]
+    fn test_risk_sizing_reduces_quantity_to_the_notional_cap() {
+        let quantity = risk_sized_quantity(
+            Price::from("500.00"),
+            Price::from("499.50"),
+            Decimal::from(25),
+            Quantity::from(50),
+            Decimal::from(5_000),
+            Quantity::from(1),
+        )
+        .unwrap();
+
+        assert_eq!(quantity, Some(Quantity::from(10)));
     }
 
     #[rstest::rstest]
