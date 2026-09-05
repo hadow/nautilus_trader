@@ -291,8 +291,9 @@ pub fn parse_trades(
 ///
 /// # Errors
 ///
-/// Returns an error with symbol, bar type, timestamp, and OHLC context if a value cannot be
-/// represented or the candlestick violates Nautilus OHLC invariants.
+/// Longbridge occasionally returns a high/low which excludes its own open or close. The parser
+/// expands that envelope to preserve every observed OHLC price, then returns an error with symbol,
+/// bar type, timestamp, and source OHLC context if a value still cannot be represented.
 pub fn parse_bar(
     bar_type: BarType,
     candlestick: Candlestick,
@@ -305,8 +306,9 @@ pub fn parse_bar(
 ///
 /// # Errors
 ///
-/// Returns an error with symbol, bar type, timestamp, and OHLC context if a value cannot be
-/// represented or the candlestick violates Nautilus OHLC invariants.
+/// Longbridge occasionally returns a high/low which excludes its own open or close. The parser
+/// expands that envelope to preserve every observed OHLC price, then returns an error with symbol,
+/// bar type, timestamp, and source OHLC context if a value still cannot be represented.
 pub fn parse_bar_with_price_precision(
     bar_type: BarType,
     candlestick: Candlestick,
@@ -322,13 +324,21 @@ fn parse_bar_inner(
     ts_init: UnixNanos,
     price_precision: Option<u8>,
 ) -> anyhow::Result<Bar> {
-    let (timestamp, open, high, low, close) = (
+    let (timestamp, open, source_high, source_low, close) = (
         candlestick.timestamp,
         candlestick.open,
         candlestick.high,
         candlestick.low,
         candlestick.close,
     );
+    let high = source_high.max(open).max(close);
+    let low = source_low.min(open).min(close);
+    if high != source_high || low != source_low {
+        log::warn!(
+            "Normalizing invalid Longbridge OHLC envelope: symbol={}, bar_type={bar_type}, timestamp={timestamp}, open={open}, high={source_high}, low={source_low}, close={close}, normalized_high={high}, normalized_low={low}",
+            bar_type.instrument_id().symbol,
+        );
+    }
     let price = |value| match price_precision {
         Some(precision) => Price::from_decimal_dp(value, precision),
         None => Price::from_decimal(value),
@@ -347,7 +357,7 @@ fn parse_bar_inner(
     })()
     .with_context(|| {
         format!(
-            "invalid Longbridge bar: symbol={}, bar_type={bar_type}, timestamp={timestamp}, open={open}, high={high}, low={low}, close={close}",
+            "invalid Longbridge bar: symbol={}, bar_type={bar_type}, timestamp={timestamp}, open={open}, high={source_high}, low={source_low}, close={close}",
             bar_type.instrument_id().symbol,
         )
     })

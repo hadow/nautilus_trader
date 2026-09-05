@@ -34,29 +34,44 @@ assumptions rather than tick-level simulation.
 The SLC trader is a parameterized, bar-signal live strategy for US equities. Configure its symbols
 and exact price increments in [`examples/slc_symbols.toml`](examples/slc_symbols.toml), or point
 `LONGBRIDGE_SLC_CONFIG_PATH` at another TOML file. It defaults to Longbridge paper trading and one
-trade per symbol per day. Fresh and once-broken/reclaimed levels are retained in bounded per-side
-collections, and stochastic periods and confirmation windows are configurable. Entry orders are
-one-bar marketable limits sized from their worst allowed price. Every fill receives a
+strategy per symbol. Fresh and once-broken/reclaimed levels are retained in bounded per-side
+collections. Stochastic confirmation defaults to three bars and must close within 0.35 ATR of the
+level; both values are configurable. Entry orders are one-bar marketable limits sized from their
+worst allowed price. Every fill receives a
 market-if-touched protective stop, and its 2R target is recalculated from average fill price.
 Executable top-of-book quotes trigger the cancel-then-close target exit immediately; completed
-5-minute bars remain a conservative fallback. It requires realtime candlestick pushes;
+5-minute bars remain a conservative fallback. New entries stop at least 60 minutes before the
+pre-close flatten time, and exposure which has not reached 0.5R MFE after nine completed bars is
+closed; these thresholds are configurable. It requires realtime candlestick pushes;
 confirmed-only pushes would add a bar of signal latency.
 
 The SLC backtest uses the same strategy, symbol TOML and `LONGBRIDGE_SLC_*` parameters as the live
 example. Set `LONGBRIDGE_SLC_BACKTEST_START` and `LONGBRIDGE_SLC_BACKTEST_END` to UTC timestamps;
 the defaults replay August 2026. `LONGBRIDGE_SLC_BACKTEST_STARTING_BALANCE` defaults to
 `100_000 USD`, `LONGBRIDGE_SLC_BACKTEST_TIMEOUT_SECS` defaults to 300, and
-`LONGBRIDGE_SLC_BACKTEST_LOG_BARS=true` enables per-bar diagnostics. It warms up each symbol before
+`LONGBRIDGE_SLC_BACKTEST_LOG_BARS=true` enables per-bar diagnostics. Cost-stressed diagnostics
+subtract `LONGBRIDGE_SLC_BACKTEST_ROUND_TRIP_COST_PER_SHARE`, which defaults to USD 0.01 per share,
+while Nautilus engine statistics remain raw. It warms up each symbol before
 the requested window, skips US half trading days, sends only completed 5-minute bars to the matching
 engine, and advances 4-hour bars inside the strategy only when the next 4-hour period begins. Orders
-therefore cannot fill before the bar after their signal. The 2R fallback and stops use OHLC ranges,
+therefore cannot fill before the bar after their signal. Resting 2R targets and stops use adaptive
+OHLC high/low ordering, and diagnostics flag bars which touched both prices,
 so intrabar ordering, spreads, quote-trigger latency and broker commissions are not reconstructed;
 treat results as a bar-level estimate rather than evidence of stable profitability.
 
+Set `LONGBRIDGE_SLC_BACKTEST_RISK_REWARDS=1.5,1.75,2` to compare fixed targets after one historical
+download. Adding `LONGBRIDGE_SLC_BACKTEST_WALK_FORWARD_SPLIT=<UTC timestamp>` uses bars before the
+split for parameter selection and runs only the winning target after the split. Selection uses
+daily cost-adjusted Sharpe and reprices a target win as a full-risk loss when its OHLC bar also
+touched the stop; the final output reports OOS degradation and rejects non-positive or undefined
+Sharpe.
+
 All per-symbol strategies share a persisted SLC-owned risk ledger. Defaults cap open risk at USD 50,
-account notional at USD 5,000, simultaneous entries or positions at one, and realized daily loss at
-USD 50. Manual trades and positions owned by other strategies are outside this ledger, so use an
-isolated account. Override these with `LONGBRIDGE_SLC_MAX_OPEN_RISK`,
+account notional at USD 5,000, simultaneous entries or positions at two, and realized daily loss at
+USD 50. Each order receives at most an equal share of account notional across usable position slots,
+so the first expensive symbol cannot reserve the entire account limit. Manual trades and positions
+owned by other strategies are outside this ledger, so use an isolated account. Override these with
+`LONGBRIDGE_SLC_MAX_OPEN_RISK`,
 `LONGBRIDGE_SLC_MAX_ACCOUNT_NOTIONAL`, `LONGBRIDGE_SLC_MAX_OPEN_POSITIONS`, and
 `LONGBRIDGE_SLC_DAILY_LOSS_LIMIT`. `LONGBRIDGE_SLC_RISK_STATE_PATH` selects the state file; paper and
 live routing use separate files under `target/` by default. Corrupt state prevents startup, and a
