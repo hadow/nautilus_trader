@@ -20,7 +20,7 @@ symbol = "AMD.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "U.US"
+symbol = "BABA.US"
 price_increment = "0.01"
 
 [[symbols]]
@@ -33,10 +33,6 @@ price_increment = "0.01"
 
 [[symbols]]
 symbol = "BA.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "INTU.US"
 price_increment = "0.01"
 
 [[symbols]]
