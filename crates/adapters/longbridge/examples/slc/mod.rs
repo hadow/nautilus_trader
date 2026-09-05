@@ -181,6 +181,7 @@ struct AppConfig {
     max_open_positions: usize,
     max_order_quantity: Quantity,
     max_order_notional: Decimal,
+    minimum_risk_utilization: Decimal,
     max_entry_slippage_ticks: u64,
     risk_reward: Decimal,
     stop_buffer_ticks: u64,
@@ -193,6 +194,7 @@ struct AppConfig {
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
     confirmation_max_distance_atr: f64,
+    confirmation_min_close_location: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
@@ -249,6 +251,7 @@ impl AppConfig {
         let max_open_positions = env_parse("LONGBRIDGE_SLC_MAX_OPEN_POSITIONS", "2")?;
         let max_order_quantity = env_parse("LONGBRIDGE_SLC_MAX_ORDER_QUANTITY", "500")?;
         let max_order_notional = env_parse("LONGBRIDGE_SLC_MAX_ORDER_NOTIONAL", "5000")?;
+        let minimum_risk_utilization = env_parse("LONGBRIDGE_SLC_MIN_RISK_UTILIZATION", "0.10")?;
         let max_entry_slippage_ticks = env_parse("LONGBRIDGE_SLC_MAX_ENTRY_SLIPPAGE_TICKS", "5")?;
         let risk_reward = env_parse("LONGBRIDGE_SLC_RISK_REWARD", "2")?;
         anyhow::ensure!(risk_amount > Decimal::ZERO, "risk amount must be positive");
@@ -284,6 +287,10 @@ impl AppConfig {
             max_order_notional <= max_account_notional,
             "maximum order notional must not exceed maximum account notional",
         );
+        anyhow::ensure!(
+            (Decimal::ZERO..=Decimal::ONE).contains(&minimum_risk_utilization),
+            "minimum risk utilization must be between 0 and 1",
+        );
         anyhow::ensure!(risk_reward > Decimal::ZERO, "risk reward must be positive");
 
         let atr_period: usize = env_parse("LONGBRIDGE_SLC_ATR_PERIOD", "14")?;
@@ -297,6 +304,8 @@ impl AppConfig {
         let confirmation_window_bars = env_parse("LONGBRIDGE_SLC_CONFIRMATION_WINDOW_BARS", "3")?;
         let confirmation_max_distance_atr =
             env_parse("LONGBRIDGE_SLC_CONFIRMATION_MAX_DISTANCE_ATR", "0.35")?;
+        let confirmation_min_close_location =
+            env_parse("LONGBRIDGE_SLC_CONFIRMATION_MIN_CLOSE_LOCATION", "0.55")?;
         let stochastic_k_period: usize = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_PERIOD", "5")?;
         let stochastic_k_smoothing = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_SMOOTHING", "3")?;
         let stochastic_d_period = env_parse("LONGBRIDGE_SLC_STOCHASTIC_D_PERIOD", "3")?;
@@ -331,6 +340,10 @@ impl AppConfig {
         anyhow::ensure!(
             (0.0..=2.0).contains(&confirmation_max_distance_atr),
             "confirmation maximum distance ATR must be between 0 and 2",
+        );
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&confirmation_min_close_location),
+            "confirmation minimum close location must be between 0 and 1",
         );
         anyhow::ensure!(
             stochastic_k_period > 0 && stochastic_k_smoothing > 0 && stochastic_d_period > 0,
@@ -400,6 +413,7 @@ impl AppConfig {
             max_open_positions,
             max_order_quantity,
             max_order_notional,
+            minimum_risk_utilization,
             max_entry_slippage_ticks,
             risk_reward,
             stop_buffer_ticks: env_parse("LONGBRIDGE_SLC_STOP_BUFFER_TICKS", "1")?,
@@ -412,6 +426,7 @@ impl AppConfig {
             max_zones_per_side,
             confirmation_window_bars,
             confirmation_max_distance_atr,
+            confirmation_min_close_location,
             stochastic_k_period,
             stochastic_k_smoothing,
             stochastic_d_period,
@@ -914,10 +929,12 @@ impl Zone {
 
         self.confirmation_armed |= confirmation.extreme;
         let distance_atr = zone_distance_atr(*self, bar.close, self.atr_at_creation);
+        let close_location = directional_close_location(bar, side);
         if allow_entry
             && self.confirmation_armed
             && confirmation.reentry
             && distance_atr <= rules.confirmation_max_distance_atr
+            && close_location >= rules.confirmation_min_close_location
         {
             return ZoneObservation::Signal(Signal {
                 side,
@@ -934,6 +951,7 @@ impl Zone {
                     rules.confirmation_window_bars + 1 - self.confirmation_bars_left,
                 )
                 .unwrap_or(u64::MAX),
+                confirmation_close_location: close_location,
                 distance_atr,
                 zone_width_atr: (self.high.as_f64() - self.low.as_f64()) / self.atr_at_creation,
                 displacement_strength_atr: self.displacement_strength_atr,
@@ -959,6 +977,7 @@ struct Signal {
     zone_high: Price,
     level_age_bars: u64,
     confirmation_bars: u64,
+    confirmation_close_location: f64,
     distance_atr: f64,
     zone_width_atr: f64,
     displacement_strength_atr: f64,
@@ -1028,6 +1047,7 @@ struct SignalRules {
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
     confirmation_max_distance_atr: f64,
+    confirmation_min_close_location: f64,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
@@ -1117,6 +1137,7 @@ impl SlcSignalState {
                 max_zones_per_side: config.max_zones_per_side,
                 confirmation_window_bars: config.confirmation_window_bars,
                 confirmation_max_distance_atr: config.confirmation_max_distance_atr,
+                confirmation_min_close_location: config.confirmation_min_close_location,
                 displacement_atr_multiple: config.displacement_atr_multiple,
                 displacement_close_fraction: config.displacement_close_fraction,
                 displacement_max_bars: config.displacement_max_bars,
@@ -1411,6 +1432,7 @@ impl Default for AccountRiskState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum RiskRejectionReason {
     ZeroQuantity,
+    RiskUnderutilized,
     SymbolTradeLimit,
     AccountHalted,
     DailyLoss,
@@ -1424,6 +1446,7 @@ impl Display for RiskRejectionReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ZeroQuantity => write!(f, "zero_quantity"),
+            Self::RiskUnderutilized => write!(f, "risk_underutilized"),
             Self::SymbolTradeLimit => write!(f, "symbol_trade_limit"),
             Self::AccountHalted => write!(f, "account_halted"),
             Self::DailyLoss => write!(f, "daily_loss_limit"),
@@ -1725,6 +1748,19 @@ fn zone_distance_atr(zone: Zone, close: Price, atr: f64) -> f64 {
     distance / atr
 }
 
+/// Returns how near the confirmation close is to the favorable end of its candle range.
+fn directional_close_location(bar: Bar, side: OrderSide) -> f64 {
+    let range = bar.high.as_f64() - bar.low.as_f64();
+    if range <= 0.0 {
+        return 0.0;
+    }
+    match side {
+        OrderSide::Buy => (bar.close.as_f64() - bar.low.as_f64()) / range,
+        OrderSide::Sell => (bar.high.as_f64() - bar.close.as_f64()) / range,
+        OrderSide::NoOrderSide => 0.0,
+    }
+}
+
 /// Returns whether stale exposure lacks the configured favorable excursion.
 fn should_request_time_stop(
     bars_held: u64,
@@ -1868,6 +1904,7 @@ struct ClosedTradeStatistics {
     level: SignalLevel,
     level_age_bars: u64,
     confirmation_bars: u64,
+    confirmation_close_location: f64,
     distance_atr: f64,
     zone_width_atr: f64,
     displacement_strength_atr: f64,
@@ -1878,6 +1915,7 @@ struct ClosedTradeStatistics {
     exit_reason: TradeExitReason,
     realized_pnl: Option<Decimal>,
     estimated_cost: Decimal,
+    entry_slippage_stress: Decimal,
     initial_risk: Decimal,
     risk_utilization: Decimal,
     r_multiple: Option<Decimal>,
@@ -1891,13 +1929,13 @@ impl ClosedTradeStatistics {
         self.realized_pnl.map(|pnl| pnl - self.estimated_cost)
     }
 
-    /// Reprices target wins on path-ambiguous bars as full-risk losses for robust selection.
+    /// Applies maximum permitted entry slippage and reprices ambiguous target bars as losses.
     fn conservative_pnl(self) -> Option<Decimal> {
         self.cost_adjusted_pnl().map(|pnl| {
             if self.ambiguous_exit_bar && self.exit_reason == TradeExitReason::Target {
-                -self.initial_risk - self.estimated_cost
+                -self.initial_risk - self.estimated_cost - self.entry_slippage_stress
             } else {
-                pnl
+                pnl - self.entry_slippage_stress
             }
         })
     }
@@ -2022,13 +2060,67 @@ impl RunStatistics {
     }
 }
 
-/// Computes daily cost-adjusted Sharpe, penalizing unknown OHLC paths before parameter selection.
-fn conservative_cost_adjusted_sharpe(
+#[derive(Clone, Copy, Debug, Default)]
+struct BacktestRiskMetrics {
+    sharpe: Option<f64>,
+    max_drawdown_pct: Option<f64>,
+    annualized_return_pct: Option<f64>,
+    calmar: Option<f64>,
+    positive_days: u64,
+    negative_days: u64,
+    flat_days: u64,
+}
+
+/// Computes daily equity risk metrics from exact PnL, including zero-trade sessions.
+fn risk_metrics_from_daily_pnl(
+    daily_pnl: &[Decimal],
+    starting_balance: Decimal,
+) -> Option<BacktestRiskMetrics> {
+    if daily_pnl.is_empty() || starting_balance <= Decimal::ZERO {
+        return None;
+    }
+    let mut equity = starting_balance;
+    let mut peak = starting_balance;
+    let mut max_drawdown = 0.0_f64;
+    let mut returns = Vec::with_capacity(daily_pnl.len());
+    let mut metrics = BacktestRiskMetrics::default();
+    for pnl in daily_pnl {
+        if equity <= Decimal::ZERO {
+            return None;
+        }
+        returns.push((*pnl / equity).to_f64()?);
+        match pnl.cmp(&Decimal::ZERO) {
+            std::cmp::Ordering::Greater => metrics.positive_days += 1,
+            std::cmp::Ordering::Less => metrics.negative_days += 1,
+            std::cmp::Ordering::Equal => metrics.flat_days += 1,
+        }
+        equity += *pnl;
+        if equity <= Decimal::ZERO {
+            return None;
+        }
+        peak = peak.max(equity);
+        max_drawdown = max_drawdown.min((equity / peak).to_f64()? - 1.0);
+    }
+    let day_count = u32::try_from(daily_pnl.len()).ok()?;
+    let annualized_return = (equity / starting_balance)
+        .to_f64()?
+        .powf(252.0 / f64::from(day_count))
+        - 1.0;
+    metrics.sharpe = annualized_sharpe(&returns);
+    metrics.max_drawdown_pct = Some(max_drawdown * 100.0);
+    metrics.annualized_return_pct = Some(annualized_return * 100.0);
+    metrics.calmar =
+        (max_drawdown < -f64::EPSILON).then_some(annualized_return / max_drawdown.abs());
+    Some(metrics)
+}
+
+/// Computes cost-, entry-slippage-, and ambiguous-path-stressed daily portfolio metrics.
+fn conservative_risk_metrics(
     statistics: &RunStatistics,
     trading_days: &BTreeSet<String>,
     starting_balance: Money,
     timezone: &TimeZone,
-) -> Option<f64> {
+) -> Option<BacktestRiskMetrics> {
     let mut pnl_by_day: BTreeMap<String, Decimal> = BTreeMap::new();
     for trade in statistics
         .symbols
@@ -2045,17 +2137,11 @@ fn conservative_cost_adjusted_sharpe(
         *pnl_by_day.entry(date).or_default() += pnl;
     }
 
-    let mut equity = starting_balance.as_decimal();
-    let mut returns = Vec::with_capacity(trading_days.len());
-    for date in trading_days {
-        if equity <= Decimal::ZERO {
-            return None;
-        }
-        let pnl = pnl_by_day.get(date).copied().unwrap_or_default();
-        returns.push((pnl / equity).to_f64()?);
-        equity += pnl;
-    }
-    annualized_sharpe(&returns)
+    let daily_pnl = trading_days
+        .iter()
+        .map(|date| pnl_by_day.get(date).copied().unwrap_or_default())
+        .collect::<Vec<_>>();
+    risk_metrics_from_daily_pnl(&daily_pnl, starting_balance.as_decimal())
 }
 
 #[derive(Debug, Default)]
@@ -2065,10 +2151,12 @@ struct TradeAggregate {
     cost_adjusted_wins: u64,
     realized_pnl: Decimal,
     estimated_cost: Decimal,
+    entry_slippage_stress: Decimal,
     cost_adjusted_pnl: Decimal,
     conservative_pnl: Decimal,
     r_sum: Decimal,
     cost_adjusted_r_sum: Decimal,
+    conservative_r_sum: Decimal,
     r_count: u64,
     initial_risk_sum: Decimal,
     risk_utilization_sum: Decimal,
@@ -2077,6 +2165,7 @@ struct TradeAggregate {
     holding_bars: u64,
     level_age_bars: u64,
     confirmation_bars: u64,
+    confirmation_close_location_sum: f64,
     distance_atr_sum: f64,
     zone_width_atr_sum: f64,
     displacement_strength_atr_sum: f64,
@@ -2096,10 +2185,12 @@ impl TradeAggregate {
             aggregate.holding_bars += trade.holding_bars;
             aggregate.level_age_bars += trade.level_age_bars;
             aggregate.confirmation_bars += trade.confirmation_bars;
+            aggregate.confirmation_close_location_sum += trade.confirmation_close_location;
             aggregate.distance_atr_sum += trade.distance_atr;
             aggregate.zone_width_atr_sum += trade.zone_width_atr;
             aggregate.displacement_strength_atr_sum += trade.displacement_strength_atr;
             aggregate.estimated_cost += trade.estimated_cost;
+            aggregate.entry_slippage_stress += trade.entry_slippage_stress;
             aggregate.ambiguous_exit_bars += u64::from(trade.ambiguous_exit_bar);
             if let Some(pnl) = trade.realized_pnl {
                 let cost_adjusted_pnl = trade
@@ -2114,6 +2205,10 @@ impl TradeAggregate {
                 aggregate.cost_adjusted_wins += u64::from(cost_adjusted_pnl > Decimal::ZERO);
                 if trade.initial_risk > Decimal::ZERO {
                     aggregate.cost_adjusted_r_sum += cost_adjusted_pnl / trade.initial_risk;
+                    aggregate.conservative_r_sum += trade
+                        .conservative_pnl()
+                        .expect("realized PnL checked above")
+                        / trade.initial_risk;
                 }
             }
             if let Some(r_multiple) = trade.r_multiple {
@@ -2130,6 +2225,7 @@ impl TradeAggregate {
         let cost_adjusted_win_rate = average(self.cost_adjusted_wins * 100, self.trades);
         let average_r = decimal_average(self.r_sum, self.r_count);
         let average_cost_adjusted_r = decimal_average(self.cost_adjusted_r_sum, self.r_count);
+        let average_conservative_r = decimal_average(self.conservative_r_sum, self.r_count);
         let average_initial_risk = decimal_average(self.initial_risk_sum, self.trades);
         let average_risk_utilization = decimal_average(self.risk_utilization_sum, self.trades);
         let average_mfe_r = decimal_average(self.mfe_r_sum, self.trades);
@@ -2137,16 +2233,19 @@ impl TradeAggregate {
         let average_holding_bars = average(self.holding_bars, self.trades);
         let average_level_age_bars = average(self.level_age_bars, self.trades);
         let average_confirmation_bars = average(self.confirmation_bars, self.trades);
+        let average_confirmation_close_location =
+            float_average(self.confirmation_close_location_sum, self.trades);
         let average_distance_atr = float_average(self.distance_atr_sum, self.trades);
         let average_zone_width_atr = float_average(self.zone_width_atr_sum, self.trades);
         let average_displacement_atr =
             float_average(self.displacement_strength_atr_sum, self.trades);
         format!(
-            "trades={}, wins={}, win_rate_pct={win_rate}, cost_adjusted_win_rate_pct={cost_adjusted_win_rate}, realized_pnl={}, estimated_cost={}, cost_adjusted_pnl={}, conservative_pnl={}, average_r={average_r}, average_cost_adjusted_r={average_cost_adjusted_r}, average_initial_risk={average_initial_risk}, average_risk_utilization={average_risk_utilization}, average_mfe_r={average_mfe_r}, average_mae_r={average_mae_r}, average_holding_bars={average_holding_bars}, average_level_age_bars={average_level_age_bars}, average_confirmation_bars={average_confirmation_bars}, average_distance_atr={average_distance_atr}, average_zone_width_atr={average_zone_width_atr}, average_displacement_atr={average_displacement_atr}, ambiguous_exit_bars={}",
+            "trades={}, wins={}, win_rate_pct={win_rate}, cost_adjusted_win_rate_pct={cost_adjusted_win_rate}, realized_pnl={}, estimated_cost={}, entry_slippage_stress={}, cost_adjusted_pnl={}, conservative_pnl={}, average_r={average_r}, average_cost_adjusted_r={average_cost_adjusted_r}, average_conservative_r={average_conservative_r}, average_initial_risk={average_initial_risk}, average_risk_utilization={average_risk_utilization}, average_mfe_r={average_mfe_r}, average_mae_r={average_mae_r}, average_holding_bars={average_holding_bars}, average_level_age_bars={average_level_age_bars}, average_confirmation_bars={average_confirmation_bars}, average_confirmation_close_location={average_confirmation_close_location}, average_distance_atr={average_distance_atr}, average_zone_width_atr={average_zone_width_atr}, average_displacement_atr={average_displacement_atr}, ambiguous_exit_bars={}",
             self.trades,
             self.wins,
             self.realized_pnl,
             self.estimated_cost,
+            self.entry_slippage_stress,
             self.cost_adjusted_pnl,
             self.conservative_pnl,
             self.ambiguous_exit_bars,
@@ -2227,6 +2326,7 @@ struct SlcStrategyConfig {
     account_risk_limits: AccountRiskLimits,
     max_order_quantity: Quantity,
     max_order_notional: Decimal,
+    minimum_risk_utilization: Decimal,
     max_entry_slippage_ticks: u64,
     risk_reward: Decimal,
     stop_buffer_ticks: u64,
@@ -2243,6 +2343,7 @@ struct PendingEntry {
     level: SignalLevel,
     level_age_bars: u64,
     confirmation_bars: u64,
+    confirmation_close_location: f64,
     distance_atr: f64,
     zone_width_atr: f64,
     displacement_strength_atr: f64,
@@ -2258,10 +2359,12 @@ struct ActiveTrade {
     level: SignalLevel,
     level_age_bars: u64,
     confirmation_bars: u64,
+    confirmation_close_location: f64,
     distance_atr: f64,
     zone_width_atr: f64,
     displacement_strength_atr: f64,
     entry_minute: u16,
+    entry_limit: Price,
     stop: Price,
     target: Price,
     first_fill_ts: UnixNanos,
@@ -2456,6 +2559,7 @@ impl SlcStrategy {
                 },
                 max_order_quantity: app_config.max_order_quantity,
                 max_order_notional: app_config.per_position_notional_limit(),
+                minimum_risk_utilization: app_config.minimum_risk_utilization,
                 max_entry_slippage_ticks: app_config.max_entry_slippage_ticks,
                 risk_reward: app_config.risk_reward,
                 stop_buffer_ticks: app_config.stop_buffer_ticks,
@@ -2765,6 +2869,23 @@ impl SlcStrategy {
             reservation.notional <= self.config.max_order_notional,
             "SLC quantity sizing exceeded configured order notional",
         );
+        let risk_utilization = risk_utilization(reservation.risk, self.config.risk_amount);
+        if risk_utilization < self.config.minimum_risk_utilization {
+            self.record_risk_rejection(RiskRejectionReason::RiskUnderutilized);
+            log::warn!(
+                "[{}] Skipping SLC signal: risk_rejection={}, level={}, candidate_risk={}, risk_budget={}, risk_utilization={}, minimum_risk_utilization={}, candidate_notional={}, max_notional={}",
+                self.config.instrument_id,
+                RiskRejectionReason::RiskUnderutilized,
+                signal.level,
+                reservation.risk,
+                self.config.risk_amount,
+                risk_utilization.round_dp(4),
+                self.config.minimum_risk_utilization,
+                reservation.notional,
+                self.config.max_order_notional,
+            );
+            return Ok(());
+        }
         let symbol = self.config.instrument_id.symbol.to_string();
         let (outcome, snapshot) = self.account_risk.reserve_entry(
             &symbol,
@@ -2822,6 +2943,7 @@ impl SlcStrategy {
             level: signal.level,
             level_age_bars: signal.level_age_bars,
             confirmation_bars: signal.confirmation_bars,
+            confirmation_close_location: signal.confirmation_close_location,
             distance_atr: signal.distance_atr,
             zone_width_atr: signal.zone_width_atr,
             displacement_strength_atr: signal.displacement_strength_atr,
@@ -2838,12 +2960,13 @@ impl SlcStrategy {
         self.entries_submitted += 1;
         self.update_run_statistics(|statistics| statistics.entries_submitted += 1);
         log::info!(
-            "[{}] Submitted SLC {} entry: level={}, confirmation=stochastic_reentry, level_age_bars={}, confirmation_bars={}, distance_atr={:.4}, zone_width_atr={:.4}, displacement_atr={:.4}, quantity={}, signal_close={}, entry_limit={}, stop={}, reserved_risk={}, reserved_notional={}",
+            "[{}] Submitted SLC {} entry: level={}, confirmation=stochastic_reentry, level_age_bars={}, confirmation_bars={}, confirmation_close_location={:.4}, distance_atr={:.4}, zone_width_atr={:.4}, displacement_atr={:.4}, quantity={}, signal_close={}, entry_limit={}, stop={}, reserved_risk={}, risk_utilization={}, reserved_notional={}",
             self.config.instrument_id,
             signal.side,
             signal.level,
             signal.level_age_bars,
             signal.confirmation_bars,
+            signal.confirmation_close_location,
             signal.distance_atr,
             signal.zone_width_atr,
             signal.displacement_strength_atr,
@@ -2852,6 +2975,7 @@ impl SlcStrategy {
             entry_limit,
             stop,
             reservation.risk,
+            risk_utilization.round_dp(4),
             reservation.notional,
         );
         Ok(())
@@ -3007,10 +3131,12 @@ impl SlcStrategy {
             level: pending.level,
             level_age_bars: pending.level_age_bars,
             confirmation_bars: pending.confirmation_bars,
+            confirmation_close_location: pending.confirmation_close_location,
             distance_atr: pending.distance_atr,
             zone_width_atr: pending.zone_width_atr,
             displacement_strength_atr: pending.displacement_strength_atr,
             entry_minute,
+            entry_limit: pending.entry_limit,
             stop: pending.stop,
             target,
             first_fill_ts,
@@ -3321,6 +3447,7 @@ nautilus_strategy!(SlcStrategy, {
         let mut mfe_r = None;
         let mut mae_r = None;
         let mut estimated_cost = None;
+        let mut entry_slippage_stress = None;
         if let Some(active) = active_trade {
             exit_reason = active.exit_reason.unwrap_or(TradeExitReason::Unknown);
             level = Some(active.level);
@@ -3329,11 +3456,17 @@ nautilus_strategy!(SlcStrategy, {
             let trade_mfe_r = active.mfe_r();
             let trade_mae_r = active.mae_r();
             let trade_estimated_cost = active.filled_qty * self.config.round_trip_cost_per_share;
+            let trade_entry_slippage_stress = if self.backtest_four_hour_bars.is_some() {
+                (active.entry_limit.as_decimal() - active.average_fill()).abs() * active.filled_qty
+            } else {
+                Decimal::ZERO
+            };
             risk_utilization = Some(utilization);
             holding_bars = Some(active.bars_held);
             mfe_r = Some(trade_mfe_r);
             mae_r = Some(trade_mae_r);
             estimated_cost = Some(trade_estimated_cost);
+            entry_slippage_stress = Some(trade_entry_slippage_stress);
             r_multiple = if active.initial_risk > Decimal::ZERO {
                 realized_pnl.map(|pnl| pnl / active.initial_risk)
             } else {
@@ -3346,6 +3479,7 @@ nautilus_strategy!(SlcStrategy, {
                     level: active.level,
                     level_age_bars: active.level_age_bars,
                     confirmation_bars: active.confirmation_bars,
+                    confirmation_close_location: active.confirmation_close_location,
                     distance_atr: active.distance_atr,
                     zone_width_atr: active.zone_width_atr,
                     displacement_strength_atr: active.displacement_strength_atr,
@@ -3356,6 +3490,7 @@ nautilus_strategy!(SlcStrategy, {
                     exit_reason,
                     realized_pnl,
                     estimated_cost: trade_estimated_cost,
+                    entry_slippage_stress: trade_entry_slippage_stress,
                     initial_risk: active.initial_risk,
                     risk_utilization: utilization,
                     r_multiple,
@@ -3392,12 +3527,14 @@ nautilus_strategy!(SlcStrategy, {
             Ok(snapshot) => {
                 self.session_disabled |= snapshot.halted;
                 log::info!(
-                    "[{}] SLC position closed: exit_reason={}, level={}, realized_pnl={:?}, estimated_cost={}, initial_risk={}, risk_utilization={}, actual_r={}, holding_bars={}, mfe_r={}, mae_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}",
+                    "[{}] SLC position closed: exit_reason={}, level={}, realized_pnl={:?}, estimated_cost={}, entry_slippage_stress={}, initial_risk={}, risk_utilization={}, actual_r={}, holding_bars={}, mfe_r={}, mae_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}",
                     self.config.instrument_id,
                     exit_reason,
                     level.map_or_else(|| "unknown".to_string(), |level| level.to_string()),
                     realized_pnl,
                     estimated_cost.map_or_else(|| "n/a".to_string(), |cost| cost.to_string()),
+                    entry_slippage_stress
+                        .map_or_else(|| "n/a".to_string(), |cost| cost.to_string()),
                     initial_risk.map_or_else(|| "n/a".to_string(), |risk| risk.to_string()),
                     risk_utilization
                         .map_or_else(|| "n/a".to_string(), |value| value.round_dp(4).to_string()),
@@ -3437,7 +3574,7 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.five_minute_bar_type, None, None);
         if self.backtest_four_hour_bars.is_some() {
             log::info!(
-                "[{}] SLC backtest active: 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, time_stop_bars={}, time_stop_minimum_mfe_r={}, estimated_round_trip_cost_per_share={}",
+                "[{}] SLC backtest active: 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, estimated_round_trip_cost_per_share={}",
                 self.config.instrument_id,
                 self.config.five_minute_bar_type,
                 self.backtest_four_hour_bars
@@ -3449,6 +3586,8 @@ impl DataActor for SlcStrategy {
                 self.config.entry_end_minute % 60,
                 self.config.flatten_minute / 60,
                 self.config.flatten_minute % 60,
+                self.signals.rules.confirmation_min_close_location,
+                self.config.minimum_risk_utilization,
                 self.config.time_stop_bars,
                 self.config.time_stop_minimum_mfe_r,
                 self.config.round_trip_cost_per_share,
@@ -3469,7 +3608,7 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.four_hour_bar_type, None, None);
         self.subscribe_quotes(self.config.instrument_id, None, None);
         log::info!(
-            "[{}] SLC subscriptions active: quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, time_stop_bars={}, time_stop_minimum_mfe_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
+            "[{}] SLC subscriptions active: quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
             self.config.instrument_id,
             self.config.five_minute_bar_type,
             self.config.four_hour_bar_type,
@@ -3479,6 +3618,8 @@ impl DataActor for SlcStrategy {
             self.config.entry_end_minute % 60,
             self.config.flatten_minute / 60,
             self.config.flatten_minute % 60,
+            self.signals.rules.confirmation_min_close_location,
+            self.config.minimum_risk_utilization,
             self.config.time_stop_bars,
             self.config.time_stop_minimum_mfe_r,
             snapshot.halted,
@@ -3857,6 +3998,11 @@ fn risk_sized_quantity(
     Ok(Some(Quantity::from_decimal(normalized)?))
 }
 
+/// Returns the exact fraction of the configured per-trade risk represented by an order.
+fn risk_utilization(reserved_risk: Decimal, risk_amount: Decimal) -> Decimal {
+    reserved_risk / risk_amount
+}
+
 struct PreparedInputs {
     instrument_id: InstrumentId,
     instrument: InstrumentAny,
@@ -4052,6 +4198,12 @@ struct BacktestEvaluation {
     trades: u64,
     conservative_pnl: Decimal,
     conservative_cost_adjusted_sharpe: Option<f64>,
+    conservative_max_drawdown_pct: Option<f64>,
+    conservative_annualized_return_pct: Option<f64>,
+    conservative_calmar: Option<f64>,
+    positive_days: u64,
+    negative_days: u64,
+    flat_days: u64,
     engine_sharpe: Option<f64>,
 }
 
@@ -4059,11 +4211,17 @@ impl BacktestEvaluation {
     /// Produces one grep-friendly comparison record for target selection and review.
     fn summary(self, sample: &str) -> String {
         format!(
-            "SLC parameter evaluation: sample={sample}, risk_reward={}, trades={}, conservative_pnl={}, conservative_cost_adjusted_sharpe={}, engine_sharpe={}",
+            "SLC parameter evaluation: sample={sample}, risk_reward={}, trades={}, conservative_pnl={}, conservative_cost_adjusted_sharpe={}, conservative_max_drawdown_pct={}, conservative_annualized_return_pct={}, conservative_calmar={}, positive_days={}, negative_days={}, flat_days={}, engine_sharpe={}",
             self.risk_reward,
             self.trades,
             self.conservative_pnl,
             format_optional_metric(self.conservative_cost_adjusted_sharpe),
+            format_optional_metric(self.conservative_max_drawdown_pct),
+            format_optional_metric(self.conservative_annualized_return_pct),
+            format_optional_metric(self.conservative_calmar),
+            self.positive_days,
+            self.negative_days,
+            self.flat_days,
             format_optional_metric(self.engine_sharpe),
         )
     }
@@ -4656,7 +4814,7 @@ fn run_backtest_engine(
         println!("{line}");
     }
 
-    let (aggregate, conservative_cost_adjusted_sharpe) = {
+    let (aggregate, risk_metrics) = {
         let statistics = run_statistics
             .lock()
             .map_err(|_| anyhow::anyhow!("SLC run statistics mutex was poisoned"))?;
@@ -4667,7 +4825,7 @@ fn run_backtest_engine(
                     .values()
                     .flat_map(|symbol| symbol.trades.iter()),
             ),
-            conservative_cost_adjusted_sharpe(
+            conservative_risk_metrics(
                 &statistics,
                 &trading_days,
                 config.starting_balance,
@@ -4675,6 +4833,7 @@ fn run_backtest_engine(
             ),
         )
     };
+    let risk_metrics = risk_metrics.unwrap_or_default();
 
     let result = engine.get_result();
     println!(
@@ -4689,7 +4848,13 @@ fn run_backtest_engine(
         risk_reward: config.strategy.risk_reward,
         trades: aggregate.trades,
         conservative_pnl: aggregate.conservative_pnl,
-        conservative_cost_adjusted_sharpe,
+        conservative_cost_adjusted_sharpe: risk_metrics.sharpe,
+        conservative_max_drawdown_pct: risk_metrics.max_drawdown_pct,
+        conservative_annualized_return_pct: risk_metrics.annualized_return_pct,
+        conservative_calmar: risk_metrics.calmar,
+        positive_days: risk_metrics.positive_days,
+        negative_days: risk_metrics.negative_days,
+        flat_days: risk_metrics.flat_days,
         engine_sharpe: result.stats_returns.get("Sharpe Ratio (252 days)").copied(),
     };
     println!("{}", evaluation.summary(sample));
@@ -4744,10 +4909,14 @@ async fn run_backtest() -> anyhow::Result<()> {
             .filter(|_| in_sample_sharpe != 0.0)
             .map(|sharpe| sharpe / in_sample_sharpe);
         println!(
-            "SLC walk-forward result: split={split}, selected_risk_reward={}, is_conservative_cost_adjusted_sharpe={}, oos_conservative_cost_adjusted_sharpe={}, degradation_ratio={}, verdict={verdict}",
+            "SLC walk-forward result: split={split}, selected_risk_reward={}, is_conservative_cost_adjusted_sharpe={}, oos_conservative_cost_adjusted_sharpe={}, is_conservative_max_drawdown_pct={}, oos_conservative_max_drawdown_pct={}, is_conservative_calmar={}, oos_conservative_calmar={}, degradation_ratio={}, verdict={verdict}",
             winner.risk_reward,
             format_optional_metric(Some(in_sample_sharpe)),
             format_optional_metric(out_of_sample_sharpe),
+            format_optional_metric(winner.conservative_max_drawdown_pct),
+            format_optional_metric(out_of_sample_evaluation.conservative_max_drawdown_pct),
+            format_optional_metric(winner.conservative_calmar),
+            format_optional_metric(out_of_sample_evaluation.conservative_calmar),
             format_optional_metric(degradation),
         );
         Ok(())
@@ -5076,6 +5245,7 @@ open_updated = true
             max_zones_per_side: 8,
             confirmation_window_bars: 6,
             confirmation_max_distance_atr: 0.35,
+            confirmation_min_close_location: 0.55,
             displacement_atr_multiple: 1.0,
             displacement_close_fraction: 0.35,
             displacement_max_bars: 3,
@@ -5391,7 +5561,7 @@ open_updated = true
     fn test_zone_accepts_reentry_on_the_touch_bar() {
         let rules = signal_rules();
         let source = five_minute_bar("100", "101", "99", "100", 1);
-        let touch_and_reentry = five_minute_bar("102", "102", "100", "101", 2);
+        let touch_and_reentry = five_minute_bar("102", "102", "100", "101.2", 2);
         let mut zones = VecDeque::from([Zone::from_bar(ZoneKind::Demand, source)]);
 
         assert!(
@@ -5409,6 +5579,28 @@ open_updated = true
             .is_some(),
         );
         assert!(zones.is_empty());
+    }
+
+    #[rstest::rstest]
+    fn test_zone_rejects_reentry_without_price_confirmation() {
+        let rules = signal_rules();
+        let source = five_minute_bar("100", "101", "99", "100", 1);
+        let weak_reentry = five_minute_bar("101", "102", "100", "101", 2);
+        let mut zones = VecDeque::from([Zone::from_bar(ZoneKind::Demand, source)]);
+
+        let signal = observe_zones(
+            &mut zones,
+            weak_reentry,
+            Confirmation {
+                extreme: false,
+                reentry: true,
+            },
+            true,
+            OrderSide::Buy,
+            rules,
+        );
+
+        assert!(signal.is_none());
     }
 
     #[rstest::rstest]
@@ -5470,7 +5662,7 @@ open_updated = true
         let still_above = five_minute_bar("102", "104", "101", "103", 3);
         let reclaimed = five_minute_bar("102", "102", "98", "98.5", 4);
         let retest = five_minute_bar("98", "100", "97", "99.5", 5);
-        let confirmed = five_minute_bar("99", "100", "97", "98.5", 6);
+        let confirmed = five_minute_bar("99", "100", "98", "98.5", 6);
         let mut zones = VecDeque::from([Zone::from_bar(ZoneKind::Supply, source)]);
         let idle = Confirmation {
             extreme: false,
@@ -5551,6 +5743,7 @@ open_updated = true
             zone_high: Price::from("99.00"),
             level_age_bars: 1,
             confirmation_bars: 0,
+            confirmation_close_location: 0.75,
             distance_atr: 0.0,
             zone_width_atr: 0.5,
             displacement_strength_atr: 1.0,
@@ -5595,6 +5788,31 @@ open_updated = true
         .unwrap();
 
         assert_eq!(quantity, Some(Quantity::from(10)));
+    }
+
+    #[rstest::rstest]
+    fn test_signal_quality_uses_directional_close_location() {
+        let weak = five_minute_bar("100", "102", "98", "100", 1);
+        let strong_long = five_minute_bar("100", "102", "98", "101", 2);
+        let strong_short = five_minute_bar("100", "102", "98", "99", 3);
+
+        assert_eq!(directional_close_location(weak, OrderSide::Buy), 0.5);
+        assert_eq!(
+            directional_close_location(strong_long, OrderSide::Buy),
+            0.75
+        );
+        assert_eq!(
+            directional_close_location(strong_short, OrderSide::Sell),
+            0.75
+        );
+    }
+
+    #[rstest::rstest]
+    fn test_risk_utilization_is_exact_fraction_of_budget() {
+        assert_eq!(
+            risk_utilization(Decimal::from(5), Decimal::from(25)),
+            Decimal::new(2, 1),
+        );
     }
 
     #[rstest::rstest]
@@ -5754,6 +5972,12 @@ open_updated = true
                 trades: 20,
                 conservative_pnl: Decimal::from(10),
                 conservative_cost_adjusted_sharpe: Some(0.8),
+                conservative_max_drawdown_pct: Some(-0.1),
+                conservative_annualized_return_pct: Some(0.2),
+                conservative_calmar: Some(2.0),
+                positive_days: 2,
+                negative_days: 1,
+                flat_days: 1,
                 engine_sharpe: Some(1.0),
             },
             BacktestEvaluation {
@@ -5761,6 +5985,12 @@ open_updated = true
                 trades: 20,
                 conservative_pnl: Decimal::from(50),
                 conservative_cost_adjusted_sharpe: Some(0.6),
+                conservative_max_drawdown_pct: Some(-0.2),
+                conservative_annualized_return_pct: Some(0.3),
+                conservative_calmar: Some(1.5),
+                positive_days: 2,
+                negative_days: 1,
+                flat_days: 1,
                 engine_sharpe: Some(2.0),
             },
         ];
@@ -5769,6 +5999,36 @@ open_updated = true
             select_in_sample_winner(&evaluations).unwrap().risk_reward,
             Decimal::new(15, 1),
         );
+    }
+
+    #[rstest::rstest]
+    fn test_daily_risk_metrics_include_flat_days_and_peak_to_trough_drawdown() {
+        let metrics = risk_metrics_from_daily_pnl(
+            &[
+                Decimal::from(10),
+                Decimal::ZERO,
+                Decimal::from(-20),
+                Decimal::from(5),
+            ],
+            Decimal::from(100),
+        )
+        .unwrap();
+
+        assert_eq!(
+            (
+                metrics.positive_days,
+                metrics.negative_days,
+                metrics.flat_days
+            ),
+            (2, 1, 1)
+        );
+        assert!(metrics.sharpe.is_some_and(|value| value < 0.0));
+        assert!(
+            metrics
+                .max_drawdown_pct
+                .is_some_and(|value| (value + 18.1818).abs() < 0.001)
+        );
+        assert!(metrics.calmar.is_some_and(|value| value < 0.0));
     }
 
     #[rstest::rstest]
@@ -5811,6 +6071,7 @@ open_updated = true
             level: SignalLevel::Reclaimed,
             level_age_bars: 12,
             confirmation_bars: 2,
+            confirmation_close_location: 0.75,
             distance_atr: 0.2,
             zone_width_atr: 0.5,
             displacement_strength_atr: 1.5,
@@ -5821,6 +6082,7 @@ open_updated = true
             exit_reason: TradeExitReason::Target,
             realized_pnl: Some(Decimal::from(40)),
             estimated_cost: Decimal::from(1),
+            entry_slippage_stress: Decimal::from(2),
             initial_risk: Decimal::from(20),
             risk_utilization: Decimal::new(8, 1),
             r_multiple: Some(Decimal::from(2)),
@@ -5829,7 +6091,8 @@ open_updated = true
         };
         let mut ambiguous = trade;
         ambiguous.ambiguous_exit_bar = true;
-        assert_eq!(ambiguous.conservative_pnl(), Some(Decimal::from(-21)));
+        assert_eq!(trade.conservative_pnl(), Some(Decimal::from(37)));
+        assert_eq!(ambiguous.conservative_pnl(), Some(Decimal::from(-23)));
         let statistics = RunStatistics {
             symbols: HashMap::from([(
                 instrument_id,
@@ -5850,7 +6113,11 @@ open_updated = true
         assert!(output.contains("side=BUY, level=reclaimed"));
         assert!(output.contains("realized_pnl=40"));
         assert!(output.contains("cost_adjusted_pnl=39"));
+        assert!(output.contains("entry_slippage_stress=2"));
+        assert!(output.contains("conservative_pnl=37"));
         assert!(output.contains("average_r=2"));
+        assert!(output.contains("average_conservative_r=1.85"));
+        assert!(output.contains("average_confirmation_close_location=0.7500"));
         assert!(output.contains("average_mfe_r=2"));
         assert!(output.contains("bucket=10:00"));
     }
