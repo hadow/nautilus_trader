@@ -18,6 +18,7 @@ cargo run -p nautilus-longbridge --features examples --example longbridge-data-t
 cargo run -p nautilus-longbridge --features examples --example longbridge-exec-tester
 cargo run -p nautilus-longbridge --features examples --example longbridge-grid-mm
 cargo run -p nautilus-longbridge --features examples --example longbridge-range-fakeout-backtest
+cargo run -p nautilus-longbridge --features examples --example longbridge-slc-backtest
 cargo run -p nautilus-longbridge --features examples --example longbridge-slc-trader
 ```
 
@@ -40,6 +41,17 @@ market-if-touched protective stop, and its 2R target is recalculated from averag
 Executable top-of-book quotes trigger the cancel-then-close target exit immediately; completed
 5-minute bars remain a conservative fallback. It requires realtime candlestick pushes;
 confirmed-only pushes would add a bar of signal latency.
+
+The SLC backtest uses the same strategy, symbol TOML and `LONGBRIDGE_SLC_*` parameters as the live
+example. Set `LONGBRIDGE_SLC_BACKTEST_START` and `LONGBRIDGE_SLC_BACKTEST_END` to UTC timestamps;
+the defaults replay August 2026. `LONGBRIDGE_SLC_BACKTEST_STARTING_BALANCE` defaults to
+`100_000 USD`, `LONGBRIDGE_SLC_BACKTEST_TIMEOUT_SECS` defaults to 300, and
+`LONGBRIDGE_SLC_BACKTEST_LOG_BARS=true` enables per-bar diagnostics. It warms up each symbol before
+the requested window, skips US half trading days, sends only completed 5-minute bars to the matching
+engine, and advances 4-hour bars inside the strategy only when the next 4-hour period begins. Orders
+therefore cannot fill before the bar after their signal. The 2R fallback and stops use OHLC ranges,
+so intrabar ordering, spreads, quote-trigger latency and broker commissions are not reconstructed;
+treat results as a bar-level estimate rather than evidence of stable profitability.
 
 All per-symbol strategies share a persisted SLC-owned risk ledger. Defaults cap open risk at USD 50,
 account notional at USD 5,000, simultaneous entries or positions at one, and realized daily loss at

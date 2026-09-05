@@ -1,9 +1,9 @@
 // -------------------------------------------------------------------------------------------------
 //  Copyright (C) 2015-2026 Nautech Systems Pty Ltd. All rights reserved.
-//  https://nautilustrader.io
+//  https://nautechsystems.io
 //
 //  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-//  You may not use this file except in compliance with the License.
+//  you may not use this file except in compliance with the License.
 //  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 //
 //  Unless required by applicable law or agreed to in writing, software distributed under the
@@ -17,5 +17,5 @@ mod slc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    slc::run(false).await
+    slc::run(true).await
 }
