@@ -22,9 +22,10 @@
 //! confirmed four-hour higher-high/higher-low or lower-high/lower-low structure, fresh supply or
 //! demand zones formed before ATR-sized displacement candles, one-break reclaim/retest levels, and
 //! configurable Stochastics re-entry from the 20/80 bands. Each signal submits a one-bar marketable
-//! limit entry sized at its worst allowed price. Every fill receives a Longbridge-compatible
-//! market-if-touched stop, while the 2R target is recalculated from average fill price and checked
-//! against executable top-of-book quotes. Completed bars provide a conservative fallback trigger.
+//! limit entry sized at its worst allowed price. Every fill receives a broker-hosted Longbridge
+//! market-if-touched stop in live trading or an equivalent stop-market order in backtests. The 2R
+//! target is recalculated from average fill price and checked against executable top-of-book quotes.
+//! Completed bars provide a conservative fallback trigger.
 //! Per-symbol strategies share a persisted SLC-owned risk ledger. Managed stop coordinates
 //! cancellation and position close before the regular session ends.
 //!
@@ -89,8 +90,8 @@ use nautilus_longbridge::{
 use nautilus_model::{
     data::{Bar, BarType, Data, QuoteTick},
     enums::{
-        AccountType, AggregationSource, BarAggregation, BookType, OmsType, OrderSide, PriceType,
-        TimeInForce,
+        AccountType, AggregationSource, BarAggregation, BookType, OmsType, OrderSide, OrderType,
+        PriceType, TimeInForce,
     },
     events::{
         OrderCancelRejected, OrderCanceled, OrderDenied, OrderExpired, OrderFilled, OrderRejected,
@@ -1433,6 +1434,15 @@ fn should_request_preclose_exit(
     close_minute >= flatten_minute && has_exposure && !exit_pending
 }
 
+/// Preserves stop-loss semantics across Nautilus simulation and Longbridge conditional orders.
+fn protective_stop_order_type(is_backtest: bool) -> OrderType {
+    if is_backtest {
+        OrderType::StopMarket
+    } else {
+        OrderType::MarketIfTouched
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SlcStrategyConfig {
     instrument_id: InstrumentId,
@@ -1887,23 +1897,44 @@ impl SlcStrategy {
             self.instrument.price_precision(),
             self.config.risk_reward,
         )?;
-        let stop_order = self.order().market_if_touched(
-            self.config.instrument_id,
-            exit_side,
-            event.last_qty,
-            pending.stop,
-            None,
-            Some(TimeInForce::Day),
-            None,
-            Some(false),
-            Some(false),
-            None,
-            None,
-            None,
-            None,
-            Some(vec![Ustr::from("SLC_STOP")]),
-            None,
-        );
+        let stop_order = match protective_stop_order_type(self.backtest_four_hour_bars.is_some()) {
+            OrderType::StopMarket => self.order().stop_market(
+                self.config.instrument_id,
+                exit_side,
+                event.last_qty,
+                pending.stop,
+                None,
+                Some(TimeInForce::Day),
+                None,
+                Some(false),
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec![Ustr::from("SLC_STOP")]),
+                None,
+            ),
+            OrderType::MarketIfTouched => self.order().market_if_touched(
+                self.config.instrument_id,
+                exit_side,
+                event.last_qty,
+                pending.stop,
+                None,
+                Some(TimeInForce::Day),
+                None,
+                Some(false),
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                Some(vec![Ustr::from("SLC_STOP")]),
+                None,
+            ),
+            _ => unreachable!("unsupported SLC protective stop order type"),
+        };
         self.submit_order(stop_order, None, None, None)?;
         let protected_qty = self
             .active_trade
@@ -3551,6 +3582,15 @@ open_updated = true
         assert!(!signals.structure.initialized());
         assert_eq!(signals.structure.trend(), Trend::Neutral);
         assert!(signals.indicators_initialized());
+    }
+
+    #[test]
+    fn backtest_uses_standard_stop_market_semantics() {
+        assert_eq!(protective_stop_order_type(true), OrderType::StopMarket);
+        assert_eq!(
+            protective_stop_order_type(false),
+            OrderType::MarketIfTouched,
+        );
     }
 
     #[test]
