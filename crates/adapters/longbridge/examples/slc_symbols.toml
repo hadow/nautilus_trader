@@ -42,3 +42,79 @@ price_increment = "0.01"
 [[symbols]]
 symbol = "TSLA.US"
 price_increment = "0.01"
+
+[[symbols]]
+symbol = "SPY.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "IWM.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "DIA.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "GLD.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "GOOGL.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "AMZN.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "META.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "JPM.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "BAC.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "XOM.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "CVX.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "PFE.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "MRK.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "WMT.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "KO.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "CAT.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "GE.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "DIS.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "UBER.US"
+price_increment = "0.01"

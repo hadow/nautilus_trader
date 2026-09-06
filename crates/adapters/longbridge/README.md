@@ -34,10 +34,12 @@ assumptions rather than tick-level simulation.
 The SLC trader is a parameterized, bar-signal live strategy for US equities. Configure its symbols
 and exact price increments in [`examples/slc_symbols.toml`](examples/slc_symbols.toml), or point
 `LONGBRIDGE_SLC_CONFIG_PATH` at another TOML file. It defaults to Longbridge paper trading and one
-strategy per symbol. Fresh and once-broken/reclaimed levels are retained in bounded per-side
-collections. Stochastic confirmation defaults to three bars and must close within 0.35 ATR of the
-level. The re-entry candle must also close at least 55% toward the trade-facing end of its range,
-which filters indicator crosses without matching price rejection. Configure these gates with
+strategy per symbol. `LONGBRIDGE_SLC_TRADE_DIRECTION=both|long|short` controls whether every symbol
+may trade both directions, long only, or short only; the default is `both`. Fresh and
+once-broken/reclaimed levels are retained in bounded per-side collections. Stochastic confirmation
+defaults to three bars and must close within 0.35 ATR of the level. The re-entry candle must also
+close at least 55% toward the trade-facing end of its range, which filters indicator crosses without
+matching price rejection. Configure these gates with
 `LONGBRIDGE_SLC_CONFIRMATION_WINDOW_BARS`,
 `LONGBRIDGE_SLC_CONFIRMATION_MAX_DISTANCE_ATR`, and
 `LONGBRIDGE_SLC_CONFIRMATION_MIN_CLOSE_LOCATION`. Entry orders are one-bar marketable limits sized

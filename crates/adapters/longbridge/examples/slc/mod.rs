@@ -170,10 +170,52 @@ impl SessionRules {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TradeDirection {
+    #[default]
+    Both,
+    Long,
+    Short,
+}
+
+impl TradeDirection {
+    /// Returns whether the configured direction permits an entry side.
+    fn allows(self, side: OrderSide) -> bool {
+        matches!(
+            (self, side),
+            (Self::Both | Self::Long, OrderSide::Buy) | (Self::Both | Self::Short, OrderSide::Sell)
+        )
+    }
+}
+
+impl Display for TradeDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Both => write!(f, "both"),
+            Self::Long => write!(f, "long"),
+            Self::Short => write!(f, "short"),
+        }
+    }
+}
+
+impl FromStr for TradeDirection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "both" => Ok(Self::Both),
+            "long" => Ok(Self::Long),
+            "short" => Ok(Self::Short),
+            _ => Err("expected one of: both, long, short".to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct AppConfig {
     instruments: Vec<SlcInstrument>,
     papertrading: bool,
+    trade_direction: TradeDirection,
     risk_amount: Decimal,
     daily_loss_limit: Decimal,
     max_open_risk: Decimal,
@@ -244,6 +286,7 @@ impl AppConfig {
         let symbol_config_path =
             env_string("LONGBRIDGE_SLC_CONFIG_PATH", DEFAULT_SYMBOL_CONFIG_PATH);
         let instruments = load_symbol_config(Path::new(&symbol_config_path))?;
+        let trade_direction = env_parse("LONGBRIDGE_SLC_TRADE_DIRECTION", "both")?;
         let risk_amount = env_parse("LONGBRIDGE_SLC_RISK_AMOUNT", "25")?;
         let daily_loss_limit = env_parse("LONGBRIDGE_SLC_DAILY_LOSS_LIMIT", "50")?;
         let max_open_risk = env_parse("LONGBRIDGE_SLC_MAX_OPEN_RISK", "50")?;
@@ -406,6 +449,7 @@ impl AppConfig {
         Ok(Self {
             instruments,
             papertrading,
+            trade_direction,
             risk_amount,
             daily_loss_limit,
             max_open_risk,
@@ -1043,6 +1087,7 @@ impl FinalBarBuffer {
 
 #[derive(Clone, Copy, Debug)]
 struct SignalRules {
+    trade_direction: TradeDirection,
     zone_ttl_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
@@ -1133,6 +1178,7 @@ impl SlcSignalState {
             supply: VecDeque::with_capacity(config.max_zones_per_side),
             funnel: SignalFunnel::default(),
             rules: SignalRules {
+                trade_direction: config.trade_direction,
                 zone_ttl_bars: config.zone_ttl_bars,
                 max_zones_per_side: config.max_zones_per_side,
                 confirmation_window_bars: config.confirmation_window_bars,
@@ -1231,7 +1277,7 @@ impl SlcSignalState {
             &mut self.demand,
             bar,
             long_confirmation,
-            trend == Trend::Up && allow_signal,
+            trend == Trend::Up && allow_signal && self.rules.trade_direction.allows(OrderSide::Buy),
             OrderSide::Buy,
             self.rules,
         );
@@ -1239,7 +1285,9 @@ impl SlcSignalState {
             &mut self.supply,
             bar,
             short_confirmation,
-            trend == Trend::Down && allow_signal,
+            trend == Trend::Down
+                && allow_signal
+                && self.rules.trade_direction.allows(OrderSide::Sell),
             OrderSide::Sell,
             self.rules,
         );
@@ -3574,8 +3622,9 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.five_minute_bar_type, None, None);
         if self.backtest_four_hour_bars.is_some() {
             log::info!(
-                "[{}] SLC backtest active: 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, estimated_round_trip_cost_per_share={}",
+                "[{}] SLC backtest active: direction={}, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, estimated_round_trip_cost_per_share={}",
                 self.config.instrument_id,
+                self.signals.rules.trade_direction,
                 self.config.five_minute_bar_type,
                 self.backtest_four_hour_bars
                     .as_ref()
@@ -3608,8 +3657,9 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.four_hour_bar_type, None, None);
         self.subscribe_quotes(self.config.instrument_id, None, None);
         log::info!(
-            "[{}] SLC subscriptions active: quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
+            "[{}] SLC subscriptions active: direction={}, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
             self.config.instrument_id,
+            self.signals.rules.trade_direction,
             self.config.five_minute_bar_type,
             self.config.four_hour_bar_type,
             self.config.entry_start_minute / 60,
@@ -4194,6 +4244,7 @@ struct PreparedBacktestInputs {
 
 #[derive(Clone, Copy, Debug)]
 struct BacktestEvaluation {
+    trade_direction: TradeDirection,
     risk_reward: Decimal,
     trades: u64,
     conservative_pnl: Decimal,
@@ -4211,7 +4262,8 @@ impl BacktestEvaluation {
     /// Produces one grep-friendly comparison record for target selection and review.
     fn summary(self, sample: &str) -> String {
         format!(
-            "SLC parameter evaluation: sample={sample}, risk_reward={}, trades={}, conservative_pnl={}, conservative_cost_adjusted_sharpe={}, conservative_max_drawdown_pct={}, conservative_annualized_return_pct={}, conservative_calmar={}, positive_days={}, negative_days={}, flat_days={}, engine_sharpe={}",
+            "SLC parameter evaluation: sample={sample}, direction={}, risk_reward={}, trades={}, conservative_pnl={}, conservative_cost_adjusted_sharpe={}, conservative_max_drawdown_pct={}, conservative_annualized_return_pct={}, conservative_calmar={}, positive_days={}, negative_days={}, flat_days={}, engine_sharpe={}",
+            self.trade_direction,
             self.risk_reward,
             self.trades,
             self.conservative_pnl,
@@ -4751,7 +4803,8 @@ fn run_backtest_engine(
         })
         .collect::<BTreeSet<_>>();
     println!(
-        "SLC backtest run: sample={sample}, risk_reward={}, trading_days={}",
+        "SLC backtest run: sample={sample}, direction={}, risk_reward={}, trading_days={}",
+        config.strategy.trade_direction,
         config.strategy.risk_reward,
         trading_days.len(),
     );
@@ -4845,6 +4898,7 @@ fn run_backtest_engine(
     println!("Return statistics: {:?}", result.stats_returns);
     println!("General statistics: {:?}", result.stats_general);
     let evaluation = BacktestEvaluation {
+        trade_direction: config.strategy.trade_direction,
         risk_reward: config.strategy.risk_reward,
         trades: aggregate.trades,
         conservative_pnl: aggregate.conservative_pnl,
@@ -5241,6 +5295,7 @@ open_updated = true
 
     fn signal_rules() -> SignalRules {
         SignalRules {
+            trade_direction: TradeDirection::Both,
             zone_ttl_bars: 234,
             max_zones_per_side: 8,
             confirmation_window_bars: 6,
@@ -5950,6 +6005,18 @@ open_updated = true
     }
 
     #[rstest::rstest]
+    fn test_trade_direction_parsing_and_entry_filter() {
+        let both = "both".parse::<TradeDirection>().unwrap();
+        let long = "long".parse::<TradeDirection>().unwrap();
+        let short = "short".parse::<TradeDirection>().unwrap();
+
+        assert!(both.allows(OrderSide::Buy) && both.allows(OrderSide::Sell));
+        assert!(long.allows(OrderSide::Buy) && !long.allows(OrderSide::Sell));
+        assert!(short.allows(OrderSide::Sell) && !short.allows(OrderSide::Buy));
+        assert!("invalid".parse::<TradeDirection>().is_err());
+    }
+
+    #[rstest::rstest]
     fn test_annualized_sharpe_requires_variance_and_preserves_sign() {
         assert_eq!(annualized_sharpe(&[0.0, 0.0]), None);
         assert!(annualized_sharpe(&[0.01, 0.02, 0.0]).is_some_and(|value| value > 0.0));
@@ -5968,6 +6035,7 @@ open_updated = true
     fn test_walk_forward_selects_only_the_best_is_sharpe() {
         let evaluations = [
             BacktestEvaluation {
+                trade_direction: TradeDirection::Both,
                 risk_reward: Decimal::new(15, 1),
                 trades: 20,
                 conservative_pnl: Decimal::from(10),
@@ -5981,6 +6049,7 @@ open_updated = true
                 engine_sharpe: Some(1.0),
             },
             BacktestEvaluation {
+                trade_direction: TradeDirection::Both,
                 risk_reward: Decimal::from(2),
                 trades: 20,
                 conservative_pnl: Decimal::from(50),
