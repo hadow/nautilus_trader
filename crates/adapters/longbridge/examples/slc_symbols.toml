@@ -19,13 +19,13 @@ live_risk_state_path = "../../../../target/longbridge-slc-live-risk-state.toml"
 # 单笔交易计划承担的最大初始风险，单位 USD；仓位数量由该值除以每股风险得到。
 risk_amount = "25"
 # 当日累计已实现亏损达到该值后，全部标的停止新开仓，单位 USD。
-daily_loss_limit = "50"
+daily_loss_limit = "200"
 # 全账户所有挂单和持仓允许同时占用的初始风险上限，单位 USD。
-max_open_risk = "50"
+max_open_risk = "300"
 # 全账户全部 SLC 仓位和入场挂单的总名义金额上限，单位 USD。
-max_account_notional = "5000"
+max_account_notional = "10000"
 # 同时允许存在的入场预留或持仓数量；所有 symbol 共享该额度。
-max_open_positions = 2
+max_open_positions = 3
 # 任意单笔入场订单的最大股数。
 max_order_quantity = "500"
 # 任意单个标的入场订单的最大名义金额，单位 USD。
@@ -75,7 +75,7 @@ overbought = 80.0
 # 距离强制平仓至少保留的潜在运行时间；晚于该边界不再开仓，单位分钟。
 minimum_target_time_minutes = 60
 # 入场后达到该 5 分钟 Bar 数且 MFE 不足时触发时间止损。
-time_stop_bars = 9
+time_stop_bars = 36
 # 时间止损要求的最低最大有利波动，单位 R；达到该值则继续持有。
 time_stop_minimum_mfe_r = "0.5"
 
@@ -106,17 +106,13 @@ risk_rewards = ["2"]
 # 回测组合初始资金；用于收益率、Sharpe、回撤和 Calmar 计算。
 starting_balance = "100_000 USD"
 # 下载全部历史数据允许的总超时秒数。
-timeout_secs = 300
+timeout_secs = 500
 # true 输出每根 Bar 的详细诊断；30 个标的会产生大量日志。
 log_bars = false
 # 保守统计按成交股数扣除的估算往返成本，单位 USD/股。
 round_trip_cost_per_share = "0.01"
 
 # SLC 交易池。每个美股标的一个 [[symbols]] 表；price_increment 必须是准确最小跳动。
-[[symbols]]
-symbol = "QQQ.US"
-price_increment = "0.01"
-
 [[symbols]]
 symbol = "AAPL.US"
 price_increment = "0.01"
