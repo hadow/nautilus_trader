@@ -27,12 +27,12 @@
 //!
 //! 1. **Structure（结构）**：只使用已经完成并经过右侧 K 线确认的 4 小时 pivot；连续更高的
 //!    pivot high 与 pivot low 定义上涨结构，连续更低的二者定义下跌结构，其余状态均为中性。
-//! 2. **Level（位置）**：在 5 分钟图中寻找 1 至 3 根 K 线完成的 ATR 级别 displacement，
-//!    把位移前最后一根反向 K 线的完整高低区间保存为 demand 或 supply zone。首次回测使用
-//!    fresh level；一次有效跌破/突破后重新收复的区域可作为 reclaimed level。
+//! 2. **Level（位置）**：只在当前 4 小时方向同侧寻找 5 分钟强位移。近期底部的 Demand 与
+//!    近期顶部的 Supply 保持最小离开时间后可首次回测；过早回访直接失效。其他强位移区域必须
+//!    先完成一次破位收复。区域取位移前最后一根反向 K 线完整高低区间，趋势改变时丢弃旧 level。
 //! 3. **Confirmation（确认）**：价格进入有效区域后开启有限确认窗口，要求 Stochastics %K
-//!    曾进入 20/80 极值区并重新穿越阈值，同时限制确认收盘价到区域的 ATR 距离，并要求 K 线
-//!    收在交易方向一侧。上涨结构只允许 demand 做多，下跌结构只允许 supply 做空。
+//!    曾进入 20/80 极值区并重新穿越阈值。上涨结构只允许 demand 做多，下跌结构只允许
+//!    supply 做空；确认 Bar 收盘后立即产生入场信号。
 //!
 //! 这种分层设计把“方向、位置、触发”分开，避免仅因指标超买超卖就逆势入场。所有判断只消费
 //! 已完成 Bar；实时订阅收到同一时间戳的多次更新时，必须等下一根 Bar 出现才确认上一根，防止
@@ -46,8 +46,8 @@
 //! 整手、最大数量、单仓名义金额、账户总名义金额、最大持仓数和开放风险共同约束。
 //!
 //! 实盘每一次部分成交都会立即创建券商托管的 Longbridge Market-If-Touched 止损。2R 目标按
-//! 实际平均成交价重新计算，由可立即成交的一档 bid/ask 触发撤单后市价平仓，已完成 5 分钟 Bar
-//! 仅作为遗漏报价时的保守补偿路径。回测则为每次成交提交 OUO 关联的止损与 2R 限价目标。
+//! 实际平均成交价重新计算，由可立即成交的一档 bid/ask 触发撤单后市价平仓；已完成 5 分钟 Bar
+//! 仅作遗漏报价时的补偿。回测为每次成交提交 OUO 保护组合。
 //! 实盘目标依赖本地进程和行情连接，因此当前实现不能等同于券商原子 bracket order。
 //!
 //! # 回测解释边界
@@ -74,7 +74,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -250,12 +250,12 @@ struct AppConfig {
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
+    level_extreme_lookback_bars: usize,
     pivot_span: usize,
     zone_ttl_bars: usize,
+    minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
-    confirmation_max_distance_atr: f64,
-    confirmation_min_close_location: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
@@ -264,8 +264,6 @@ struct AppConfig {
     five_minute_warmup: usize,
     four_hour_warmup: usize,
     minimum_target_time_minutes: u16,
-    time_stop_bars: u64,
-    time_stop_minimum_mfe_r: Decimal,
     risk_state_path: PathBuf,
     timezone: TimeZone,
     session: SessionRules,
@@ -326,20 +324,18 @@ struct SignalSettings {
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
+    level_extreme_lookback_bars: usize,
     pivot_span: usize,
     zone_ttl_bars: usize,
+    minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
-    confirmation_max_distance_atr: f64,
-    confirmation_min_close_location: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
     oversold: f64,
     overbought: f64,
     minimum_target_time_minutes: u16,
-    time_stop_bars: u64,
-    time_stop_minimum_mfe_r: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,12 +359,27 @@ struct SessionSettings {
 struct BacktestSettings {
     start: String,
     end: String,
-    walk_forward_split: Option<String>,
     risk_rewards: Vec<String>,
     starting_balance: String,
     timeout_secs: u64,
     log_bars: bool,
     round_trip_cost_per_share: String,
+    walk_forward: Option<WalkForwardSettings>,
+}
+
+/// 滚动 walk-forward 的交易日窗口和最低 OOS 验收门槛
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalkForwardSettings {
+    train_days: usize,
+    test_days: usize,
+    step_days: usize,
+    minimum_folds: usize,
+    minimum_is_trades: u64,
+    minimum_oos_trades: u64,
+    minimum_oos_sharpe: f64,
+    maximum_oos_drawdown_pct: f64,
+    minimum_pass_rate: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -460,18 +471,21 @@ impl AppConfig {
             (Decimal::ZERO..=Decimal::ONE).contains(&minimum_risk_utilization),
             "minimum risk utilization must be between 0 and 1",
         );
-        anyhow::ensure!(risk_reward > Decimal::ZERO, "risk reward must be positive");
+        anyhow::ensure!(
+            risk_reward >= Decimal::from(2),
+            "SLC risk reward must be at least 2R",
+        );
 
         let atr_period = signal.atr_period;
         let displacement_atr_multiple = signal.displacement_atr_multiple;
         let displacement_close_fraction = signal.displacement_close_fraction;
         let displacement_max_bars = signal.displacement_max_bars;
+        let level_extreme_lookback_bars = signal.level_extreme_lookback_bars;
         let pivot_span = signal.pivot_span;
         let zone_ttl_bars = signal.zone_ttl_bars;
+        let minimum_fresh_level_age_bars = signal.minimum_fresh_level_age_bars;
         let max_zones_per_side = signal.max_zones_per_side;
         let confirmation_window_bars = signal.confirmation_window_bars;
-        let confirmation_max_distance_atr = signal.confirmation_max_distance_atr;
-        let confirmation_min_close_location = signal.confirmation_min_close_location;
         let stochastic_k_period = signal.stochastic_k_period;
         let stochastic_k_smoothing = signal.stochastic_k_smoothing;
         let stochastic_d_period = signal.stochastic_d_period;
@@ -491,10 +505,18 @@ impl AppConfig {
             "displacement maximum bars must be between 1 and 12",
         );
         anyhow::ensure!(
+            (1..=24).contains(&level_extreme_lookback_bars),
+            "level extreme lookback bars must be between 1 and 24",
+        );
+        anyhow::ensure!(
             pivot_span > 0 && pivot_span <= (MAX_WARMUP_BARS - 1) / 2,
             "pivot span must fit inside the maximum warmup window",
         );
         anyhow::ensure!(zone_ttl_bars > 0, "zone TTL must be positive");
+        anyhow::ensure!(
+            minimum_fresh_level_age_bars > 0 && minimum_fresh_level_age_bars < zone_ttl_bars,
+            "minimum fresh level age must be positive and below zone TTL",
+        );
         anyhow::ensure!(
             (1..=32).contains(&max_zones_per_side),
             "maximum zones per side must be between 1 and 32",
@@ -502,14 +524,6 @@ impl AppConfig {
         anyhow::ensure!(
             confirmation_window_bars > 0 && confirmation_window_bars <= zone_ttl_bars,
             "confirmation window must be positive and not exceed zone TTL",
-        );
-        anyhow::ensure!(
-            (0.0..=2.0).contains(&confirmation_max_distance_atr),
-            "confirmation maximum distance ATR must be between 0 and 2",
-        );
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&confirmation_min_close_location),
-            "confirmation minimum close location must be between 0 and 1",
         );
         anyhow::ensure!(
             stochastic_k_period > 0 && stochastic_k_smoothing > 0 && stochastic_d_period > 0,
@@ -544,19 +558,9 @@ impl AppConfig {
         };
         session.validate()?;
         let minimum_target_time_minutes = signal.minimum_target_time_minutes;
-        let time_stop_bars = signal.time_stop_bars;
-        let time_stop_minimum_mfe_r = parse_config_value(
-            "signal.time_stop_minimum_mfe_r",
-            &signal.time_stop_minimum_mfe_r,
-        )?;
         anyhow::ensure!(
             minimum_target_time_minutes > 0,
             "minimum target time minutes must be positive",
-        );
-        anyhow::ensure!(time_stop_bars > 0, "time stop bars must be positive");
-        anyhow::ensure!(
-            time_stop_minimum_mfe_r >= Decimal::ZERO && time_stop_minimum_mfe_r < risk_reward,
-            "time stop minimum MFE R must be non-negative and below the profit target",
         );
         let configured_risk_state_path = if papertrading {
             &longbridge.paper_risk_state_path
@@ -586,12 +590,12 @@ impl AppConfig {
             displacement_atr_multiple,
             displacement_close_fraction,
             displacement_max_bars,
+            level_extreme_lookback_bars,
             pivot_span,
             zone_ttl_bars,
+            minimum_fresh_level_age_bars,
             max_zones_per_side,
             confirmation_window_bars,
-            confirmation_max_distance_atr,
-            confirmation_min_close_location,
             stochastic_k_period,
             stochastic_k_smoothing,
             stochastic_d_period,
@@ -600,8 +604,6 @@ impl AppConfig {
             five_minute_warmup,
             four_hour_warmup,
             minimum_target_time_minutes,
-            time_stop_bars,
-            time_stop_minimum_mfe_r,
             risk_state_path,
             timezone: get_timezone(US_TIMEZONE)?,
             session,
@@ -653,12 +655,12 @@ struct SlcBacktestConfig {
     strategy: AppConfig,
     start: Timestamp,
     end: Timestamp,
-    walk_forward_split: Option<Timestamp>,
     risk_rewards: Vec<Decimal>,
     starting_balance: Money,
     timeout_secs: u64,
     log_bars: bool,
     round_trip_cost_per_share: Decimal,
+    walk_forward: Option<WalkForwardSettings>,
 }
 
 impl SlcBacktestConfig {
@@ -670,23 +672,15 @@ impl SlcBacktestConfig {
         let start = parse_config_value("backtest.start", &backtest.start)?;
         let end = parse_config_value("backtest.end", &backtest.end)?;
         anyhow::ensure!(start < end, "backtest.start must be before backtest.end",);
-        let walk_forward_split = backtest
-            .walk_forward_split
-            .as_deref()
-            .map(|value| parse_config_value("backtest.walk_forward_split", value))
-            .transpose()?;
-        if let Some(split) = walk_forward_split {
-            anyhow::ensure!(
-                start < split && split < end,
-                "walk-forward split must be strictly inside the backtest interval",
-            );
+        if let Some(walk_forward) = backtest.walk_forward {
+            validate_walk_forward_settings(walk_forward)?;
         }
         let risk_rewards = parse_decimal_grid(&backtest.risk_rewards)?;
         anyhow::ensure!(
             risk_rewards
                 .iter()
-                .all(|risk_reward| *risk_reward > strategy.time_stop_minimum_mfe_r),
-            "every backtest risk reward must exceed the time-stop minimum MFE R",
+                .all(|risk_reward| *risk_reward >= Decimal::from(2)),
+            "every SLC backtest risk reward must be at least 2R",
         );
         let starting_balance =
             parse_config_value("backtest.starting_balance", &backtest.starting_balance)?;
@@ -713,14 +707,51 @@ impl SlcBacktestConfig {
             strategy,
             start,
             end,
-            walk_forward_split,
             risk_rewards,
             starting_balance,
             timeout_secs,
             log_bars: backtest.log_bars,
             round_trip_cost_per_share,
+            walk_forward: backtest.walk_forward,
         })
     }
+}
+
+/// 拒绝重叠 OOS、样本不足或没有统计意义的滚动窗口设置
+fn validate_walk_forward_settings(settings: WalkForwardSettings) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        settings.train_days > 0,
+        "walk_forward.train_days must be positive"
+    );
+    anyhow::ensure!(
+        settings.test_days > 0,
+        "walk_forward.test_days must be positive"
+    );
+    anyhow::ensure!(
+        settings.step_days == settings.test_days,
+        "walk_forward.step_days must equal test_days so OOS windows do not overlap or leave gaps",
+    );
+    anyhow::ensure!(
+        settings.minimum_folds > 0,
+        "walk_forward.minimum_folds must be positive",
+    );
+    anyhow::ensure!(
+        settings.minimum_is_trades > 0 && settings.minimum_oos_trades > 0,
+        "walk-forward minimum trade counts must be positive",
+    );
+    anyhow::ensure!(
+        settings.minimum_oos_sharpe.is_finite(),
+        "walk_forward.minimum_oos_sharpe must be finite",
+    );
+    anyhow::ensure!(
+        settings.maximum_oos_drawdown_pct.is_finite() && settings.maximum_oos_drawdown_pct > 0.0,
+        "walk_forward.maximum_oos_drawdown_pct must be positive",
+    );
+    anyhow::ensure!(
+        settings.minimum_pass_rate.is_finite() && (0.0..=1.0).contains(&settings.minimum_pass_rate),
+        "walk_forward.minimum_pass_rate must be finite and between 0 and 1",
+    );
+    Ok(())
 }
 
 /// 读取并反序列化统一 TOML 配置，错误信息始终包含实际文件路径
@@ -971,13 +1002,14 @@ enum ZoneState {
 
 /// 一个有界生命周期的 supply/demand 价格区域及其确认状态
 ///
-/// 区域边界取 displacement 源 K 线的完整高低点；ATR 和位移强度固定记录在创建时刻，
-/// 后续确认和统计不会被变化中的波动率重新解释。
+/// 区域边界取 displacement 源 K 线的完整高低点；只有近期极值允许 fresh 入场，其他强位移
+/// 区域必须先完成一次破位收复。ATR 和位移强度固定记录在创建时刻，不被后续波动率重新解释。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Zone {
     kind: ZoneKind,
     low: Price,
     high: Price,
+    fresh_entry_eligible: bool,
     age: usize,
     state: ZoneState,
     break_count: u8,
@@ -994,6 +1026,7 @@ impl Zone {
             kind,
             low: bar.low,
             high: bar.high,
+            fresh_entry_eligible: true,
             age: 0,
             state: ZoneState::Fresh,
             break_count: 0,
@@ -1004,11 +1037,18 @@ impl Zone {
         }
     }
 
-    /// 创建 zone 并记录生成时 ATR 及位移强度，供后续质量诊断和归一化比较
-    fn from_displacement(kind: ZoneKind, bar: Bar, atr: f64, strength_atr: f64) -> Self {
+    /// 创建 zone，并固定记录是否允许首次回测、生成时 ATR 及位移强度
+    fn from_displacement(
+        kind: ZoneKind,
+        bar: Bar,
+        atr: f64,
+        strength_atr: f64,
+        fresh_entry_eligible: bool,
+    ) -> Self {
         Self {
             atr_at_creation: atr,
             displacement_strength_atr: strength_atr,
+            fresh_entry_eligible,
             ..Self::from_bar(kind, bar)
         }
     }
@@ -1034,20 +1074,19 @@ impl Zone {
         }
     }
 
-    /// 在有效回测区域后启动有界随机指标确认窗口，并继承本 Bar 已出现的极值或回穿
+    /// 在有效回测区域后启动有界随机指标确认窗口；极值必须在触达 Level 时或之后出现
     fn begin_confirmation(&mut self, confirmation: Confirmation, window_bars: usize) {
         self.state = ZoneState::AwaitingConfirmation;
-        // 发生 re-entry 说明前一根 %K 已位于阈值外，因此可同时视为完成过极值条件
-        self.confirmation_armed = confirmation.extreme || confirmation.reentry;
+        self.confirmation_armed = confirmation.extreme;
         self.confirmation_bars_left = window_bars + 1;
     }
 
     /// 用一根已完成 Bar 推进 fresh、待确认、一次破位和收复四态 level 状态机
     ///
     /// 状态转换遵循以下约束：首次有效破位只把区域标记为 `BrokenOnce`，待价格从反方向完整
-    /// 收复后才允许作为 `Reclaimed` 再次回测；收复后的再次破位、确认超时或超过 TTL 都会删除
-    /// 区域。函数只有在趋势、交易方向、随机指标回穿、ATR 距离和收盘位置全部通过时返回信号，
-    /// 从而保证 level 的生命周期与是否允许下单相互独立。
+    /// 收复后才允许作为 `Reclaimed` 再次回测；非近期极值只跳过 Fresh 入场，仍可等待一次破位
+    /// 收复。可 Fresh 入场的 Level 若过早回访则直接失效，表示价格没有真正离开。收复后的再次
+    /// 破位、确认超时或超过 TTL 都会删除区域。只有趋势、方向和随机指标回穿成立才返回信号。
     fn observe(
         &mut self,
         bar: Bar,
@@ -1077,8 +1116,19 @@ impl Zone {
             }
         }
 
+        if self.state == ZoneState::Fresh
+            && self.fresh_entry_eligible
+            && self.age < rules.minimum_fresh_level_age_bars
+            && self.intersects(bar)
+        {
+            return ZoneObservation::Remove;
+        }
+
         match self.state {
-            ZoneState::Fresh | ZoneState::Reclaimed if self.intersects(bar) => {
+            ZoneState::Fresh if self.fresh_entry_eligible && self.intersects(bar) => {
+                self.begin_confirmation(confirmation, rules.confirmation_window_bars);
+            }
+            ZoneState::Reclaimed if self.intersects(bar) => {
                 self.begin_confirmation(confirmation, rules.confirmation_window_bars);
             }
             ZoneState::BrokenOnce if self.reclaimed(bar) => {
@@ -1094,12 +1144,7 @@ impl Zone {
         self.confirmation_armed |= confirmation.extreme;
         let distance_atr = zone_distance_atr(*self, bar.close, self.atr_at_creation);
         let close_location = directional_close_location(bar, side);
-        if allow_entry
-            && self.confirmation_armed
-            && confirmation.reentry
-            && distance_atr <= rules.confirmation_max_distance_atr
-            && close_location >= rules.confirmation_min_close_location
-        {
+        if allow_entry && self.confirmation_armed && confirmation.reentry {
             return ZoneObservation::Signal(Signal {
                 side,
                 level: if self.break_count == 0 {
@@ -1132,10 +1177,9 @@ impl Zone {
     }
 }
 
-/// level 完成全部过滤后交给订单层的不可变信号快照
+/// level 完成 SLC 三步检查后交给订单层的不可变信号快照
 ///
-/// 除方向、入场参考价和区域边界外，同时携带 setup 质量特征，供仓位门槛、回测分层统计和
-/// 实盘诊断复用，避免订单层重新读取已经变化的指标状态。
+/// 除方向、入场参考价和区域边界外，同时携带只读诊断特征；这些特征不参与准入或排序。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Signal {
     side: OrderSide,
@@ -1219,13 +1263,13 @@ impl FinalBarBuffer {
 struct SignalRules {
     trade_direction: TradeDirection,
     zone_ttl_bars: usize,
+    minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
-    confirmation_max_distance_atr: f64,
-    confirmation_min_close_location: f64,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
+    level_extreme_lookback_bars: usize,
     oversold: f64,
     overbought: f64,
 }
@@ -1253,7 +1297,8 @@ impl SignalFunnel {
         confirmation: Confirmation,
     ) {
         let touched = zones.iter().any(|zone| {
-            matches!(zone.state, ZoneState::Fresh | ZoneState::Reclaimed)
+            (zone.state == ZoneState::Reclaimed
+                || (zone.state == ZoneState::Fresh && zone.fresh_entry_eligible))
                 && !zone.broken(bar)
                 && zone.intersects(bar)
         });
@@ -1278,6 +1323,7 @@ struct SlcSignalState {
     atr: AverageTrueRange,
     stochastics: Stochastics,
     recent_five_minute_bars: VecDeque<Bar>,
+    level_trend: Trend,
     last_demand_source: Option<UnixNanos>,
     last_supply_source: Option<UnixNanos>,
     previous_k: Option<f64>,
@@ -1307,7 +1353,10 @@ impl SlcSignalState {
                 MovingAverageType::Simple,
                 StochasticsDMethod::MovingAverage,
             ),
-            recent_five_minute_bars: VecDeque::with_capacity(config.displacement_max_bars + 1),
+            recent_five_minute_bars: VecDeque::with_capacity(
+                config.displacement_max_bars + config.level_extreme_lookback_bars + 1,
+            ),
+            level_trend: Trend::Neutral,
             last_demand_source: None,
             last_supply_source: None,
             previous_k: None,
@@ -1317,13 +1366,13 @@ impl SlcSignalState {
             rules: SignalRules {
                 trade_direction: config.trade_direction,
                 zone_ttl_bars: config.zone_ttl_bars,
+                minimum_fresh_level_age_bars: config.minimum_fresh_level_age_bars,
                 max_zones_per_side: config.max_zones_per_side,
                 confirmation_window_bars: config.confirmation_window_bars,
-                confirmation_max_distance_atr: config.confirmation_max_distance_atr,
-                confirmation_min_close_location: config.confirmation_min_close_location,
                 displacement_atr_multiple: config.displacement_atr_multiple,
                 displacement_close_fraction: config.displacement_close_fraction,
                 displacement_max_bars: config.displacement_max_bars,
+                level_extreme_lookback_bars: config.level_extreme_lookback_bars,
                 oversold: config.oversold,
                 overbought: config.overbought,
             },
@@ -1401,6 +1450,7 @@ impl SlcSignalState {
             && current_k < self.rules.overbought;
 
         let trend = self.structure.trend();
+        self.align_levels_with_trend(trend);
         self.funnel.directional_bars += u64::from(trend != Trend::Neutral);
         let long_confirmation = Confirmation {
             extreme: stochastic_initialized && current_k <= self.rules.oversold,
@@ -1441,12 +1491,18 @@ impl SlcSignalState {
             self.recent_five_minute_bars.clear();
         }
         self.recent_five_minute_bars.push_back(bar);
-        while self.recent_five_minute_bars.len() > self.rules.displacement_max_bars + 1 {
+        while self.recent_five_minute_bars.len()
+            > self.rules.displacement_max_bars + self.rules.level_extreme_lookback_bars + 1
+        {
             self.recent_five_minute_bars.pop_front();
         }
         if atr_initialized
-            && let Some((kind, source, displacement_strength_atr)) =
+            && let Some((kind, source, displacement_strength_atr, fresh_entry_eligible)) =
                 displacement_zone(&self.recent_five_minute_bars, atr_before, self.rules)
+            && matches!(
+                (trend, kind),
+                (Trend::Up, ZoneKind::Demand) | (Trend::Down, ZoneKind::Supply)
+            )
         {
             let last_source = match kind {
                 ZoneKind::Demand => &mut self.last_demand_source,
@@ -1459,7 +1515,13 @@ impl SlcSignalState {
                 };
                 push_zone(
                     zones,
-                    Zone::from_displacement(kind, source, atr_before, displacement_strength_atr),
+                    Zone::from_displacement(
+                        kind,
+                        source,
+                        atr_before,
+                        displacement_strength_atr,
+                        fresh_entry_eligible,
+                    ),
                     self.rules.max_zones_per_side,
                 );
                 *last_source = Some(source.ts_event);
@@ -1472,6 +1534,18 @@ impl SlcSignalState {
         let signal = long_signal.or(short_signal);
         self.funnel.signals += u64::from(signal.is_some());
         signal
+    }
+
+    /// 4 小时方向变化时丢弃旧结构下生成的 level，后续只接受新方向同侧的 level
+    fn align_levels_with_trend(&mut self, trend: Trend) {
+        if trend == self.level_trend {
+            return;
+        }
+        self.demand.clear();
+        self.supply.clear();
+        self.last_demand_source = None;
+        self.last_supply_source = None;
+        self.level_trend = trend;
     }
 }
 
@@ -1515,15 +1589,16 @@ fn push_zone(zones: &mut VecDeque<Zone>, zone: Zone, max_zones: usize) {
     zones.push_back(zone);
 }
 
-/// 在最近 1 至 N 根位移 K 线之前寻找最后一根反向源 K 线，并验证移动达到 ATR 阈值
+/// 在近期顶部/底部寻找最后一根反向源 K 线，并验证随后 1 至 N 根 Bar 达到 ATR 位移阈值
 ///
 /// Demand 要求源 K 线收跌、当前收盘突破源高点且靠近位移区间上沿；Supply 条件完全镜像。
-/// 返回的强度使用生成前 ATR 归一化，便于在价格和波动率不同的标的之间比较。
+/// 返回值同时标记源 K 是否处于近期极值：极值区可首次回测，非极值区只能等待破位收复；强度
+/// 使用生成前 ATR 归一化，便于在价格和波动率不同的标的之间比较。
 fn displacement_zone(
     bars: &VecDeque<Bar>,
     atr: f64,
     rules: SignalRules,
-) -> Option<(ZoneKind, Bar, f64)> {
+) -> Option<(ZoneKind, Bar, f64, bool)> {
     if atr <= 0.0 {
         return None;
     }
@@ -1531,6 +1606,15 @@ fn displacement_zone(
     let first_source = bars.len().saturating_sub(rules.displacement_max_bars + 1);
     for source_index in (first_source..bars.len().saturating_sub(1)).rev() {
         let source = bars[source_index];
+        let context_start = source_index.saturating_sub(rules.level_extreme_lookback_bars);
+        let at_recent_bottom = bars
+            .iter()
+            .skip(context_start)
+            .all(|candidate| source.low <= candidate.low);
+        let at_recent_top = bars
+            .iter()
+            .skip(context_start)
+            .all(|candidate| source.high >= candidate.high);
         let mut impulse_high = f64::NEG_INFINITY;
         let mut impulse_low = f64::INFINITY;
         for impulse in bars.iter().skip(source_index + 1) {
@@ -1542,29 +1626,28 @@ fn displacement_zone(
             continue;
         }
         let required_move = atr * rules.displacement_atr_multiple;
+        let upward_move = current.close.as_f64() - source.close.as_f64();
+        let downward_move = source.close.as_f64() - current.close.as_f64();
         if source.close < source.open
             && current.close > source.high
-            && current.close.as_f64() - source.close.as_f64() >= required_move
+            && upward_move >= required_move
             && (impulse_high - current.close.as_f64()) / impulse_range
                 <= rules.displacement_close_fraction
         {
             return Some((
                 ZoneKind::Demand,
                 source,
-                (current.close.as_f64() - source.close.as_f64()) / atr,
+                upward_move / atr,
+                at_recent_bottom,
             ));
         }
         if source.close > source.open
             && current.close < source.low
-            && source.close.as_f64() - current.close.as_f64() >= required_move
+            && downward_move >= required_move
             && (current.close.as_f64() - impulse_low) / impulse_range
                 <= rules.displacement_close_fraction
         {
-            return Some((
-                ZoneKind::Supply,
-                source,
-                (source.close.as_f64() - current.close.as_f64()) / atr,
-            ));
+            return Some((ZoneKind::Supply, source, downward_move / atr, at_recent_top));
         }
     }
     None
@@ -1967,18 +2050,6 @@ fn directional_close_location(bar: Bar, side: OrderSide) -> f64 {
     }
 }
 
-/// 判断持仓时间已到上限且最大有利波动仍不足，是否应触发 time stop
-fn should_request_time_stop(
-    bars_held: u64,
-    mfe_r: Decimal,
-    time_stop_bars: u64,
-    minimum_mfe_r: Decimal,
-    has_exposure: bool,
-    exit_pending: bool,
-) -> bool {
-    has_exposure && !exit_pending && bars_held >= time_stop_bars && mfe_r < minimum_mfe_r
-}
-
 /// 按持仓槽位均分账户名义上限，防止首个订单耗尽其他标的的全部容量
 fn per_position_notional_limit(
     account_notional: Decimal,
@@ -2073,7 +2144,6 @@ fn backtest_protective_orders(
 enum TradeExitReason {
     Target,
     Stop,
-    TimeStop,
     PreClose,
     RiskExit,
     Mixed,
@@ -2096,7 +2166,6 @@ impl Display for TradeExitReason {
         match self {
             Self::Target => write!(f, "target"),
             Self::Stop => write!(f, "stop"),
-            Self::TimeStop => write!(f, "time_stop"),
             Self::PreClose => write!(f, "pre_close"),
             Self::RiskExit => write!(f, "risk_exit"),
             Self::Mixed => write!(f, "mixed"),
@@ -2188,7 +2257,6 @@ impl RunStatistics {
             "SLC diagnostics total: entries_submitted={entries_submitted}, risk_rejections={risk_rejections}, {}",
             total.summary(),
         )];
-
         let mut rejections: BTreeMap<RiskRejectionReason, u64> = BTreeMap::new();
         for symbol in self.symbols.values() {
             for (reason, count) in &symbol.risk_rejections {
@@ -2208,6 +2276,32 @@ impl RunStatistics {
         for (reason, trades) in exits {
             lines.push(format!(
                 "SLC exit cohort: exit_reason={reason}, {}",
+                TradeAggregate::from_trades(trades.into_iter()).summary(),
+            ));
+        }
+
+        let mut side_cohorts: BTreeMap<String, Vec<&ClosedTradeStatistics>> = BTreeMap::new();
+        let mut level_cohorts: BTreeMap<SignalLevel, Vec<&ClosedTradeStatistics>> = BTreeMap::new();
+        for trade in self
+            .symbols
+            .values()
+            .flat_map(|symbol| symbol.trades.iter())
+        {
+            side_cohorts
+                .entry(trade.side.to_string())
+                .or_default()
+                .push(trade);
+            level_cohorts.entry(trade.level).or_default().push(trade);
+        }
+        for (side, trades) in side_cohorts {
+            lines.push(format!(
+                "SLC side cohort: side={side}, {}",
+                TradeAggregate::from_trades(trades.into_iter()).summary(),
+            ));
+        }
+        for (level, trades) in level_cohorts {
+            lines.push(format!(
+                "SLC level cohort: level={level}, {}",
                 TradeAggregate::from_trades(trades.into_iter()).summary(),
             ));
         }
@@ -2327,13 +2421,12 @@ fn risk_metrics_from_daily_pnl(
     Some(metrics)
 }
 
-/// 汇总扣费、最坏入场滑点及模糊路径压力后的逐日组合风险指标
-fn conservative_risk_metrics(
+/// 汇总扣费、最坏入场滑点及模糊路径压力后的逐日组合 PnL，并保留零交易日
+fn conservative_daily_pnl(
     statistics: &RunStatistics,
     trading_days: &BTreeSet<String>,
-    starting_balance: Money,
     timezone: &TimeZone,
-) -> Option<BacktestRiskMetrics> {
+) -> Option<Vec<Decimal>> {
     let mut pnl_by_day: BTreeMap<String, Decimal> = BTreeMap::new();
     for trade in statistics
         .symbols
@@ -2350,11 +2443,12 @@ fn conservative_risk_metrics(
         *pnl_by_day.entry(date).or_default() += pnl;
     }
 
-    let daily_pnl = trading_days
-        .iter()
-        .map(|date| pnl_by_day.get(date).copied().unwrap_or_default())
-        .collect::<Vec<_>>();
-    risk_metrics_from_daily_pnl(&daily_pnl, starting_balance.as_decimal())
+    Some(
+        trading_days
+            .iter()
+            .map(|date| pnl_by_day.get(date).copied().unwrap_or_default())
+            .collect(),
+    )
 }
 
 /// 将逐笔交易汇总成总计或 cohort 共用的绩效字段
@@ -2547,8 +2641,6 @@ struct SlcStrategyConfig {
     max_entry_slippage_ticks: u64,
     risk_reward: Decimal,
     stop_buffer_ticks: u64,
-    time_stop_bars: u64,
-    time_stop_minimum_mfe_r: Decimal,
     round_trip_cost_per_share: Decimal,
     log_bars: bool,
 }
@@ -2796,8 +2888,6 @@ impl SlcStrategy {
                 max_entry_slippage_ticks: app_config.max_entry_slippage_ticks,
                 risk_reward: app_config.risk_reward,
                 stop_buffer_ticks: app_config.stop_buffer_ticks,
-                time_stop_bars: app_config.time_stop_bars,
-                time_stop_minimum_mfe_r: app_config.time_stop_minimum_mfe_r,
                 round_trip_cost_per_share: run_config.round_trip_cost_per_share,
                 log_bars: run_config.log_bars,
             },
@@ -3052,11 +3142,7 @@ impl SlcStrategy {
         }
     }
 
-    /// 先预留账户容量，再按最坏允许价格计算数量并提交只存活一根 Bar 的可成交限价单
-    ///
-    /// 数量同时受风险预算、整手、最大数量和名义金额限制。reservation 使用最坏入场价计算，
-    /// 因而实际成交更优时只会降低风险；风险利用率低于最小阈值时直接跳过，避免产生经济意义
-    /// 很小且难以横向比较的交易。任何同步提交失败都会撤销尚未成交的风险预留。
+    /// 按确认 Bar 收盘价生成最坏可成交限价，预留账户容量后提交一根 Bar 有效的入场单
     fn submit_signal(
         &mut self,
         signal: Signal,
@@ -3197,20 +3283,17 @@ impl SlcStrategy {
         self.entries_submitted += 1;
         self.update_run_statistics(|statistics| statistics.entries_submitted += 1);
         log::info!(
-            "[{}] Submitted SLC {} entry: level={}, confirmation=stochastic_reentry, level_age_bars={}, confirmation_bars={}, confirmation_close_location={:.4}, distance_atr={:.4}, zone_width_atr={:.4}, displacement_atr={:.4}, quantity={}, signal_close={}, entry_limit={}, stop={}, reserved_risk={}, risk_utilization={}, reserved_notional={}",
+            "[{}] Submitted SLC {} entry: level={}, confirmation=stochastic_reentry, level_age_bars={}, confirmation_bars={}, quantity={}, signal_close={}, entry_limit={}, stop={}, target={}R, reserved_risk={}, risk_utilization={}, reserved_notional={}",
             self.config.instrument_id,
             signal.side,
             signal.level,
             signal.level_age_bars,
             signal.confirmation_bars,
-            signal.confirmation_close_location,
-            signal.distance_atr,
-            signal.zone_width_atr,
-            signal.displacement_strength_atr,
             quantity,
             signal.entry,
             entry_limit,
             stop,
+            self.config.risk_reward,
             reservation.risk,
             risk_utilization.round_dp(4),
             reservation.notional,
@@ -3218,7 +3301,7 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// 逐次保护每一笔入场成交；回测挂 OUO 止损/2R 目标，实盘向 Longbridge 提交 MIT 止损
+    /// 逐次保护每一笔入场成交；回测挂 OUO 止损/目标，实盘向 Longbridge 提交 MIT 止损
     ///
     /// 部分成交会累计成交数量和金额，实际平均价变化后重新计算整个头寸的目标。每个 fill 都按
     /// 相同区域止损单独保护，只有保护单成功提交后才更新 `protected_qty`。实盘目标不挂在券商，
@@ -3819,7 +3902,7 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.five_minute_bar_type, None, None);
         if self.backtest_four_hour_bars.is_some() {
             log::info!(
-                "[{}] SLC backtest active: direction={}, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, estimated_round_trip_cost_per_share={}",
+                "[{}] SLC backtest active: direction={}, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, target={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
                 self.config.instrument_id,
                 self.signals.rules.trade_direction,
                 self.config.five_minute_bar_type,
@@ -3832,10 +3915,8 @@ impl DataActor for SlcStrategy {
                 self.config.entry_end_minute % 60,
                 self.config.flatten_minute / 60,
                 self.config.flatten_minute % 60,
-                self.signals.rules.confirmation_min_close_location,
+                self.config.risk_reward,
                 self.config.minimum_risk_utilization,
-                self.config.time_stop_bars,
-                self.config.time_stop_minimum_mfe_r,
                 self.config.round_trip_cost_per_share,
             );
             return Ok(());
@@ -3854,7 +3935,7 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.four_hour_bar_type, None, None);
         self.subscribe_quotes(self.config.instrument_id, None, None);
         log::info!(
-            "[{}] SLC subscriptions active: direction={}, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, confirmation_min_close_location={}, minimum_risk_utilization={}, time_stop_bars={}, time_stop_minimum_mfe_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
+            "[{}] SLC subscriptions active: direction={}, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, target={}R, minimum_risk_utilization={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
             self.config.instrument_id,
             self.signals.rules.trade_direction,
             self.config.five_minute_bar_type,
@@ -3865,10 +3946,8 @@ impl DataActor for SlcStrategy {
             self.config.entry_end_minute % 60,
             self.config.flatten_minute / 60,
             self.config.flatten_minute % 60,
-            self.signals.rules.confirmation_min_close_location,
+            self.config.risk_reward,
             self.config.minimum_risk_utilization,
-            self.config.time_stop_bars,
-            self.config.time_stop_minimum_mfe_r,
             snapshot.halted,
             snapshot.realized_pnl,
             snapshot.open_risk,
@@ -3909,7 +3988,7 @@ impl DataActor for SlcStrategy {
         Ok(())
     }
 
-    /// 当可立即成交的一档报价达到实际成交价计算的 2R 时，启动先撤保护单再市价退出
+    /// 当可立即成交的一档报价达到实际成交价计算的固定 R 目标时启动退出
     ///
     /// 多头使用 bid、空头使用 ask，避免用不可成交的报价另一侧虚假触发盈利目标。该路径依赖
     /// 本地进程和实时 Quote；完成 Bar 检测只承担兜底职责，不能消除撤单与市价成交之间的延迟。
@@ -3937,7 +4016,7 @@ impl DataActor for SlcStrategy {
             return Ok(());
         }
         log::info!(
-            "[{}] Realtime 2R target reached: side={}, target={}, bid={}, ask={}, ts_event={}",
+            "[{}] Realtime SLC target reached: side={}, target={}, bid={}, ask={}, ts_event={}",
             self.config.instrument_id,
             side,
             target,
@@ -3947,14 +4026,14 @@ impl DataActor for SlcStrategy {
         );
         self.request_exit(
             TradeExitReason::Target,
-            "executable top-of-book quote reached the actual-fill-based 2R target",
+            "executable top-of-book quote reached the actual-fill-based SLC target",
         )
     }
 
     /// 按结构、数据完整性、时段、风险和执行顺序处理已完成 Bar
     ///
     /// 4 小时 Bar 只更新结构。5 分钟 Bar 先检查跨日与断档，再更新持仓 MFE/MAE、计算信号、
-    /// 执行收盘前退出和 time stop、取消过期入场、检查实盘目标兜底，最后才允许新订单进入风险
+    /// 执行收盘前退出、取消过期入场、检查实盘目标兜底，最后才允许新订单进入风险
     /// 预留流程。任一故障、会话禁用、已有敞口或退出未完成都会阻断新入场。
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         if bar.bar_type == self.config.four_hour_bar_type {
@@ -4070,36 +4149,11 @@ impl DataActor for SlcStrategy {
             }
             return Ok(());
         }
-        if let Some(active) = self.active_trade.as_ref() {
-            let bars_held = active.bars_held;
-            let mfe_r = active.mfe_r();
-            if should_request_time_stop(
-                bars_held,
-                mfe_r,
-                self.config.time_stop_bars,
-                self.config.time_stop_minimum_mfe_r,
-                self.has_exposure(),
-                self.exit_pending,
-            ) {
-                log::info!(
-                    "[{}] SLC time stop reached: bars_held={}, mfe_r={}, required_mfe_r={}",
-                    self.config.instrument_id,
-                    bars_held,
-                    mfe_r.round_dp(4),
-                    self.config.time_stop_minimum_mfe_r,
-                );
-                self.request_exit(
-                    TradeExitReason::TimeStop,
-                    "position failed to make the configured favorable excursion",
-                )?;
-                return Ok(());
-            }
-        }
         self.cancel_stale_entry(finalized)?;
         if self.backtest_four_hour_bars.is_none() && self.target_reached(finalized) {
             self.request_exit(
                 TradeExitReason::Target,
-                "five-minute bar traded through the actual-fill-based 2R target",
+                "five-minute bar traded through the actual-fill-based SLC target",
             )?;
             return Ok(());
         }
@@ -4111,11 +4165,8 @@ impl DataActor for SlcStrategy {
         {
             return Ok(());
         }
-        if let Some(signal) = signal
-            && let Err(e) = self.submit_signal(signal, local.date())
-        {
-            self.faulted = true;
-            return Err(e);
+        if let Some(signal) = signal {
+            self.submit_signal(signal, local.date())?;
         }
         Ok(())
     }
@@ -4280,9 +4331,19 @@ async fn load_instruments(
         .iter()
         .map(|instrument| instrument.instrument_id.symbol.as_str())
         .collect::<Vec<_>>();
+    let started = Instant::now();
+    println!(
+        "SLC data download: requesting static security info for {} symbols",
+        symbols.len(),
+    );
     let static_info = quote_api_call_with_retry(|| context.static_info(symbols.clone()))
         .await
         .context("failed to request Longbridge static security info")?;
+    println!(
+        "SLC data download: static security info ready, symbols={}, elapsed={:.1}s",
+        static_info.len(),
+        started.elapsed().as_secs_f64(),
+    );
     let mut static_info_by_symbol = static_info
         .into_iter()
         .map(|info| (info.symbol.clone(), info))
@@ -4471,6 +4532,13 @@ struct BacktestEvaluation {
     engine_sharpe: Option<f64>,
 }
 
+/// 单次引擎运行的参数评估及逐日保守 PnL，后者用于无重叠 OOS 组合汇总
+#[derive(Debug)]
+struct BacktestRunResult {
+    evaluation: BacktestEvaluation,
+    conservative_daily_pnl: Vec<Decimal>,
+}
+
 impl BacktestEvaluation {
     /// 生成单行且便于 grep 的参数评估记录，供 IS 选择和人工复核
     fn summary(self, sample: &str) -> String {
@@ -4500,11 +4568,15 @@ fn format_optional_metric(value: Option<f64>) -> String {
 /// 仅按保守 IS Sharpe 选择候选；并列时依次比较 PnL 和较小目标以保证结果确定
 fn select_in_sample_winner(
     evaluations: &[BacktestEvaluation],
+    minimum_trades: u64,
 ) -> anyhow::Result<BacktestEvaluation> {
     evaluations
         .iter()
         .copied()
-        .filter(|evaluation| evaluation.conservative_cost_adjusted_sharpe.is_some())
+        .filter(|evaluation| {
+            evaluation.trades >= minimum_trades
+                && evaluation.conservative_cost_adjusted_sharpe.is_some()
+        })
         .max_by(|left, right| {
             left.conservative_cost_adjusted_sharpe
                 .expect("filtered above")
@@ -4516,7 +4588,29 @@ fn select_in_sample_winner(
                 .then_with(|| left.conservative_pnl.cmp(&right.conservative_pnl))
                 .then_with(|| right.risk_reward.cmp(&left.risk_reward))
         })
-        .context("no target candidate produced a defined in-sample Sharpe")
+        .with_context(|| {
+            format!(
+                "no target candidate produced at least {minimum_trades} trades and a defined in-sample Sharpe",
+            )
+        })
+}
+
+/// 判断单折是否同时通过 IS 稳定性及预先声明的 OOS 样本量、收益、Sharpe 和回撤门槛
+fn walk_forward_fold_passes(
+    in_sample_sharpe: f64,
+    evaluation: BacktestEvaluation,
+    settings: WalkForwardSettings,
+) -> bool {
+    let Some(out_of_sample_sharpe) = evaluation.conservative_cost_adjusted_sharpe else {
+        return false;
+    };
+    evaluation.trades >= settings.minimum_oos_trades
+        && evaluation.conservative_pnl > Decimal::ZERO
+        && out_of_sample_sharpe >= settings.minimum_oos_sharpe
+        && walk_forward_verdict(in_sample_sharpe, out_of_sample_sharpe) == "acceptable"
+        && evaluation
+            .conservative_max_drawdown_pct
+            .is_some_and(|drawdown| drawdown >= -settings.maximum_oos_drawdown_pct)
 }
 
 /// 返回 OOS 边界之前最近的完整 Bar 作为指标 warmup，且不把这些 Bar 再计入 OOS 绩效
@@ -4544,27 +4638,95 @@ fn split_warmup_bars(
     Ok(bars.split_off(bars.len() - count))
 }
 
-/// 在同一时间戳切分全部 symbol，禁止任何 OOS Bar 进入 IS 参数选择
-fn split_walk_forward_inputs(
+/// 一组严格按交易日滚动且 OOS 不重叠的 IS/OOS 时间边界
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WalkForwardWindow {
+    train_start: UnixNanos,
+    test_start: UnixNanos,
+    test_end: UnixNanos,
+}
+
+/// 从全部标的实际出现的交易日生成滚动窗口，避免按自然日错误计算节假日
+fn rolling_walk_forward_windows(
     inputs: &[PreparedBacktestInputs],
     config: &AppConfig,
-    split: Timestamp,
-) -> anyhow::Result<(Vec<PreparedBacktestInputs>, Vec<PreparedBacktestInputs>)> {
-    let split = UnixNanos::from(split);
-    let mut in_sample = Vec::with_capacity(inputs.len());
-    let mut out_of_sample = Vec::with_capacity(inputs.len());
+    end: Timestamp,
+    settings: WalkForwardSettings,
+) -> anyhow::Result<Vec<WalkForwardWindow>> {
+    let mut day_starts = BTreeMap::<String, UnixNanos>::new();
     for input in inputs {
-        let mut train = input.clone();
-        train.five_minute_bars.retain(|bar| bar.ts_event < split);
-        train.four_hour_bars.retain(|bar| bar.ts_event < split);
+        for bar in &input.five_minute_bars {
+            let date = bar
+                .ts_event
+                .to_datetime_utc()
+                .to_zoned(config.timezone.clone())
+                .date()
+                .to_string();
+            day_starts
+                .entry(date)
+                .and_modify(|start| *start = (*start).min(bar.ts_event))
+                .or_insert(bar.ts_event);
+        }
+    }
+    walk_forward_windows_from_day_starts(
+        &day_starts.into_values().collect::<Vec<_>>(),
+        UnixNanos::from(end),
+        settings,
+    )
+}
 
-        let test = PreparedBacktestInputs {
+/// 根据有序交易日起点生成固定长度窗口；独立函数使边界与非重叠性质可直接测试
+fn walk_forward_windows_from_day_starts(
+    day_starts: &[UnixNanos],
+    end: UnixNanos,
+    settings: WalkForwardSettings,
+) -> anyhow::Result<Vec<WalkForwardWindow>> {
+    let window_days = settings
+        .train_days
+        .checked_add(settings.test_days)
+        .context("walk-forward window length overflowed")?;
+    anyhow::ensure!(
+        day_starts.len() >= window_days,
+        "walk-forward requires at least {window_days} trading days, available={}",
+        day_starts.len(),
+    );
+
+    let mut windows = Vec::new();
+    let mut first_day = 0;
+    while first_day + window_days <= day_starts.len() {
+        let test_end_index = first_day + window_days;
+        windows.push(WalkForwardWindow {
+            train_start: day_starts[first_day],
+            test_start: day_starts[first_day + settings.train_days],
+            test_end: day_starts.get(test_end_index).copied().unwrap_or(end),
+        });
+        first_day += settings.step_days;
+    }
+    anyhow::ensure!(
+        windows.len() >= settings.minimum_folds,
+        "walk-forward produced {} folds, below configured minimum {}",
+        windows.len(),
+        settings.minimum_folds,
+    );
+    Ok(windows)
+}
+
+/// 截取同一时间范围内的全部标的，并从边界之前重新构造各自 warmup
+fn slice_backtest_inputs(
+    inputs: &[PreparedBacktestInputs],
+    config: &AppConfig,
+    start: UnixNanos,
+    end: UnixNanos,
+) -> anyhow::Result<Vec<PreparedBacktestInputs>> {
+    let mut sliced = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let sample = PreparedBacktestInputs {
             instrument_id: input.instrument_id,
             instrument: input.instrument.clone(),
             five_minute_warmup: split_warmup_bars(
                 &input.five_minute_warmup,
                 &input.five_minute_bars,
-                split,
+                start,
                 config.five_minute_warmup,
                 input.instrument_id,
                 AppConfig::five_minute_bar_type(input.instrument_id),
@@ -4572,7 +4734,7 @@ fn split_walk_forward_inputs(
             four_hour_warmup: split_warmup_bars(
                 &input.four_hour_warmup,
                 &input.four_hour_bars,
-                split,
+                start,
                 config.four_hour_warmup,
                 input.instrument_id,
                 AppConfig::four_hour_bar_type(input.instrument_id),
@@ -4581,24 +4743,23 @@ fn split_walk_forward_inputs(
                 .five_minute_bars
                 .iter()
                 .copied()
-                .filter(|bar| bar.ts_event >= split)
+                .filter(|bar| bar.ts_event >= start && bar.ts_event < end)
                 .collect(),
             four_hour_bars: input
                 .four_hour_bars
                 .iter()
                 .copied()
-                .filter(|bar| bar.ts_event >= split)
+                .filter(|bar| bar.ts_event >= start && bar.ts_event < end)
                 .collect(),
         };
         anyhow::ensure!(
-            !train.five_minute_bars.is_empty() && !test.five_minute_bars.is_empty(),
-            "walk-forward split leaves an empty 5m sample for {}",
+            !sample.five_minute_bars.is_empty(),
+            "walk-forward window {start}..{end} leaves an empty 5m sample for {}",
             input.instrument_id,
         );
-        in_sample.push(train);
-        out_of_sample.push(test);
+        sliced.push(sample);
     }
-    Ok((in_sample, out_of_sample))
+    Ok(sliced)
 }
 
 /// 通过共享限流的 Longbridge QuoteContext 为所有 symbol 加载 warmup 和回放数据
@@ -4608,6 +4769,7 @@ async fn prepare_backtest_inputs(
 ) -> anyhow::Result<Vec<PreparedBacktestInputs>> {
     let start_date = us_market_date(config.start)?;
     let end_date = us_market_date(config.end)?;
+    println!("SLC data download: querying US trading calendar, range={start_date}..={end_date}",);
     let mut half_days = BTreeSet::new();
     let mut cursor = start_date;
     while cursor <= end_date {
@@ -4616,6 +4778,7 @@ async fn prepare_backtest_inputs(
             .checked_add(time::Duration::days(TRADING_DAYS_CHUNK_DAYS - 1))
             .unwrap_or(end_date)
             .min(end_date);
+        println!("SLC data download: trading calendar chunk {cursor}..={chunk_end}");
         half_days.extend(
             quote_api_call_with_retry(|| context.trading_days(Market::US, cursor, chunk_end))
                 .await
@@ -4634,10 +4797,18 @@ async fn prepare_backtest_inputs(
             .context("trading-day date range exceeded the supported calendar")?;
     }
     let mut prepared = Vec::with_capacity(config.strategy.instruments.len());
-    for (instrument_id, instrument) in load_instruments(&config.strategy, context).await? {
+    let instruments = load_instruments(&config.strategy, context).await?;
+    let symbol_count = instruments.len();
+    for (index, (instrument_id, instrument)) in instruments.into_iter().enumerate() {
         let symbol = instrument_id.symbol.as_str();
         let five_minute_bar_type = AppConfig::five_minute_bar_type(instrument_id);
         let four_hour_bar_type = AppConfig::four_hour_bar_type(instrument_id);
+        let started = Instant::now();
+        println!(
+            "[{}/{}] [{instrument_id}] SLC data download: requesting 5m warmup",
+            index + 1,
+            symbol_count,
+        );
         let five_minute_warmup = load_backtest_warmup_bars(
             context,
             symbol,
@@ -4648,6 +4819,12 @@ async fn prepare_backtest_inputs(
             instrument.price_precision(),
         )
         .await?;
+        println!(
+            "[{}/{}] [{instrument_id}] SLC data download: 5m warmup ready, bars={}",
+            index + 1,
+            symbol_count,
+            five_minute_warmup.len(),
+        );
         let four_hour_warmup = load_backtest_warmup_bars(
             context,
             symbol,
@@ -4658,6 +4835,17 @@ async fn prepare_backtest_inputs(
             instrument.price_precision(),
         )
         .await?;
+        println!(
+            "[{}/{}] [{instrument_id}] SLC data download: 4h warmup ready, bars={}",
+            index + 1,
+            symbol_count,
+            four_hour_warmup.len(),
+        );
+        println!(
+            "[{}/{}] [{instrument_id}] SLC data download: requesting 5m replay {start_date}..={end_date}",
+            index + 1,
+            symbol_count,
+        );
         let downloaded_five_minute_bars = load_backtest_bars(
             context,
             symbol,
@@ -4681,6 +4869,12 @@ async fn prepare_backtest_inputs(
             config.start,
             config.end,
         );
+        println!(
+            "[{}/{}] [{instrument_id}] SLC data download: 5m replay ready, bars={}",
+            index + 1,
+            symbol_count,
+            five_minute_bars.len(),
+        );
         let four_hour_bars = load_backtest_bars(
             context,
             symbol,
@@ -4691,13 +4885,16 @@ async fn prepare_backtest_inputs(
             instrument.price_precision(),
         )
         .await?;
-        log::info!(
-            "[{instrument_id}] SLC backtest data ready: 5m_warmup={}, 4h_warmup={}, 5m_bars={}, 4h_bars={}, skipped_half_days={}",
+        println!(
+            "[{}/{}] [{instrument_id}] SLC data ready: 5m_warmup={}, 4h_warmup={}, 5m_bars={}, 4h_bars={}, skipped_half_days={}, elapsed={:.1}s",
+            index + 1,
+            symbol_count,
             five_minute_warmup.len(),
             four_hour_warmup.len(),
             five_minute_bars.len(),
             four_hour_bars.len(),
             half_days.len(),
+            started.elapsed().as_secs_f64(),
         );
         prepared.push(PreparedBacktestInputs {
             instrument_id,
@@ -5005,7 +5202,7 @@ fn run_backtest_engine(
     config: &SlcBacktestConfig,
     prepared: Vec<PreparedBacktestInputs>,
     sample: &str,
-) -> anyhow::Result<BacktestEvaluation> {
+) -> anyhow::Result<BacktestRunResult> {
     let _cleanup = TemporaryRiskState(config.strategy.risk_state_path.clone());
     let account_risk = Arc::new(AccountRisk::load(config.strategy.risk_state_path.clone())?);
     let run_statistics = Arc::new(Mutex::new(RunStatistics::default()));
@@ -5085,7 +5282,7 @@ fn run_backtest_engine(
         println!("{line}");
     }
 
-    let (aggregate, risk_metrics) = {
+    let (aggregate, conservative_daily_pnl) = {
         let statistics = run_statistics
             .lock()
             .map_err(|_| anyhow::anyhow!("SLC run statistics mutex was poisoned"))?;
@@ -5096,15 +5293,15 @@ fn run_backtest_engine(
                     .values()
                     .flat_map(|symbol| symbol.trades.iter()),
             ),
-            conservative_risk_metrics(
-                &statistics,
-                &trading_days,
-                config.starting_balance,
-                &config.strategy.timezone,
-            ),
+            conservative_daily_pnl(&statistics, &trading_days, &config.strategy.timezone)
+                .context("SLC conservative PnL is unavailable for one or more closed trades")?,
         )
     };
-    let risk_metrics = risk_metrics.unwrap_or_default();
+    let risk_metrics = risk_metrics_from_daily_pnl(
+        &conservative_daily_pnl,
+        config.starting_balance.as_decimal(),
+    )
+    .unwrap_or_default();
 
     let result = engine.get_result();
     println!(
@@ -5130,7 +5327,10 @@ fn run_backtest_engine(
         engine_sharpe: result.stats_returns.get("Sharpe Ratio (252 days)").copied(),
     };
     println!("{}", evaluation.summary(sample));
-    Ok(evaluation)
+    Ok(BacktestRunResult {
+        evaluation,
+        conservative_daily_pnl,
+    })
 }
 
 /// 从第一个可选命令行参数读取 TOML 路径；未提供时使用仓库内示例配置
@@ -5138,8 +5338,7 @@ fn config_path_from_args() -> anyhow::Result<PathBuf> {
     let mut args = env::args_os().skip(1);
     let path = args
         .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+        .map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), PathBuf::from);
     anyhow::ensure!(
         args.next().is_none(),
         "expected at most one argument: path to the SLC TOML configuration",
@@ -5157,10 +5356,10 @@ pub(super) async fn run(backtest: bool) -> anyhow::Result<()> {
     }
 }
 
-/// 下载 Longbridge 历史数据并运行参数化多标的回测或 walk-forward 评估
+/// 下载 Longbridge 历史数据并运行参数化多标的回测或滚动 walk-forward 评估
 ///
-/// 有切分点时先在 IS 比较目标候选，只把胜出参数运行于 OOS；无切分点时对全部候选分别运行。
-/// 参数选择只依据保守指标，原始 Nautilus 统计仍输出用于核对，但不作为最优参数依据。
+/// 每个滚动折只在 IS 比较目标候选，只把胜出参数运行于紧随其后的非重叠 OOS；无滚动配置时
+/// 对全部候选分别运行完整样本。参数选择只依据保守指标，原始 Nautilus 统计仅用于核对。
 async fn run_backtest(config_path: &Path) -> anyhow::Result<()> {
     let config = SlcBacktestConfig::load(config_path)?;
     println!("SLC configuration loaded from {}", config_path.display());
@@ -5176,39 +5375,110 @@ async fn run_backtest(config_path: &Path) -> anyhow::Result<()> {
             config.timeout_secs,
         )
     })??;
-    if let Some(split) = config.walk_forward_split {
-        let (in_sample, out_of_sample) =
-            split_walk_forward_inputs(&prepared, &config.strategy, split)?;
-        let mut in_sample_evaluations = Vec::with_capacity(config.risk_rewards.len());
-        for risk_reward in &config.risk_rewards {
+    if let Some(settings) = config.walk_forward {
+        let windows =
+            rolling_walk_forward_windows(&prepared, &config.strategy, config.end, settings)?;
+        let fold_count = windows.len();
+        let mut passing_folds = 0_usize;
+        let mut total_oos_trades = 0_u64;
+        let mut total_oos_pnl = Decimal::ZERO;
+        let mut combined_oos_daily_pnl = Vec::new();
+        let mut selected_targets = BTreeMap::<Decimal, u64>::new();
+
+        for (index, window) in windows.into_iter().enumerate() {
+            let fold = index + 1;
+            let in_sample = slice_backtest_inputs(
+                &prepared,
+                &config.strategy,
+                window.train_start,
+                window.test_start,
+            )?;
+            let out_of_sample = slice_backtest_inputs(
+                &prepared,
+                &config.strategy,
+                window.test_start,
+                window.test_end,
+            )?;
+            let mut in_sample_evaluations = Vec::with_capacity(config.risk_rewards.len());
+            for risk_reward in &config.risk_rewards {
+                let mut candidate = config.clone();
+                candidate.strategy.risk_reward = *risk_reward;
+                let sample = format!("WF-{fold:02}-IS");
+                in_sample_evaluations
+                    .push(run_backtest_engine(&candidate, in_sample.clone(), &sample)?.evaluation);
+            }
+            let winner =
+                select_in_sample_winner(&in_sample_evaluations, settings.minimum_is_trades)?;
+            *selected_targets.entry(winner.risk_reward).or_default() += 1;
+
             let mut candidate = config.clone();
-            candidate.strategy.risk_reward = *risk_reward;
-            in_sample_evaluations.push(run_backtest_engine(&candidate, in_sample.clone(), "IS")?);
+            candidate.strategy.risk_reward = winner.risk_reward;
+            let sample = format!("WF-{fold:02}-OOS");
+            let out_of_sample = run_backtest_engine(&candidate, out_of_sample, &sample)?;
+            let evaluation = out_of_sample.evaluation;
+            let in_sample_sharpe = winner
+                .conservative_cost_adjusted_sharpe
+                .expect("winner requires a defined Sharpe");
+            let stability_verdict = evaluation
+                .conservative_cost_adjusted_sharpe
+                .map_or("reject_undefined_oos", |sharpe| {
+                    walk_forward_verdict(in_sample_sharpe, sharpe)
+                });
+            let degradation = evaluation
+                .conservative_cost_adjusted_sharpe
+                .filter(|_| in_sample_sharpe != 0.0)
+                .map(|sharpe| sharpe / in_sample_sharpe);
+            let passes = walk_forward_fold_passes(in_sample_sharpe, evaluation, settings);
+            passing_folds += usize::from(passes);
+            total_oos_trades += evaluation.trades;
+            total_oos_pnl += evaluation.conservative_pnl;
+            combined_oos_daily_pnl.extend(out_of_sample.conservative_daily_pnl);
+            println!(
+                "SLC walk-forward fold: fold={fold}/{fold_count}, train={}..{}, test={}..{}, selected_risk_reward={}, is_trades={}, oos_trades={}, is_conservative_sharpe={}, oos_conservative_sharpe={}, degradation_ratio={}, oos_conservative_pnl={}, oos_max_drawdown_pct={}, stability_verdict={stability_verdict}, pass={passes}",
+                window.train_start,
+                window.test_start,
+                window.test_start,
+                window.test_end,
+                winner.risk_reward,
+                winner.trades,
+                evaluation.trades,
+                format_optional_metric(Some(in_sample_sharpe)),
+                format_optional_metric(evaluation.conservative_cost_adjusted_sharpe),
+                format_optional_metric(degradation),
+                evaluation.conservative_pnl,
+                format_optional_metric(evaluation.conservative_max_drawdown_pct),
+            );
         }
-        let winner = select_in_sample_winner(&in_sample_evaluations)?;
-        let mut candidate = config.clone();
-        candidate.strategy.risk_reward = winner.risk_reward;
-        let out_of_sample_evaluation = run_backtest_engine(&candidate, out_of_sample, "OOS")?;
-        let in_sample_sharpe = winner
-            .conservative_cost_adjusted_sharpe
-            .expect("winner requires a defined Sharpe");
-        let out_of_sample_sharpe = out_of_sample_evaluation.conservative_cost_adjusted_sharpe;
-        let verdict = out_of_sample_sharpe.map_or("reject_undefined_oos", |sharpe| {
-            walk_forward_verdict(in_sample_sharpe, sharpe)
-        });
-        let degradation = out_of_sample_sharpe
-            .filter(|_| in_sample_sharpe != 0.0)
-            .map(|sharpe| sharpe / in_sample_sharpe);
+
+        let pass_rate =
+            f64::from(u32::try_from(passing_folds)?) / f64::from(u32::try_from(fold_count)?);
+        let aggregate_metrics = risk_metrics_from_daily_pnl(
+            &combined_oos_daily_pnl,
+            config.starting_balance.as_decimal(),
+        )
+        .context("rolling OOS samples produced no daily risk metrics")?;
+        let eligible_for_paper_risk_scaling = pass_rate >= settings.minimum_pass_rate
+            && total_oos_pnl > Decimal::ZERO
+            && aggregate_metrics
+                .sharpe
+                .is_some_and(|sharpe| sharpe >= settings.minimum_oos_sharpe)
+            && aggregate_metrics
+                .max_drawdown_pct
+                .is_some_and(|drawdown| drawdown >= -settings.maximum_oos_drawdown_pct);
+        let selected_targets = selected_targets
+            .into_iter()
+            .map(|(risk_reward, folds)| format!("{risk_reward}:{folds}"))
+            .collect::<Vec<_>>()
+            .join(",");
         println!(
-            "SLC walk-forward result: split={split}, selected_risk_reward={}, is_conservative_cost_adjusted_sharpe={}, oos_conservative_cost_adjusted_sharpe={}, is_conservative_max_drawdown_pct={}, oos_conservative_max_drawdown_pct={}, is_conservative_calmar={}, oos_conservative_calmar={}, degradation_ratio={}, verdict={verdict}",
-            winner.risk_reward,
-            format_optional_metric(Some(in_sample_sharpe)),
-            format_optional_metric(out_of_sample_sharpe),
-            format_optional_metric(winner.conservative_max_drawdown_pct),
-            format_optional_metric(out_of_sample_evaluation.conservative_max_drawdown_pct),
-            format_optional_metric(winner.conservative_calmar),
-            format_optional_metric(out_of_sample_evaluation.conservative_calmar),
-            format_optional_metric(degradation),
+            "SLC rolling OOS aggregate: folds={fold_count}, passing_folds={passing_folds}, pass_rate={pass_rate:.4}, selected_targets={selected_targets}, trades={total_oos_trades}, conservative_pnl={total_oos_pnl}, conservative_sharpe={}, max_drawdown_pct={}, annualized_return_pct={}, calmar={}, positive_days={}, negative_days={}, flat_days={}, eligible_for_paper_risk_scaling={eligible_for_paper_risk_scaling}",
+            format_optional_metric(aggregate_metrics.sharpe),
+            format_optional_metric(aggregate_metrics.max_drawdown_pct),
+            format_optional_metric(aggregate_metrics.annualized_return_pct),
+            format_optional_metric(aggregate_metrics.calmar),
+            aggregate_metrics.positive_days,
+            aggregate_metrics.negative_days,
+            aggregate_metrics.flat_days,
         );
         Ok(())
     } else {
@@ -5535,21 +5805,20 @@ open_updated = true
         SignalRules {
             trade_direction: TradeDirection::Both,
             zone_ttl_bars: 234,
+            minimum_fresh_level_age_bars: 1,
             max_zones_per_side: 8,
             confirmation_window_bars: 6,
-            confirmation_max_distance_atr: 0.35,
-            confirmation_min_close_location: 0.55,
             displacement_atr_multiple: 1.0,
             displacement_close_fraction: 0.35,
             displacement_max_bars: 3,
+            level_extreme_lookback_bars: 3,
             oversold: 20.0,
             overbought: 80.0,
         }
     }
 
-    #[test]
-    fn five_minute_indicators_initialize_without_four_hour_structure() {
-        let mut signals = SlcSignalState {
+    fn signal_state() -> SlcSignalState {
+        SlcSignalState {
             five_minute_bars: FinalBarBuffer::default(),
             four_hour_bars: FinalBarBuffer::default(),
             structure: PivotStructure::new(2),
@@ -5562,6 +5831,7 @@ open_updated = true
                 StochasticsDMethod::MovingAverage,
             ),
             recent_five_minute_bars: VecDeque::new(),
+            level_trend: Trend::Neutral,
             last_demand_source: None,
             last_supply_source: None,
             previous_k: None,
@@ -5569,7 +5839,12 @@ open_updated = true
             supply: VecDeque::new(),
             funnel: SignalFunnel::default(),
             rules: signal_rules(),
-        };
+        }
+    }
+
+    #[test]
+    fn five_minute_indicators_initialize_without_four_hour_structure() {
+        let mut signals = signal_state();
 
         let _ = signals.process_five_minute(five_minute_bar("100", "101", "99", "100", 1), false);
 
@@ -5578,6 +5853,30 @@ open_updated = true
         assert!(!signals.structure.initialized());
         assert_eq!(signals.structure.trend(), Trend::Neutral);
         assert!(signals.indicators_initialized());
+    }
+
+    #[test]
+    fn high_timeframe_trend_change_discards_old_levels() {
+        let mut signals = signal_state();
+        signals.level_trend = Trend::Up;
+        signals.last_demand_source = Some(UnixNanos::from(1));
+        signals.last_supply_source = Some(UnixNanos::from(2));
+        signals.demand.push_back(Zone::from_bar(
+            ZoneKind::Demand,
+            five_minute_bar("100", "101", "99", "100", 1),
+        ));
+        signals.supply.push_back(Zone::from_bar(
+            ZoneKind::Supply,
+            five_minute_bar("100", "101", "99", "100", 1),
+        ));
+
+        signals.align_levels_with_trend(Trend::Down);
+
+        assert_eq!(signals.level_trend, Trend::Down);
+        assert!(signals.demand.is_empty());
+        assert!(signals.supply.is_empty());
+        assert_eq!(signals.last_demand_source, None);
+        assert_eq!(signals.last_supply_source, None);
     }
 
     #[test]
@@ -5714,13 +6013,18 @@ open_updated = true
 
         assert_eq!(config.instruments.len(), file.symbols.len());
         assert!(!config.instruments.is_empty());
-        assert_eq!(config.risk_amount, Decimal::from(25));
+        assert_eq!(config.risk_amount, Decimal::from(100));
+        assert_eq!(config.max_account_notional, Decimal::from(60_000));
+        assert_eq!(config.max_order_quantity, Quantity::from(1_000));
+        assert_eq!(config.max_order_notional, Decimal::from(20_000));
+        assert_eq!(config.per_position_notional_limit(), Decimal::from(20_000));
         assert_eq!(config.trade_direction, TradeDirection::Both);
         assert!(config.papertrading);
 
         let backtest = SlcBacktestConfig::load(Path::new(DEFAULT_CONFIG_PATH)).unwrap();
         assert!(backtest.start < backtest.end);
-        assert_eq!(backtest.risk_rewards, vec![Decimal::from(2)]);
+        assert_eq!(backtest.risk_rewards, vec![Decimal::from(2)],);
+        assert!(backtest.walk_forward.is_none());
     }
 
     #[rstest::rstest]
@@ -5787,7 +6091,7 @@ open_updated = true
                 2.0,
                 rules,
             )
-            .map(|(kind, source, _)| (kind, source)),
+            .map(|(kind, source, _, _)| (kind, source)),
             Some((ZoneKind::Demand, bearish_base)),
         );
         assert_eq!(
@@ -5796,7 +6100,7 @@ open_updated = true
                 2.0,
                 rules,
             )
-            .map(|(kind, source, _)| (kind, source)),
+            .map(|(kind, source, _, _)| (kind, source)),
             Some((ZoneKind::Supply, bullish_base)),
         );
     }
@@ -5811,13 +6115,32 @@ open_updated = true
 
         assert_eq!(
             displacement_zone(&VecDeque::from([source, first, second]), 2.0, rules)
-                .map(|(kind, source, _)| (kind, source)),
+                .map(|(kind, source, _, _)| (kind, source)),
             None,
         );
         assert_eq!(
             displacement_zone(&VecDeque::from([source, first, second, third]), 2.0, rules,)
-                .map(|(kind, source, _)| (kind, source)),
+                .map(|(kind, source, _, _)| (kind, source)),
             Some((ZoneKind::Demand, source)),
+        );
+    }
+
+    #[test]
+    fn non_extreme_displacement_cannot_enter_fresh() {
+        let prior_low = five_minute_bar("98.0", "100.0", "97.0", "99.0", 1);
+        let source = five_minute_bar("100.0", "101.0", "98.0", "99.0", 2);
+        let displacement = five_minute_bar("99.0", "104.0", "99.0", "103.5", 3);
+
+        assert_eq!(
+            displacement_zone(
+                &VecDeque::from([prior_low, source, displacement]),
+                2.0,
+                signal_rules(),
+            )
+            .map(|(kind, candidate, _, fresh_entry_eligible)| {
+                (kind, candidate, fresh_entry_eligible)
+            }),
+            Some((ZoneKind::Demand, source, false)),
         );
     }
 
@@ -5863,13 +6186,13 @@ open_updated = true
     }
 
     #[rstest::rstest]
-    fn test_zone_accepts_reentry_on_the_touch_bar() {
+    fn zone_rejects_reentry_when_the_extreme_precedes_the_touch() {
         let rules = signal_rules();
         let source = five_minute_bar("100", "101", "99", "100", 1);
         let touch_and_reentry = five_minute_bar("102", "102", "100", "101.2", 2);
         let mut zones = VecDeque::from([Zone::from_bar(ZoneKind::Demand, source)]);
 
-        assert!(
+        assert_eq!(
             observe_zones(
                 &mut zones,
                 touch_and_reentry,
@@ -5880,22 +6203,98 @@ open_updated = true
                 true,
                 OrderSide::Buy,
                 rules,
-            )
-            .is_some(),
+            ),
+            None,
         );
-        assert!(zones.is_empty());
+        assert_eq!(zones[0].state, ZoneState::AwaitingConfirmation);
     }
 
-    #[rstest::rstest]
-    fn test_zone_rejects_reentry_without_price_confirmation() {
+    #[test]
+    fn premature_fresh_retest_invalidates_the_level() {
+        let rules = SignalRules {
+            minimum_fresh_level_age_bars: 3,
+            ..signal_rules()
+        };
+        let source = five_minute_bar("100", "101", "99", "100", 1);
+        let mut zone = Zone::from_bar(ZoneKind::Demand, source);
+
+        assert_eq!(
+            zone.observe(
+                five_minute_bar("102", "102", "100", "101.2", 2),
+                Confirmation {
+                    extreme: true,
+                    reentry: false,
+                },
+                true,
+                OrderSide::Buy,
+                rules,
+            ),
+            ZoneObservation::Remove,
+        );
+    }
+
+    #[test]
+    fn non_extreme_level_requires_break_and_reclaim() {
         let rules = signal_rules();
         let source = five_minute_bar("100", "101", "99", "100", 1);
-        let weak_reentry = five_minute_bar("101", "102", "100", "101", 2);
-        let mut zones = VecDeque::from([Zone::from_bar(ZoneKind::Demand, source)]);
+        let mut zones = VecDeque::from([Zone::from_displacement(
+            ZoneKind::Demand,
+            source,
+            2.0,
+            1.5,
+            false,
+        )]);
 
-        let signal = observe_zones(
+        let fresh = observe_zones(
             &mut zones,
-            weak_reentry,
+            five_minute_bar("102", "102", "100", "101.2", 2),
+            Confirmation {
+                extreme: false,
+                reentry: true,
+            },
+            true,
+            OrderSide::Buy,
+            rules,
+        );
+        assert_eq!(fresh, None);
+        assert_eq!(zones[0].state, ZoneState::Fresh);
+
+        let _ = observe_zones(
+            &mut zones,
+            five_minute_bar("100", "100", "98", "98.5", 3),
+            Confirmation {
+                extreme: false,
+                reentry: false,
+            },
+            true,
+            OrderSide::Buy,
+            rules,
+        );
+        let _ = observe_zones(
+            &mut zones,
+            five_minute_bar("99", "102", "99", "101.5", 4),
+            Confirmation {
+                extreme: false,
+                reentry: false,
+            },
+            true,
+            OrderSide::Buy,
+            rules,
+        );
+        let _ = observe_zones(
+            &mut zones,
+            five_minute_bar("101", "101.5", "100", "101.2", 5),
+            Confirmation {
+                extreme: true,
+                reentry: false,
+            },
+            true,
+            OrderSide::Buy,
+            rules,
+        );
+        let reclaimed = observe_zones(
+            &mut zones,
+            five_minute_bar("101.2", "102", "101", "101.8", 6),
             Confirmation {
                 extreme: false,
                 reentry: true,
@@ -5905,21 +6304,22 @@ open_updated = true
             rules,
         );
 
-        assert!(signal.is_none());
+        assert!(reclaimed.is_some_and(|signal| signal.level == SignalLevel::Reclaimed));
     }
 
     #[rstest::rstest]
-    fn test_zone_rejects_confirmation_after_price_leaves_the_level() {
-        let rules = SignalRules {
-            confirmation_max_distance_atr: 0.25,
-            ..signal_rules()
-        };
+    fn test_zone_accepts_stochastic_reentry_within_confirmation_window() {
+        let rules = signal_rules();
         let source = five_minute_bar("100", "101", "99", "100", 1);
         let touch = five_minute_bar("101", "101", "100", "100.5", 2);
-        let far_confirmation = five_minute_bar("101.5", "102.5", "101.5", "102", 3);
-        let near_confirmation = five_minute_bar("101.2", "101.5", "101", "101.4", 4);
-        let mut zones =
-            VecDeque::from([Zone::from_displacement(ZoneKind::Demand, source, 2.0, 1.5)]);
+        let confirmation = five_minute_bar("101.5", "102.5", "101.5", "102", 3);
+        let mut zones = VecDeque::from([Zone::from_displacement(
+            ZoneKind::Demand,
+            source,
+            2.0,
+            1.5,
+            true,
+        )]);
 
         let _ = observe_zones(
             &mut zones,
@@ -5932,20 +6332,9 @@ open_updated = true
             OrderSide::Buy,
             rules,
         );
-        let far = observe_zones(
+        let signal = observe_zones(
             &mut zones,
-            far_confirmation,
-            Confirmation {
-                extreme: false,
-                reentry: true,
-            },
-            true,
-            OrderSide::Buy,
-            rules,
-        );
-        let near = observe_zones(
-            &mut zones,
-            near_confirmation,
+            confirmation,
             Confirmation {
                 extreme: false,
                 reentry: true,
@@ -5955,8 +6344,8 @@ open_updated = true
             rules,
         );
 
-        assert!(far.is_none());
-        assert!(near.is_some_and(|signal| (signal.distance_atr - 0.2).abs() < 1e-9),);
+        assert!(signal.is_some());
+        assert!(zones.is_empty());
     }
 
     #[rstest::rstest]
@@ -6207,34 +6596,6 @@ open_updated = true
     }
 
     #[rstest::rstest]
-    fn test_time_stop_requires_stale_exposure_without_sufficient_mfe() {
-        assert!(should_request_time_stop(
-            9,
-            Decimal::new(4, 1),
-            9,
-            Decimal::new(5, 1),
-            true,
-            false,
-        ));
-        assert!(!should_request_time_stop(
-            9,
-            Decimal::new(5, 1),
-            9,
-            Decimal::new(5, 1),
-            true,
-            false,
-        ));
-        assert!(!should_request_time_stop(
-            8,
-            Decimal::new(4, 1),
-            9,
-            Decimal::new(5, 1),
-            true,
-            false,
-        ));
-    }
-
-    #[rstest::rstest]
     fn test_order_notional_reserves_capacity_for_each_position_slot() {
         assert_eq!(
             per_position_notional_limit(Decimal::from(5_000), 2, Decimal::from(5_000)),
@@ -6321,9 +6682,87 @@ open_updated = true
         ];
 
         assert_eq!(
-            select_in_sample_winner(&evaluations).unwrap().risk_reward,
+            select_in_sample_winner(&evaluations, 20)
+                .unwrap()
+                .risk_reward,
             Decimal::new(15, 1),
         );
+        assert!(select_in_sample_winner(&evaluations, 21).is_err());
+    }
+
+    #[rstest::rstest]
+    fn test_rolling_walk_forward_windows_are_fixed_and_non_overlapping() {
+        let settings = WalkForwardSettings {
+            train_days: 3,
+            test_days: 2,
+            step_days: 2,
+            minimum_folds: 2,
+            minimum_is_trades: 1,
+            minimum_oos_trades: 1,
+            minimum_oos_sharpe: 0.0,
+            maximum_oos_drawdown_pct: 1.0,
+            minimum_pass_rate: 0.5,
+        };
+        let days = (1_u64..=7).map(UnixNanos::from).collect::<Vec<_>>();
+
+        let windows =
+            walk_forward_windows_from_day_starts(&days, UnixNanos::from(8), settings).unwrap();
+
+        assert_eq!(
+            windows,
+            vec![
+                WalkForwardWindow {
+                    train_start: UnixNanos::from(1),
+                    test_start: UnixNanos::from(4),
+                    test_end: UnixNanos::from(6),
+                },
+                WalkForwardWindow {
+                    train_start: UnixNanos::from(3),
+                    test_start: UnixNanos::from(6),
+                    test_end: UnixNanos::from(8),
+                },
+            ],
+        );
+    }
+
+    #[rstest::rstest]
+    fn test_walk_forward_fold_requires_every_acceptance_threshold() {
+        let settings = WalkForwardSettings {
+            train_days: 3,
+            test_days: 2,
+            step_days: 2,
+            minimum_folds: 1,
+            minimum_is_trades: 1,
+            minimum_oos_trades: 20,
+            minimum_oos_sharpe: 1.0,
+            maximum_oos_drawdown_pct: 1.0,
+            minimum_pass_rate: 0.5,
+        };
+        let accepted = BacktestEvaluation {
+            trade_direction: TradeDirection::Both,
+            risk_reward: Decimal::from(2),
+            trades: 20,
+            conservative_pnl: Decimal::ONE,
+            conservative_cost_adjusted_sharpe: Some(1.0),
+            conservative_max_drawdown_pct: Some(-1.0),
+            conservative_annualized_return_pct: Some(1.0),
+            conservative_calmar: Some(1.0),
+            positive_days: 1,
+            negative_days: 0,
+            flat_days: 0,
+            engine_sharpe: Some(1.0),
+        };
+
+        assert!(walk_forward_fold_passes(1.0, accepted, settings));
+        assert!(!walk_forward_fold_passes(
+            1.0,
+            BacktestEvaluation {
+                conservative_pnl: Decimal::ZERO,
+                ..accepted
+            },
+            settings,
+        ));
+        assert!(!walk_forward_fold_passes(-0.1, accepted, settings));
     }
 
     #[rstest::rstest]

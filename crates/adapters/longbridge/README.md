@@ -43,24 +43,27 @@ cargo run -p nautilus-longbridge --features examples --example longbridge-slc-ba
 
 The OAuth public client ID is read from the TOML, while OAuth tokens remain in the official SDK's
 local secure storage. The example defaults to Longbridge paper trading and creates one strategy per
-symbol. Fresh and once-broken/reclaimed levels are retained in bounded per-side collections.
-Stochastic confirmation defaults to three bars, must remain close to the level, and requires a
-directional candle close. Entry orders are one-bar marketable limits sized from their worst allowed
-price. Every fill receives a market-if-touched protective stop, and its 2R target is recalculated
-from average fill price. Executable top-of-book quotes trigger the cancel-then-close target exit
-immediately; completed 5-minute bars remain a conservative fallback.
+symbol. Fresh entries require the displacement source candle to be at a recent local extreme and
+remain untouched for the configured minimum departure interval; other strong levels become eligible
+only after one break, reclaim and retest. Stochastic confirmation defaults to a three-bar window,
+with the extreme required at or after the level touch. Entry orders are one-bar marketable limits
+sized from their worst allowed price. Every fill receives a market-if-touched protective stop, and
+its 2R target is recalculated from average fill price. Executable top-of-book quotes trigger the
+cancel-then-close target exit immediately; completed 5-minute bars remain a conservative fallback.
 
 The SLC backtest uses the same TOML and strategy implementation as the live example. Its `[backtest]`
-table controls the UTC interval, initial balance, download timeout, per-bar logging, transaction-cost
-stress, target candidates and optional walk-forward split. Conservative diagnostics assume every
-entry fills at its worst permitted limit, subtract configured round-trip costs and reprice ambiguous
-same-bar target/stop outcomes as losses; Nautilus engine statistics remain raw. The report includes
-daily Sharpe, maximum drawdown, annualized return, Calmar, and positive, negative, and flat day counts.
+table controls the UTC interval, initial balance, download timeout, per-bar logging,
+transaction-cost stress, target candidates and optional rolling walk-forward windows. Conservative
+diagnostics assume every entry fills at its worst permitted limit, subtract configured round-trip
+costs and reprice ambiguous same-bar target/stop outcomes as losses; Nautilus engine statistics
+remain raw. The report includes daily Sharpe, maximum drawdown, annualized return, Calmar, and
+positive, negative, and flat day counts.
 
 Set `backtest.risk_rewards = ["1.5", "1.75", "2"]` to compare fixed targets after one historical
-download. Set `backtest.walk_forward_split` to use bars before the split for parameter selection and
-run only the winning target after the split. Selection uses daily cost- and entry-slippage-stressed
-Sharpe and reports OOS degradation, maximum drawdown and Calmar.
+download. Add `[backtest.walk_forward]` to select the winning target inside each fixed training
+window and run it only in the immediately following, non-overlapping OOS window. Selection uses
+daily cost- and entry-slippage-stressed Sharpe; the aggregate reports fold pass rate, OOS Sharpe,
+maximum drawdown and whether the result is eligible for paper-trading risk-scaling review.
 
 All per-symbol strategies share the persisted risk ledger configured under `[longbridge]`. Account
 limits live under `[risk]`; they cap daily loss, open risk, account notional, position count, order

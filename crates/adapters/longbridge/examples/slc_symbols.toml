@@ -16,20 +16,20 @@ paper_risk_state_path = "../../../../target/longbridge-slc-paper-risk-state.toml
 live_risk_state_path = "../../../../target/longbridge-slc-live-risk-state.toml"
 
 [risk]
-# 单笔交易计划承担的最大初始风险，单位 USD；仓位数量由该值除以每股风险得到。
-risk_amount = "25"
-# 当日累计已实现亏损达到该值后，全部标的停止新开仓，单位 USD。
+# 单笔交易计划承担的最大初始风险，单位 USD；100 USD 为 100,000 USD 初始资金的 0.10%。
+risk_amount = "100"
+# 当日累计已实现亏损达到该值后，全部标的停止新开仓，单位 USD；当前相当于 2 笔计划风险。
 daily_loss_limit = "200"
-# 全账户所有挂单和持仓允许同时占用的初始风险上限，单位 USD。
+# 全账户所有挂单和持仓允许同时占用的初始风险上限，单位 USD；当前覆盖 3 个满风险仓位。
 max_open_risk = "300"
-# 全账户全部 SLC 仓位和入场挂单的总名义金额上限，单位 USD。
-max_account_notional = "10000"
+# 全账户全部 SLC 仓位和入场挂单的总名义金额上限，单位 USD；不超过初始资金的 60%。
+max_account_notional = "60000"
 # 同时允许存在的入场预留或持仓数量；所有 symbol 共享该额度。
 max_open_positions = 3
-# 任意单笔入场订单的最大股数。
-max_order_quantity = "500"
-# 任意单个标的入场订单的最大名义金额，单位 USD。
-max_order_notional = "5000"
+# 任意单笔入场订单的最大股数；为低价、窄止损标的保留足够风险容量。
+max_order_quantity = "1000"
+# 任意单个标的入场订单的最大名义金额，单位 USD；三个并发仓位各不超过 20,000。
+max_order_notional = "20000"
 # 实际预留风险/计划风险的最低比例；过小仓位会被拒绝，范围 0 至 1。
 minimum_risk_utilization = "0.10"
 # 限价入场相对信号收盘价最多放宽的最小价格跳动数，同时用于回测滑点压力。
@@ -38,30 +38,30 @@ max_entry_slippage_ticks = 5
 [signal]
 # 允许的入场方向：both、long 或 short；只影响新信号，不改变退出逻辑。
 trade_direction = "both"
-# 固定止盈倍数，以初始风险 R 为单位；2 表示目标为 2R。
+# 固定止盈倍数，以初始风险 R 为单位；文档要求至少 2R。
 risk_reward = "2"
 # 止损在 zone 远端之外额外留出的最小价格跳动数。
 stop_buffer_ticks = 1
-# 5 分钟 Wilder ATR 周期；用于位移、距离和区域宽度归一化。
+# 5 分钟 Wilder ATR 周期；只用于把“强势离开”量化为跨标的可比较的位移。
 atr_period = 14
-# 创建 level 所需的最小位移强度，单位 ATR。
-displacement_atr_multiple = 1.0
+# 创建 level 所需的最小位移强度，单位 ATR；1.5 用来排除普通波动形成的伪 level。
+displacement_atr_multiple = 1.5
 # 位移结束收盘价允许偏离位移极端的最大比例，范围 0 至 0.5，越小越严格。
 displacement_close_fraction = 0.35
 # 一次有效 displacement 最多允许由多少根 5 分钟 Bar 完成，范围 1 至 12。
 displacement_max_bars = 3
+# Fresh demand/supply 的源 K 必须是近期窗口最低/最高点；其他 Level 仅在一次破位收复后可交易。
+level_extreme_lookback_bars = 3
 # 4 小时 pivot 左右各需多少根已完成 Bar 确认；越大越稳定但趋势识别越慢。
 pivot_span = 2
-# level 最多保留的 5 分钟 Bar 数，超时后删除。
-zone_ttl_bars = 234
+# “recent level”最多保留一个美股常规交易时段（78 根 5 分钟 Bar），超时后删除。
+zone_ttl_bars = 78
+# 可首次交易的 Level 必须至少保持该数量 Bar 未触达；提前回访说明离开不充分，直接作废。
+minimum_fresh_level_age_bars = 6
 # demand 和 supply 各自最多保留的 level 数，防止状态和扫描成本无界增长。
 max_zones_per_side = 8
 # 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数。
 confirmation_window_bars = 3
-# 确认收盘价距离 level 的最大 ATR 倍数；越小越要求贴近区域完成确认。
-confirmation_max_distance_atr = 0.35
-# 确认 Bar 必须收在交易方向一侧的最低位置比例，范围 0 至 1。
-confirmation_min_close_location = 0.55
 # Stochastics %K 原始周期。
 stochastic_k_period = 5
 # Stochastics %K 平滑周期。
@@ -74,10 +74,6 @@ oversold = 20.0
 overbought = 80.0
 # 距离强制平仓至少保留的潜在运行时间；晚于该边界不再开仓，单位分钟。
 minimum_target_time_minutes = 60
-# 入场后达到该 5 分钟 Bar 数且 MFE 不足时触发时间止损。
-time_stop_bars = 36
-# 时间止损要求的最低最大有利波动，单位 R；达到该值则继续持有。
-time_stop_minimum_mfe_r = "0.5"
 
 [warmup]
 # 启动前加载的已完成 5 分钟 Bar 数，用于初始化 ATR、随机指标和近期位移窗口。
@@ -96,18 +92,16 @@ flatten_before_close_minutes = 10
 max_trades_per_day = 20
 
 [backtest]
-# 回测样本起点和终点，必须使用 UTC 时间戳且 start < end。
+# 回测样本起点和终点，必须使用 UTC 时间戳且 start < end；当前回归 2026 年 8 月。
 start = "2026-08-03T00:00:00Z"
 end = "2026-08-31T23:59:59Z"
-# 可选 walk-forward 切分点；启用时取消下一行注释，且必须严格位于样本区间内。
-# walk_forward_split = "2026-08-20T00:00:00Z"
-# 要比较的止盈 R 倍数；只含一个值时运行单参数完整样本回测。
+# 要比较的止盈 R 倍数；当前固定为原始 2R，保证与之前 8 月结果可比。
 risk_rewards = ["2"]
 # 回测组合初始资金；用于收益率、Sharpe、回撤和 Calmar 计算。
 starting_balance = "100_000 USD"
-# 下载全部历史数据允许的总超时秒数。
-timeout_secs = 500
-# true 输出每根 Bar 的详细诊断；30 个标的会产生大量日志。
+# 下载全部历史数据允许的总超时秒数；一年多标的数据需为限流留足时间。
+timeout_secs = 3600
+# true 输出每根 Bar 的详细诊断；多标的会产生大量日志。
 log_bars = false
 # 保守统计按成交股数扣除的估算往返成本，单位 USD/股。
 round_trip_cost_per_share = "0.01"
@@ -155,6 +149,10 @@ price_increment = "0.01"
 
 [[symbols]]
 symbol = "SPY.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "QQQ.US"
 price_increment = "0.01"
 
 [[symbols]]
