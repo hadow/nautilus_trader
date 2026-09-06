@@ -12,35 +12,58 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Runs live and backtest Structure-Level-Confirmation strategies with Longbridge stocks.
+//! 使用 Longbridge 股票行情和交易接口运行 Structure-Level-Confirmation（SLC）实盘及回测策略。
 //!
-//! WARNING: This example submits orders. It defaults to Longbridge paper trading. Setting
-//! `LONGBRIDGE_SLC_PAPERTRADING=false` routes orders to a live margin account and additionally
-//! requires `LONGBRIDGE_SLC_LIVE_ACK=I_UNDERSTAND_LIVE_ORDERS`.
+//! # 风险提示
 //!
-//! The strategy trades completed five-minute bars during the US regular session. It combines
-//! confirmed four-hour higher-high/higher-low or lower-high/lower-low structure, fresh supply or
-//! demand zones formed before one-to-three-bar ATR-sized displacement moves, one-break
-//! reclaim/retest levels, and
-//! configurable Stochastics re-entry from the 20/80 bands. Each signal submits a one-bar marketable
-//! limit entry sized at its worst allowed price. Every fill receives a broker-hosted Longbridge
-//! market-if-touched stop in live trading. Backtests submit a linked stop-market and resting 2R
-//! limit target for every fill. Live targets are recalculated from average fill price and checked
-//! against executable top-of-book quotes, with completed bars as a conservative fallback trigger.
-//! Per-symbol strategies share a persisted SLC-owned risk ledger. Managed stop coordinates
-//! cancellation and position close before the regular session ends.
+//! 本示例会真实提交订单。默认配置连接 Longbridge 模拟盘；把配置项 `papertrading` 改为
+//! `false` 后会把订单路由到真实保证金账户，同时必须把 `live_order_ack` 设置为
+//! `I_UNDERSTAND_LIVE_ORDERS`。该确认只防止误启动，不代表策略已经具备稳定盈利能力。
+//! 首次运行必须使用隔离的模拟账户，并在每次关闭节点后人工核对券商侧订单与持仓。
 //!
-//! The strategy has no guaranteed profitability. Use an isolated paper account first and inspect
-//! the broker account after every shutdown.
+//! # 策略底层逻辑
 //!
-//! Run with:
+//! SLC 将一次入场拆成三个必须依次成立的层次：
+//!
+//! 1. **Structure（结构）**：只使用已经完成并经过右侧 K 线确认的 4 小时 pivot；连续更高的
+//!    pivot high 与 pivot low 定义上涨结构，连续更低的二者定义下跌结构，其余状态均为中性。
+//! 2. **Level（位置）**：在 5 分钟图中寻找 1 至 3 根 K 线完成的 ATR 级别 displacement，
+//!    把位移前最后一根反向 K 线的完整高低区间保存为 demand 或 supply zone。首次回测使用
+//!    fresh level；一次有效跌破/突破后重新收复的区域可作为 reclaimed level。
+//! 3. **Confirmation（确认）**：价格进入有效区域后开启有限确认窗口，要求 Stochastics %K
+//!    曾进入 20/80 极值区并重新穿越阈值，同时限制确认收盘价到区域的 ATR 距离，并要求 K 线
+//!    收在交易方向一侧。上涨结构只允许 demand 做多，下跌结构只允许 supply 做空。
+//!
+//! 这种分层设计把“方向、位置、触发”分开，避免仅因指标超买超卖就逆势入场。所有判断只消费
+//! 已完成 Bar；实时订阅收到同一时间戳的多次更新时，必须等下一根 Bar 出现才确认上一根，防止
+//! 使用尚未收盘的数据。代价是信号必然比视觉回看更晚，尤其对称 4 小时 pivot 需要等待右侧
+//! Bar，不能把这种确认延迟误认为数据故障。
+//!
+//! # 订单与风险模型
+//!
+//! 每个 symbol 创建独立策略实例和信号状态，多个实例只共享账户风险账本。信号出现后提交仅保留
+//! 一根 5 分钟 Bar 的可成交限价单；数量按照“最坏允许入场价到区域止损”的每股风险计算，并受
+//! 整手、最大数量、单仓名义金额、账户总名义金额、最大持仓数和开放风险共同约束。
+//!
+//! 实盘每一次部分成交都会立即创建券商托管的 Longbridge Market-If-Touched 止损。2R 目标按
+//! 实际平均成交价重新计算，由可立即成交的一档 bid/ask 触发撤单后市价平仓，已完成 5 分钟 Bar
+//! 仅作为遗漏报价时的保守补偿路径。回测则为每次成交提交 OUO 关联的止损与 2R 限价目标。
+//! 实盘目标依赖本地进程和行情连接，因此当前实现不能等同于券商原子 bracket order。
+//!
+//! # 回测解释边界
+//!
+//! 回测和实盘共用信号、仓位和风险代码，但 5 分钟 OHLC 无法重建盘口价差、队列顺序、网络延迟
+//! 及真实止损滑点。保守统计额外扣除每股往返成本，假设入场成交在允许的最差限价，并把同一根
+//! Bar 同时触及止损与目标的未知路径按亏损处理。Sharpe、年化收益和 Calmar 仍然只是给定样本
+//! 的估计值，不能证明未来收益。
+//!
+//! # 运行方式
+//!
 //! `cargo run -p nautilus-longbridge --features examples --example longbridge-slc-trader`
 //!
-//! Required environment variable:
-//! - `LONGBRIDGE_OAUTH_CLIENT_ID`: OAuth 2.0 public client ID.
-//!
-//! Configure one or more US equities in `examples/slc_symbols.toml`. Override its location with
-//! `LONGBRIDGE_SLC_CONFIG_PATH`.
+//! 策略、风控、回测和 Longbridge OAuth 公共客户端 ID 均在 `examples/slc_symbols.toml`
+//! 配置；OAuth token 仍由官方 SDK 的本地安全存储管理。若要使用其他配置文件，在命令后
+//! 添加文件路径，例如 `cargo run ... -- /path/to/slc.toml`。
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -127,17 +150,9 @@ const TRADING_DAYS_CHUNK_DAYS: i64 = 28;
 const MAX_WARMUP_AGE_NANOS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 const MAX_WARMUP_BARS: usize = 1_000;
 const LIVE_ACK: &str = "I_UNDERSTAND_LIVE_ORDERS";
-const DEFAULT_SYMBOL_CONFIG_PATH: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/examples/slc_symbols.toml");
-const DEFAULT_PAPER_RISK_STATE_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../target/longbridge-slc-paper-risk-state.toml",
-);
-const DEFAULT_LIVE_RISK_STATE_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../target/longbridge-slc-live-risk-state.toml",
-);
+const DEFAULT_CONFIG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/slc_symbols.toml");
 
+/// 美股常规时段内允许入场、禁止新单和强制平仓的时间约束
 #[derive(Clone, Copy, Debug)]
 struct SessionRules {
     entry_start_minute: u16,
@@ -147,7 +162,7 @@ struct SessionRules {
 }
 
 impl SessionRules {
-    /// Validates that entry and flattening rules stay inside the US regular session.
+    /// 校验入场时间窗和收盘前平仓规则均位于美股常规交易时段内
     fn validate(self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.entry_start_minute >= RTH_OPEN_MINUTE,
@@ -170,6 +185,7 @@ impl SessionRules {
     }
 }
 
+/// 全局方向控制变量，用同一参数组隔离评估多头与空头期望值
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TradeDirection {
     #[default]
@@ -179,7 +195,7 @@ enum TradeDirection {
 }
 
 impl TradeDirection {
-    /// Returns whether the configured direction permits an entry side.
+    /// 判断当前方向开关是否允许指定买卖方向产生入场信号
     fn allows(self, side: OrderSide) -> bool {
         matches!(
             (self, side),
@@ -211,9 +227,12 @@ impl FromStr for TradeDirection {
     }
 }
 
+/// 从统一 TOML 加载并完成交叉校验的应用级策略配置
 #[derive(Clone, Debug)]
 struct AppConfig {
     instruments: Vec<SlcInstrument>,
+    oauth_client_id: String,
+    oauth_callback_port: u16,
     papertrading: bool,
     trade_direction: TradeDirection,
     risk_amount: Decimal,
@@ -252,16 +271,104 @@ struct AppConfig {
     session: SessionRules,
 }
 
+/// 配置文件中的标的身份及交易所规定的精确最小价格变动单位
 #[derive(Clone, Copy, Debug)]
 struct SlcInstrument {
     instrument_id: InstrumentId,
     price_increment: Price,
 }
 
+/// TOML 根结构；未知字段直接报错，避免拼写错误静默使用其他值
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SymbolConfig {
+struct SlcFileConfig {
+    longbridge: LongbridgeSettings,
+    risk: RiskSettings,
+    signal: SignalSettings,
+    warmup: WarmupSettings,
+    session: SessionSettings,
+    backtest: BacktestSettings,
     symbols: Vec<SymbolConfigEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LongbridgeSettings {
+    oauth_client_id: String,
+    oauth_callback_port: u16,
+    papertrading: bool,
+    live_order_ack: String,
+    paper_risk_state_path: PathBuf,
+    live_risk_state_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RiskSettings {
+    risk_amount: String,
+    daily_loss_limit: String,
+    max_open_risk: String,
+    max_account_notional: String,
+    max_open_positions: usize,
+    max_order_quantity: String,
+    max_order_notional: String,
+    minimum_risk_utilization: String,
+    max_entry_slippage_ticks: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignalSettings {
+    trade_direction: String,
+    risk_reward: String,
+    stop_buffer_ticks: u64,
+    atr_period: usize,
+    displacement_atr_multiple: f64,
+    displacement_close_fraction: f64,
+    displacement_max_bars: usize,
+    pivot_span: usize,
+    zone_ttl_bars: usize,
+    max_zones_per_side: usize,
+    confirmation_window_bars: usize,
+    confirmation_max_distance_atr: f64,
+    confirmation_min_close_location: f64,
+    stochastic_k_period: usize,
+    stochastic_k_smoothing: usize,
+    stochastic_d_period: usize,
+    oversold: f64,
+    overbought: f64,
+    minimum_target_time_minutes: u16,
+    time_stop_bars: u64,
+    time_stop_minimum_mfe_r: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WarmupSettings {
+    five_minute_bars: usize,
+    four_hour_bars: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionSettings {
+    entry_start: String,
+    entry_end: String,
+    flatten_before_close_minutes: u16,
+    max_trades_per_day: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BacktestSettings {
+    start: String,
+    end: String,
+    walk_forward_split: Option<String>,
+    risk_rewards: Vec<String>,
+    starting_balance: String,
+    timeout_secs: u64,
+    log_bars: bool,
+    round_trip_cost_per_share: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -272,31 +379,50 @@ struct SymbolConfigEntry {
 }
 
 impl AppConfig {
-    /// Loads environment configuration and rejects unsafe or internally inconsistent limits.
-    fn from_env(live: bool) -> anyhow::Result<Self> {
-        let papertrading = env_parse("LONGBRIDGE_SLC_PAPERTRADING", "true")?;
+    /// 加载统一 TOML 配置，并拒绝不安全、越界或彼此矛盾的参数组合
+    fn load(path: &Path, live: bool) -> anyhow::Result<Self> {
+        let config = load_config_file(path)?;
+        Self::from_file_config(&config, path, live)
+    }
+
+    /// 把已反序列化配置转换成交易热路径使用的精确领域类型
+    fn from_file_config(config: &SlcFileConfig, path: &Path, live: bool) -> anyhow::Result<Self> {
+        let longbridge = &config.longbridge;
+        let oauth_client_id = longbridge.oauth_client_id.trim().to_string();
+        anyhow::ensure!(
+            !oauth_client_id.is_empty(),
+            "longbridge.oauth_client_id must not be empty",
+        );
+        anyhow::ensure!(
+            longbridge.oauth_callback_port > 0,
+            "longbridge.oauth_callback_port must be positive",
+        );
+        let papertrading = longbridge.papertrading;
         if live {
-            validate_live_guard(
-                papertrading,
-                env::var("LONGBRIDGE_SLC_LIVE_ACK").ok().as_deref(),
-            )?;
-            validate_realtime_candlesticks()?;
+            validate_live_guard(papertrading, Some(longbridge.live_order_ack.trim()))?;
         }
 
-        let symbol_config_path =
-            env_string("LONGBRIDGE_SLC_CONFIG_PATH", DEFAULT_SYMBOL_CONFIG_PATH);
-        let instruments = load_symbol_config(Path::new(&symbol_config_path))?;
-        let trade_direction = env_parse("LONGBRIDGE_SLC_TRADE_DIRECTION", "both")?;
-        let risk_amount = env_parse("LONGBRIDGE_SLC_RISK_AMOUNT", "25")?;
-        let daily_loss_limit = env_parse("LONGBRIDGE_SLC_DAILY_LOSS_LIMIT", "50")?;
-        let max_open_risk = env_parse("LONGBRIDGE_SLC_MAX_OPEN_RISK", "50")?;
-        let max_account_notional = env_parse("LONGBRIDGE_SLC_MAX_ACCOUNT_NOTIONAL", "5000")?;
-        let max_open_positions = env_parse("LONGBRIDGE_SLC_MAX_OPEN_POSITIONS", "2")?;
-        let max_order_quantity = env_parse("LONGBRIDGE_SLC_MAX_ORDER_QUANTITY", "500")?;
-        let max_order_notional = env_parse("LONGBRIDGE_SLC_MAX_ORDER_NOTIONAL", "5000")?;
-        let minimum_risk_utilization = env_parse("LONGBRIDGE_SLC_MIN_RISK_UTILIZATION", "0.10")?;
-        let max_entry_slippage_ticks = env_parse("LONGBRIDGE_SLC_MAX_ENTRY_SLIPPAGE_TICKS", "5")?;
-        let risk_reward = env_parse("LONGBRIDGE_SLC_RISK_REWARD", "2")?;
+        let instruments = parse_instruments(&config.symbols)?;
+        let signal = &config.signal;
+        let risk = &config.risk;
+        let trade_direction =
+            parse_config_value("signal.trade_direction", &signal.trade_direction)?;
+        let risk_amount = parse_config_value("risk.risk_amount", &risk.risk_amount)?;
+        let daily_loss_limit = parse_config_value("risk.daily_loss_limit", &risk.daily_loss_limit)?;
+        let max_open_risk = parse_config_value("risk.max_open_risk", &risk.max_open_risk)?;
+        let max_account_notional =
+            parse_config_value("risk.max_account_notional", &risk.max_account_notional)?;
+        let max_open_positions = risk.max_open_positions;
+        let max_order_quantity =
+            parse_config_value("risk.max_order_quantity", &risk.max_order_quantity)?;
+        let max_order_notional =
+            parse_config_value("risk.max_order_notional", &risk.max_order_notional)?;
+        let minimum_risk_utilization = parse_config_value(
+            "risk.minimum_risk_utilization",
+            &risk.minimum_risk_utilization,
+        )?;
+        let max_entry_slippage_ticks = risk.max_entry_slippage_ticks;
+        let risk_reward = parse_config_value("signal.risk_reward", &signal.risk_reward)?;
         anyhow::ensure!(risk_amount > Decimal::ZERO, "risk amount must be positive");
         anyhow::ensure!(
             daily_loss_limit > Decimal::ZERO,
@@ -336,24 +462,21 @@ impl AppConfig {
         );
         anyhow::ensure!(risk_reward > Decimal::ZERO, "risk reward must be positive");
 
-        let atr_period: usize = env_parse("LONGBRIDGE_SLC_ATR_PERIOD", "14")?;
-        let displacement_atr_multiple = env_parse("LONGBRIDGE_SLC_DISPLACEMENT_ATR", "1.0")?;
-        let displacement_close_fraction =
-            env_parse("LONGBRIDGE_SLC_DISPLACEMENT_CLOSE_FRACTION", "0.35")?;
-        let displacement_max_bars = env_parse("LONGBRIDGE_SLC_DISPLACEMENT_MAX_BARS", "3")?;
-        let pivot_span = env_parse("LONGBRIDGE_SLC_PIVOT_SPAN", "2")?;
-        let zone_ttl_bars = env_parse("LONGBRIDGE_SLC_ZONE_TTL_BARS", "234")?;
-        let max_zones_per_side = env_parse("LONGBRIDGE_SLC_MAX_ZONES_PER_SIDE", "8")?;
-        let confirmation_window_bars = env_parse("LONGBRIDGE_SLC_CONFIRMATION_WINDOW_BARS", "3")?;
-        let confirmation_max_distance_atr =
-            env_parse("LONGBRIDGE_SLC_CONFIRMATION_MAX_DISTANCE_ATR", "0.35")?;
-        let confirmation_min_close_location =
-            env_parse("LONGBRIDGE_SLC_CONFIRMATION_MIN_CLOSE_LOCATION", "0.55")?;
-        let stochastic_k_period: usize = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_PERIOD", "5")?;
-        let stochastic_k_smoothing = env_parse("LONGBRIDGE_SLC_STOCHASTIC_K_SMOOTHING", "3")?;
-        let stochastic_d_period = env_parse("LONGBRIDGE_SLC_STOCHASTIC_D_PERIOD", "3")?;
-        let oversold = env_parse("LONGBRIDGE_SLC_OVERSOLD", "20")?;
-        let overbought = env_parse("LONGBRIDGE_SLC_OVERBOUGHT", "80")?;
+        let atr_period = signal.atr_period;
+        let displacement_atr_multiple = signal.displacement_atr_multiple;
+        let displacement_close_fraction = signal.displacement_close_fraction;
+        let displacement_max_bars = signal.displacement_max_bars;
+        let pivot_span = signal.pivot_span;
+        let zone_ttl_bars = signal.zone_ttl_bars;
+        let max_zones_per_side = signal.max_zones_per_side;
+        let confirmation_window_bars = signal.confirmation_window_bars;
+        let confirmation_max_distance_atr = signal.confirmation_max_distance_atr;
+        let confirmation_min_close_location = signal.confirmation_min_close_location;
+        let stochastic_k_period = signal.stochastic_k_period;
+        let stochastic_k_smoothing = signal.stochastic_k_smoothing;
+        let stochastic_d_period = signal.stochastic_d_period;
+        let oversold = signal.oversold;
+        let overbought = signal.overbought;
         anyhow::ensure!(atr_period > 0, "ATR period must be positive");
         anyhow::ensure!(
             displacement_atr_multiple > 0.0,
@@ -397,8 +520,8 @@ impl AppConfig {
             "stochastic thresholds must satisfy 0 < oversold < overbought < 100",
         );
 
-        let five_minute_warmup = env_parse("LONGBRIDGE_SLC_5M_WARMUP", "500")?;
-        let four_hour_warmup = env_parse("LONGBRIDGE_SLC_4H_WARMUP", "60")?;
+        let five_minute_warmup = config.warmup.five_minute_bars;
+        let four_hour_warmup = config.warmup.four_hour_bars;
         let minimum_five_minute_warmup = atr_period.max(
             stochastic_k_period
                 .saturating_add(stochastic_k_smoothing)
@@ -414,19 +537,18 @@ impl AppConfig {
         );
 
         let session = SessionRules {
-            entry_start_minute: env_time("LONGBRIDGE_SLC_ENTRY_START", "09:35")?,
-            entry_end_minute: env_time("LONGBRIDGE_SLC_ENTRY_END", "15:30")?,
-            flatten_before_close_minutes: env_parse(
-                "LONGBRIDGE_SLC_FLATTEN_BEFORE_CLOSE_MINUTES",
-                "10",
-            )?,
-            max_trades_per_day: env_parse("LONGBRIDGE_SLC_MAX_TRADES_PER_DAY", "20")?,
+            entry_start_minute: parse_clock("session.entry_start", &config.session.entry_start)?,
+            entry_end_minute: parse_clock("session.entry_end", &config.session.entry_end)?,
+            flatten_before_close_minutes: config.session.flatten_before_close_minutes,
+            max_trades_per_day: config.session.max_trades_per_day,
         };
         session.validate()?;
-        let minimum_target_time_minutes =
-            env_parse("LONGBRIDGE_SLC_MINIMUM_TARGET_TIME_MINUTES", "60")?;
-        let time_stop_bars = env_parse("LONGBRIDGE_SLC_TIME_STOP_BARS", "9")?;
-        let time_stop_minimum_mfe_r = env_parse("LONGBRIDGE_SLC_TIME_STOP_MINIMUM_MFE_R", "0.5")?;
+        let minimum_target_time_minutes = signal.minimum_target_time_minutes;
+        let time_stop_bars = signal.time_stop_bars;
+        let time_stop_minimum_mfe_r = parse_config_value(
+            "signal.time_stop_minimum_mfe_r",
+            &signal.time_stop_minimum_mfe_r,
+        )?;
         anyhow::ensure!(
             minimum_target_time_minutes > 0,
             "minimum target time minutes must be positive",
@@ -436,18 +558,17 @@ impl AppConfig {
             time_stop_minimum_mfe_r >= Decimal::ZERO && time_stop_minimum_mfe_r < risk_reward,
             "time stop minimum MFE R must be non-negative and below the profit target",
         );
-        let default_risk_state_path = if papertrading {
-            DEFAULT_PAPER_RISK_STATE_PATH
+        let configured_risk_state_path = if papertrading {
+            &longbridge.paper_risk_state_path
         } else {
-            DEFAULT_LIVE_RISK_STATE_PATH
+            &longbridge.live_risk_state_path
         };
-        let risk_state_path = PathBuf::from(env_string(
-            "LONGBRIDGE_SLC_RISK_STATE_PATH",
-            default_risk_state_path,
-        ));
+        let risk_state_path = resolve_config_path(path, configured_risk_state_path);
 
         Ok(Self {
             instruments,
+            oauth_client_id,
+            oauth_callback_port: longbridge.oauth_callback_port,
             papertrading,
             trade_direction,
             risk_amount,
@@ -460,7 +581,7 @@ impl AppConfig {
             minimum_risk_utilization,
             max_entry_slippage_ticks,
             risk_reward,
-            stop_buffer_ticks: env_parse("LONGBRIDGE_SLC_STOP_BUFFER_TICKS", "1")?,
+            stop_buffer_ticks: signal.stop_buffer_ticks,
             atr_period,
             displacement_atr_multiple,
             displacement_close_fraction,
@@ -487,17 +608,17 @@ impl AppConfig {
         })
     }
 
-    /// Returns the external five-minute bar type used for signals and fallback target checks.
+    /// 构造用于信号计算及实盘目标兜底检测的外部 5 分钟 LAST BarType
     fn five_minute_bar_type(instrument_id: InstrumentId) -> BarType {
         BarType::from(format!("{instrument_id}-5-MINUTE-LAST-EXTERNAL").as_str())
     }
 
-    /// Returns the external four-hour bar type used for higher-timeframe structure.
+    /// 构造用于高周期市场结构识别的外部 4 小时 LAST BarType
     fn four_hour_bar_type(instrument_id: InstrumentId) -> BarType {
         BarType::from(format!("{instrument_id}-4-HOUR-LAST-EXTERNAL").as_str())
     }
 
-    /// Returns the per-entry notional cap after reserving equal capacity for each usable slot.
+    /// 为每个可用持仓槽位均分账户名义额度，并返回单次入场可使用的上限
     fn per_position_notional_limit(&self) -> Decimal {
         per_position_notional_limit(
             self.max_account_notional,
@@ -506,9 +627,11 @@ impl AppConfig {
         )
     }
 
-    /// Builds the data-client configuration for every configured instrument.
+    /// 为全部配置标的构造 Longbridge 数据客户端参数，并保留精确最小价格变动单位
     fn data_config(&self) -> LongbridgeDataClientConfig {
         LongbridgeDataClientConfig {
+            oauth_client_id: Some(self.oauth_client_id.clone()),
+            oauth_callback_port: self.oauth_callback_port,
             instrument_price_increments: self
                 .instruments
                 .iter()
@@ -524,6 +647,7 @@ impl AppConfig {
     }
 }
 
+/// 在实盘共享配置之上增加历史区间、资金、成本与样本切分规则
 #[derive(Clone, Debug)]
 struct SlcBacktestConfig {
     strategy: AppConfig,
@@ -538,25 +662,18 @@ struct SlcBacktestConfig {
 }
 
 impl SlcBacktestConfig {
-    /// Loads the historical window and simulation-only controls around the shared SLC settings.
-    fn from_env() -> anyhow::Result<Self> {
-        let mut strategy = AppConfig::from_env(false)?;
-        let start = env_parse("LONGBRIDGE_SLC_BACKTEST_START", "2026-08-03T00:00:00Z")?;
-        let end = env_parse("LONGBRIDGE_SLC_BACKTEST_END", "2026-08-31T23:59:59Z")?;
-        anyhow::ensure!(
-            start < end,
-            "LONGBRIDGE_SLC_BACKTEST_START must be before LONGBRIDGE_SLC_BACKTEST_END",
-        );
-        let walk_forward_split = env::var("LONGBRIDGE_SLC_BACKTEST_WALK_FORWARD_SPLIT")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                value.parse::<Timestamp>().map_err(|error| {
-                    anyhow::anyhow!(
-                        "invalid LONGBRIDGE_SLC_BACKTEST_WALK_FORWARD_SPLIT={value:?}: {error}",
-                    )
-                })
-            })
+    /// 从统一 TOML 加载共享策略和回测区间、资金、成本及 walk-forward 配置
+    fn load(path: &Path) -> anyhow::Result<Self> {
+        let config = load_config_file(path)?;
+        let mut strategy = AppConfig::from_file_config(&config, path, false)?;
+        let backtest = &config.backtest;
+        let start = parse_config_value("backtest.start", &backtest.start)?;
+        let end = parse_config_value("backtest.end", &backtest.end)?;
+        anyhow::ensure!(start < end, "backtest.start must be before backtest.end",);
+        let walk_forward_split = backtest
+            .walk_forward_split
+            .as_deref()
+            .map(|value| parse_config_value("backtest.walk_forward_split", value))
             .transpose()?;
         if let Some(split) = walk_forward_split {
             anyhow::ensure!(
@@ -564,10 +681,7 @@ impl SlcBacktestConfig {
                 "walk-forward split must be strictly inside the backtest interval",
             );
         }
-        let risk_rewards = env::var("LONGBRIDGE_SLC_BACKTEST_RISK_REWARDS").map_or_else(
-            |_| Ok(vec![strategy.risk_reward]),
-            |value| parse_decimal_grid(&value),
-        )?;
+        let risk_rewards = parse_decimal_grid(&backtest.risk_rewards)?;
         anyhow::ensure!(
             risk_rewards
                 .iter()
@@ -575,21 +689,20 @@ impl SlcBacktestConfig {
             "every backtest risk reward must exceed the time-stop minimum MFE R",
         );
         let starting_balance =
-            env_parse("LONGBRIDGE_SLC_BACKTEST_STARTING_BALANCE", "100_000 USD")?;
+            parse_config_value("backtest.starting_balance", &backtest.starting_balance)?;
         anyhow::ensure!(
             Money::is_positive(&starting_balance),
-            "LONGBRIDGE_SLC_BACKTEST_STARTING_BALANCE must be positive",
+            "backtest.starting_balance must be positive",
         );
-        let timeout_secs = env_parse("LONGBRIDGE_SLC_BACKTEST_TIMEOUT_SECS", "300")?;
-        anyhow::ensure!(
-            timeout_secs > 0,
-            "LONGBRIDGE_SLC_BACKTEST_TIMEOUT_SECS must be positive",
-        );
-        let round_trip_cost_per_share =
-            env_parse("LONGBRIDGE_SLC_BACKTEST_ROUND_TRIP_COST_PER_SHARE", "0.01")?;
+        let timeout_secs = backtest.timeout_secs;
+        anyhow::ensure!(timeout_secs > 0, "backtest.timeout_secs must be positive");
+        let round_trip_cost_per_share = parse_config_value(
+            "backtest.round_trip_cost_per_share",
+            &backtest.round_trip_cost_per_share,
+        )?;
         anyhow::ensure!(
             round_trip_cost_per_share >= Decimal::ZERO,
-            "LONGBRIDGE_SLC_BACKTEST_ROUND_TRIP_COST_PER_SHARE must be non-negative",
+            "backtest.round_trip_cost_per_share must be non-negative",
         );
         strategy.risk_state_path = env::temp_dir().join(format!(
             "nautilus-slc-backtest-risk-{}-{}.toml",
@@ -604,34 +717,35 @@ impl SlcBacktestConfig {
             risk_rewards,
             starting_balance,
             timeout_secs,
-            log_bars: env_parse("LONGBRIDGE_SLC_BACKTEST_LOG_BARS", "false")?,
+            log_bars: backtest.log_bars,
             round_trip_cost_per_share,
         })
     }
 }
 
-/// Returns an environment value or its explicit default without silently trimming values.
-fn env_string(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_string())
+/// 读取并反序列化统一 TOML 配置，错误信息始终包含实际文件路径
+fn load_config_file(path: &Path) -> anyhow::Result<SlcFileConfig> {
+    let value = fs::read_to_string(path)
+        .with_context(|| format!("failed to read SLC config {}", path.display()))?;
+    toml::from_str(&value).with_context(|| format!("invalid SLC config {}", path.display()))
 }
 
-/// Parses one typed environment value and includes its name and raw value in failures.
-fn env_parse<T>(name: &str, default: &str) -> anyhow::Result<T>
+/// 把字符串配置解析成精确领域类型，并在错误中保留 TOML 字段名和原始值
+fn parse_config_value<T>(name: &str, value: &str) -> anyhow::Result<T>
 where
     T: FromStr,
     T::Err: Display,
 {
-    let value = env_string(name, default);
     value
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid {name}={value:?}: {e}"))
 }
 
-/// Parses a positive, deterministic Decimal grid for exit-parameter comparisons.
-fn parse_decimal_grid(value: &str) -> anyhow::Result<Vec<Decimal>> {
-    let mut values = value
-        .split(',')
-        .map(str::trim)
+/// 解析用于退出参数比较的正数 Decimal 网格，并排序去重以保证每次搜索顺序一致
+fn parse_decimal_grid(configured: &[String]) -> anyhow::Result<Vec<Decimal>> {
+    let mut values = configured
+        .iter()
+        .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .map(|value| {
             value
@@ -649,28 +763,19 @@ fn parse_decimal_grid(value: &str) -> anyhow::Result<Vec<Decimal>> {
     Ok(values)
 }
 
-/// Reads and validates the external multi-symbol TOML configuration.
-fn load_symbol_config(path: &Path) -> anyhow::Result<Vec<SlcInstrument>> {
-    let value = fs::read_to_string(path)
-        .with_context(|| format!("failed to read SLC symbol config {}", path.display()))?;
-    parse_symbol_config(&value)
-        .with_context(|| format!("invalid SLC symbol config {}", path.display()))
-}
-
-/// Parses unique Longbridge US symbols and exact positive price increments.
-fn parse_symbol_config(value: &str) -> anyhow::Result<Vec<SlcInstrument>> {
-    let config: SymbolConfig = toml::from_str(value).context("failed to parse TOML")?;
+/// 把配置项转换成唯一的 Longbridge 美股 InstrumentId，并校验精确且为正的价格步长
+fn parse_instruments(configured: &[SymbolConfigEntry]) -> anyhow::Result<Vec<SlcInstrument>> {
     anyhow::ensure!(
-        !config.symbols.is_empty(),
+        !configured.is_empty(),
         "symbols must contain at least one instrument",
     );
     anyhow::ensure!(
-        config.symbols.len() <= MAX_QUOTE_SUBSCRIPTION_SYMBOLS,
+        configured.len() <= MAX_QUOTE_SUBSCRIPTION_SYMBOLS,
         "symbol config supports at most {MAX_QUOTE_SUBSCRIPTION_SYMBOLS} instruments",
     );
 
-    let mut instruments = Vec::with_capacity(config.symbols.len());
-    for entry in config.symbols {
+    let mut instruments = Vec::with_capacity(configured.len());
+    for entry in configured {
         let symbol = entry.symbol.trim();
         anyhow::ensure!(
             symbol.ends_with(".US"),
@@ -708,9 +813,8 @@ fn parse_symbol_config(value: &str) -> anyhow::Result<Vec<SlcInstrument>> {
     Ok(instruments)
 }
 
-/// Parses an `HH:MM` environment value into minutes since local midnight.
-fn env_time(name: &str, default: &str) -> anyhow::Result<u16> {
-    let value = env_string(name, default);
+/// 将 TOML 中的 `HH:MM` 时钟转换为当地午夜后的分钟数，并拒绝无效值
+fn parse_clock(name: &str, value: &str) -> anyhow::Result<u16> {
     let (hour, minute) = value
         .split_once(':')
         .with_context(|| format!("invalid {name}={value:?}, expected HH:MM"))?;
@@ -727,33 +831,31 @@ fn env_time(name: &str, default: &str) -> anyhow::Result<u16> {
     Ok(hour * 60 + minute)
 }
 
-/// Requires an exact second acknowledgement before the example can route live orders.
+/// 相对路径以配置文件所在目录为基准，绝对路径保持不变
+fn resolve_config_path(config_path: &Path, configured_path: &Path) -> PathBuf {
+    if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(configured_path)
+    }
+}
+
+/// 在允许示例路由真实订单前要求第二道完全匹配的人工确认字符串
 fn validate_live_guard(papertrading: bool, live_ack: Option<&str>) -> anyhow::Result<()> {
     anyhow::ensure!(
         papertrading || live_ack == Some(LIVE_ACK),
         concat!(
-            "live trading requires LONGBRIDGE_SLC_LIVE_ACK=",
+            "live trading requires longbridge.live_order_ack=",
             "I_UNDERSTAND_LIVE_ORDERS",
         ),
     );
     Ok(())
 }
 
-/// Rejects confirmed-only pushes because they add one full bar of finalization latency.
-fn validate_realtime_candlesticks() -> anyhow::Result<()> {
-    let mode = env::var("LONGBRIDGE_PUSH_CANDLESTICK_MODE")
-        .ok()
-        .or_else(|| env::var("LONGPORT_PUSH_CANDLESTICK_MODE").ok());
-    anyhow::ensure!(
-        mode.as_deref() != Some("confirmed"),
-        concat!(
-            "SLC strategy requires Longbridge realtime candlestick pushes so it can finalize ",
-            "the previous bar when the next bar starts; unset LONGBRIDGE_PUSH_CANDLESTICK_MODE",
-        ),
-    );
-    Ok(())
-}
-
+/// 4 小时确认 pivot 推导出的方向许可，不直接代表 5 分钟入场信号
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Trend {
     Up,
@@ -762,6 +864,10 @@ enum Trend {
     Neutral,
 }
 
+/// 保存确认 pivot 所需的最小滑动窗口，以及最近两个高点和低点
+///
+/// pivot 只有在右侧 `span` 根 Bar 全部完成后才被确认，因此该结构天然避免使用未来数据，
+/// 代价是趋势切换会比价格拐点晚 `span` 根 4 小时 Bar。
 #[derive(Debug)]
 struct PivotStructure {
     span: usize,
@@ -771,7 +877,7 @@ struct PivotStructure {
 }
 
 impl PivotStructure {
-    /// Creates a symmetric confirmed-pivot detector with the requested bars on each side.
+    /// 创建对称 pivot 检测器，候选点左右两侧都必须拥有指定数量的已完成 Bar
     fn new(span: usize) -> Self {
         Self {
             span,
@@ -781,7 +887,7 @@ impl PivotStructure {
         }
     }
 
-    /// Adds one completed four-hour bar and confirms only the center of a full pivot window.
+    /// 加入一根已完成 4 小时 Bar，仅在完整窗口形成后确认正中央的严格 pivot high/low
     fn update(&mut self, bar: Bar) {
         let window_size = self.span * 2 + 1;
         if self.window.len() == window_size {
@@ -811,12 +917,12 @@ impl PivotStructure {
         }
     }
 
-    /// Returns whether two confirmed pivot highs and lows are available for classification.
+    /// 判断是否已经各有两个确认的 pivot high 和 pivot low，可用于结构分类
     fn initialized(&self) -> bool {
         self.highs.len() == 2 && self.lows.len() == 2
     }
 
-    /// Classifies structure from the last two confirmed pivot highs and lows.
+    /// 用最近两个确认高点和低点分类结构；二者必须同向变化，否则保持 Neutral
     fn trend(&self) -> Trend {
         if !self.initialized() {
             return Trend::Neutral;
@@ -836,7 +942,7 @@ impl PivotStructure {
     }
 }
 
-/// Retains only the two most recent confirmed pivots required for structure classification.
+/// 仅保留结构分类所需的最近两个确认 pivot，避免历史状态无界增长
 fn push_last_two(values: &mut VecDeque<Price>, value: Price) {
     if values.len() == 2 {
         values.pop_front();
@@ -844,12 +950,17 @@ fn push_last_two(values: &mut VecDeque<Price>, value: Price) {
     values.push_back(value);
 }
 
+/// 由向上或向下 displacement 生成的需求区、供给区方向
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZoneKind {
     Demand,
     Supply,
 }
 
+/// Supply/Demand level 的生命周期状态
+///
+/// `Fresh` 首次等待回测，`AwaitingConfirmation` 已触达并处于确认窗口，`BrokenOnce` 表示
+/// 首次有效破位，`Reclaimed` 表示从另一侧收复后重新取得交易资格。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZoneState {
     Fresh,
@@ -858,6 +969,10 @@ enum ZoneState {
     Reclaimed,
 }
 
+/// 一个有界生命周期的 supply/demand 价格区域及其确认状态
+///
+/// 区域边界取 displacement 源 K 线的完整高低点；ATR 和位移强度固定记录在创建时刻，
+/// 后续确认和统计不会被变化中的波动率重新解释。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Zone {
     kind: ZoneKind,
@@ -873,7 +988,7 @@ struct Zone {
 }
 
 impl Zone {
-    /// Creates a fresh zone from the full range of the candle before displacement.
+    /// 用 displacement 前源 K 线的完整高低区间创建 fresh zone
     fn from_bar(kind: ZoneKind, bar: Bar) -> Self {
         Self {
             kind,
@@ -889,7 +1004,7 @@ impl Zone {
         }
     }
 
-    /// Creates a level carrying the normalized quality of its displacement move.
+    /// 创建 zone 并记录生成时 ATR 及位移强度，供后续质量诊断和归一化比较
     fn from_displacement(kind: ZoneKind, bar: Bar, atr: f64, strength_atr: f64) -> Self {
         Self {
             atr_at_creation: atr,
@@ -898,12 +1013,12 @@ impl Zone {
         }
     }
 
-    /// Returns whether any part of a completed bar trades inside the zone.
+    /// 判断已完成 Bar 的高低区间是否与 zone 有任何重叠，即价格是否触达该区域
     fn intersects(self, bar: Bar) -> bool {
         bar.low <= self.high && bar.high >= self.low
     }
 
-    /// Returns whether price decisively closes through the far side of the zone.
+    /// 判断收盘价是否穿过 zone 远端；只看收盘可过滤盘中短暂刺穿
     fn broken(self, bar: Bar) -> bool {
         match self.kind {
             ZoneKind::Demand => bar.close < self.low,
@@ -911,7 +1026,7 @@ impl Zone {
         }
     }
 
-    /// Returns whether a once-broken zone has been reclaimed from the opposite side.
+    /// 判断一次破位后的 zone 是否从另一侧被收盘价完整收复
     fn reclaimed(self, bar: Bar) -> bool {
         match self.kind {
             ZoneKind::Demand => bar.close > self.high,
@@ -919,15 +1034,20 @@ impl Zone {
         }
     }
 
-    /// Starts the bounded stochastic confirmation window after a valid retest.
+    /// 在有效回测区域后启动有界随机指标确认窗口，并继承本 Bar 已出现的极值或回穿
     fn begin_confirmation(&mut self, confirmation: Confirmation, window_bars: usize) {
         self.state = ZoneState::AwaitingConfirmation;
-        // A re-entry cross proves the immediately preceding %K value was already beyond the band.
+        // 发生 re-entry 说明前一根 %K 已位于阈值外，因此可同时视为完成过极值条件
         self.confirmation_armed = confirmation.extreme || confirmation.reentry;
         self.confirmation_bars_left = window_bars + 1;
     }
 
-    /// Advances the untouched or once-broken SLC level state machine by one completed bar.
+    /// 用一根已完成 Bar 推进 fresh、待确认、一次破位和收复四态 level 状态机
+    ///
+    /// 状态转换遵循以下约束：首次有效破位只把区域标记为 `BrokenOnce`，待价格从反方向完整
+    /// 收复后才允许作为 `Reclaimed` 再次回测；收复后的再次破位、确认超时或超过 TTL 都会删除
+    /// 区域。函数只有在趋势、交易方向、随机指标回穿、ATR 距离和收盘位置全部通过时返回信号，
+    /// 从而保证 level 的生命周期与是否允许下单相互独立。
     fn observe(
         &mut self,
         bar: Bar,
@@ -1012,6 +1132,10 @@ impl Zone {
     }
 }
 
+/// level 完成全部过滤后交给订单层的不可变信号快照
+///
+/// 除方向、入场参考价和区域边界外，同时携带 setup 质量特征，供仓位门槛、回测分层统计和
+/// 实盘诊断复用，避免订单层重新读取已经变化的指标状态。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Signal {
     side: OrderSide,
@@ -1028,6 +1152,7 @@ struct Signal {
     ts_event: UnixNanos,
 }
 
+/// 区分首次回测与破位收复后的 setup，便于独立衡量两类 level 的期望值
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SignalLevel {
     Fresh,
@@ -1043,6 +1168,7 @@ impl Display for SignalLevel {
     }
 }
 
+/// 当前随机指标是否到达过极值，以及本 Bar 是否完成阈值回穿
 #[derive(Clone, Copy, Debug)]
 struct Confirmation {
     extreme: bool,
@@ -1056,13 +1182,16 @@ enum ZoneObservation {
     Signal(Signal),
 }
 
+/// 将 Longbridge 同一时间戳的多次实时更新折叠成一根最终完成 Bar
+///
+/// 缓冲器不依赖供应商的 confirmed 推送；看到更晚的时间戳时，才把上一时间戳数据交给策略。
 #[derive(Debug, Default)]
 struct FinalBarBuffer {
     pending: Option<Bar>,
 }
 
 impl FinalBarBuffer {
-    /// Replaces updates for the current timestamp and emits it only after the next bar starts.
+    /// 缓存同一时间戳的最新 Bar 更新，只在下一根 Bar 开始时释放上一根作为最终完成数据
     fn update(&mut self, bar: Bar) -> Option<Bar> {
         let Some(pending) = self.pending else {
             self.pending = Some(bar);
@@ -1079,12 +1208,13 @@ impl FinalBarBuffer {
         Some(pending)
     }
 
-    /// Takes the last already-confirmed historical bar after a finite warmup replay.
+    /// 在有限历史 warmup 结束后取出最后一根已确认 Bar，避免回测边界丢失有效数据
     fn take(&mut self) -> Option<Bar> {
         self.pending.take()
     }
 }
 
+/// 从应用配置提取的纯信号规则，便于同一状态机在回测和实盘中复用
 #[derive(Clone, Copy, Debug)]
 struct SignalRules {
     trade_direction: TradeDirection,
@@ -1100,6 +1230,9 @@ struct SignalRules {
     overbought: f64,
 }
 
+/// 记录信号从方向、level、触达、确认到最终产生的逐层样本数
+///
+/// 该漏斗是诊断“没有交易”的首要依据，不参与任何交易决策。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SignalFunnel {
     five_minute_bars: u64,
@@ -1112,7 +1245,7 @@ struct SignalFunnel {
 }
 
 impl SignalFunnel {
-    /// Records confirmation events once per side and bar, rather than once per overlapping level.
+    /// 每个方向、每根 Bar 只统计一次触达和确认事件，避免重叠 level 重复放大漏斗计数
     fn record_confirmation(
         &mut self,
         zones: &VecDeque<Zone>,
@@ -1134,6 +1267,10 @@ impl SignalFunnel {
     }
 }
 
+/// 单个标的的 SLC 信号引擎，封装 Bar 完成、指标、结构、level 与确认状态
+///
+/// 它只产生 `Signal`，不读取账户余额、不计算数量也不提交订单，使信号规则能在回测和实盘
+/// 共享同一条执行路径，并与跨标的账户风险控制解耦。
 struct SlcSignalState {
     five_minute_bars: FinalBarBuffer,
     four_hour_bars: FinalBarBuffer,
@@ -1151,7 +1288,7 @@ struct SlcSignalState {
 }
 
 impl SlcSignalState {
-    /// Builds per-symbol indicators and bounded zone collections from validated configuration.
+    /// 根据已校验配置创建单标的指标、Bar 完成缓冲器及有界 supply/demand zone 集合
     fn new(config: &AppConfig) -> Self {
         Self {
             five_minute_bars: FinalBarBuffer::default(),
@@ -1193,7 +1330,7 @@ impl SlcSignalState {
         }
     }
 
-    /// Replays completed historical bars while suppressing historical entry signals.
+    /// 回放已完成历史 Bar 初始化指标、结构和 level，但禁止 warmup 期间产生可交易信号
     fn warm_up(
         &mut self,
         five_minute_bars: Vec<Bar>,
@@ -1220,27 +1357,31 @@ impl SlcSignalState {
         }
     }
 
-    /// Returns whether the five-minute indicators are initialized for signal evaluation.
+    /// 判断 ATR 与 Stochastics 是否都已积累足够样本，可以参与 5 分钟信号判断
     fn indicators_initialized(&self) -> bool {
         self.atr.initialized() && self.stochastics.initialized()
     }
 
-    /// Finalizes the pending four-hour update when a newer timestamp arrives.
+    /// 接收 4 小时 Bar 更新，仅在出现更新的时间戳后返回上一根最终 Bar
     fn finalize_four_hour(&mut self, bar: Bar) -> Option<Bar> {
         self.four_hour_bars.update(bar)
     }
 
-    /// Updates confirmed four-hour pivot structure from one completed bar.
+    /// 将一根已完成 4 小时 Bar 写入确认 pivot 结构，不接触任何订单状态
     fn process_four_hour(&mut self, bar: Bar) {
         self.structure.update(bar);
     }
 
-    /// Finalizes the pending five-minute update when a newer timestamp arrives.
+    /// 接收 5 分钟 Bar 更新，仅在出现更新的时间戳后返回上一根最终 Bar
     fn finalize_five_minute(&mut self, bar: Bar) -> Option<Bar> {
         self.five_minute_bars.update(bar)
     }
 
-    /// Updates levels and indicators, then returns at most one trend-aligned confirmed signal.
+    /// 推进指标与全部 level，并至多返回一个和 4 小时结构一致的确认信号
+    ///
+    /// 处理顺序刻意固定：先用当前 Bar 更新随机指标并观察已有区域，再用更新前 ATR 检测当前
+    /// displacement 并创建新区域，最后才更新 ATR。这样新区域不能在创建它的同一根 Bar 上被
+    /// 当作历史 level 使用，也避免把当前大幅波动提前计入用于判定自身的 ATR 基准。
     fn process_five_minute(&mut self, bar: Bar, allow_signal: bool) -> Option<Signal> {
         self.funnel.five_minute_bars += 1;
         let atr_before = self.atr.value;
@@ -1334,7 +1475,7 @@ impl SlcSignalState {
     }
 }
 
-/// Advances every active level, preferring the most recent confirmed setup on the bar.
+/// 从新到旧推进全部有效区域，同一根 Bar 最多选择最近的一个确认 setup
 fn observe_zones(
     zones: &mut VecDeque<Zone>,
     bar: Bar,
@@ -1366,7 +1507,7 @@ fn observe_zones(
     signal
 }
 
-/// Adds the newest level and evicts only the oldest level when the configured bound is full.
+/// 加入最新 level；集合达到容量时仅淘汰最旧项，保证内存和每根 Bar 的扫描成本有界
 fn push_zone(zones: &mut VecDeque<Zone>, zone: Zone, max_zones: usize) {
     if zones.len() == max_zones {
         zones.pop_front();
@@ -1374,7 +1515,10 @@ fn push_zone(zones: &mut VecDeque<Zone>, zone: Zone, max_zones: usize) {
     zones.push_back(zone);
 }
 
-/// Finds the most recent opposing candle before an ATR-sized one-to-three-bar price expansion.
+/// 在最近 1 至 N 根位移 K 线之前寻找最后一根反向源 K 线，并验证移动达到 ATR 阈值
+///
+/// Demand 要求源 K 线收跌、当前收盘突破源高点且靠近位移区间上沿；Supply 条件完全镜像。
+/// 返回的强度使用生成前 ATR 归一化，便于在价格和波动率不同的标的之间比较。
 fn displacement_zone(
     bars: &VecDeque<Bar>,
     atr: f64,
@@ -1426,6 +1570,7 @@ fn displacement_zone(
     None
 }
 
+/// 所有标的共同竞争的账户级风险上限
 #[derive(Clone, Copy, Debug)]
 struct AccountRiskLimits {
     daily_loss: Decimal,
@@ -1434,6 +1579,7 @@ struct AccountRiskLimits {
     open_positions: usize,
 }
 
+/// 一笔未完成入场预先占用的最大初始风险与名义金额
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RiskReservation {
@@ -1449,6 +1595,10 @@ struct RiskReservation {
     notional: Decimal,
 }
 
+/// 可持久化的跨策略账户风险账本
+///
+/// 多标的采用独立策略实例，但通过此状态共享当日盈亏、停机状态、交易次数及未释放预留，
+/// 防止并发信号分别通过单标的检查后合计突破账户上限。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct AccountRiskState {
@@ -1477,6 +1627,7 @@ impl Default for AccountRiskState {
     }
 }
 
+/// 入场在数量、单标的或账户层被拒绝的稳定分类，用于日志与统计聚合
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum RiskRejectionReason {
     ZeroQuantity,
@@ -1512,6 +1663,7 @@ enum ReservationOutcome {
     Rejected(RiskRejectionReason),
 }
 
+/// 某次风险决策时账户账本的只读快照，保证日志可以解释拒绝原因
 #[derive(Clone, Copy, Debug)]
 struct AccountRiskSnapshot {
     realized_pnl: Decimal,
@@ -1522,6 +1674,9 @@ struct AccountRiskSnapshot {
     entries_for_symbol: usize,
 }
 
+/// 以互斥锁和原子文件替换协调多标的策略的共享风险账本
+///
+/// 所有检查、预留和释放均在锁内完成；持久化失败会恢复内存旧状态，避免内存与磁盘账本分叉。
 #[derive(Debug)]
 struct AccountRisk {
     path: PathBuf,
@@ -1529,7 +1684,7 @@ struct AccountRisk {
 }
 
 impl AccountRisk {
-    /// Loads fail-closed account risk state from disk or creates a clean first-run state.
+    /// 从磁盘加载共享账户风险状态；首次运行创建空状态，损坏或不安全内容按 fail-closed 处理
     fn load(path: PathBuf) -> anyhow::Result<Self> {
         let state = if path.exists() {
             let raw = fs::read_to_string(&path)
@@ -1546,7 +1701,10 @@ impl AccountRisk {
         })
     }
 
-    /// Reserves account capacity before an entry command can reach the execution engine.
+    /// 在入场命令到达执行引擎前原子预留账户风险、名义金额、持仓槽位和当日交易次数
+    ///
+    /// 先在互斥锁内滚动交易日并检查全部账户门槛，通过后才持久化 reservation。任何失败都不会
+    /// 让订单先于风险状态到达执行引擎，从而避免多个 symbol 同时看到同一份剩余额度。
     fn reserve_entry(
         &self,
         symbol: &str,
@@ -1598,7 +1756,7 @@ impl AccountRisk {
         ))
     }
 
-    /// Releases an entry reservation and trade count when no quantity was filled.
+    /// 未发生任何成交时释放入场 reservation，并回退该 symbol 的当日交易次数
     fn release_unfilled(&self, symbol: &str) -> anyhow::Result<AccountRiskSnapshot> {
         let mut state = self
             .state
@@ -1620,7 +1778,7 @@ impl AccountRisk {
         Ok(account_risk_snapshot(&state, symbol))
     }
 
-    /// Releases open risk after a filled entry ends while retaining its daily trade count.
+    /// 已成交头寸结束后释放开放风险，但保留当日已执行交易次数
     fn release_reservation(&self, symbol: &str) -> anyhow::Result<AccountRiskSnapshot> {
         let mut state = self
             .state
@@ -1632,7 +1790,7 @@ impl AccountRisk {
         Ok(account_risk_snapshot(&state, symbol))
     }
 
-    /// Records realized PnL and releases risk unless an entry remainder can still refill it.
+    /// 记录已实现 PnL；仅在没有剩余入场数量可能再次成交时释放 reservation
     fn record_close(
         &self,
         symbol: &str,
@@ -1658,7 +1816,7 @@ impl AccountRisk {
         Ok(account_risk_snapshot(&state, symbol))
     }
 
-    /// Reconciles one symbol and halts new entries when broker exposure lacks reserved risk.
+    /// 对账单个 symbol；券商存在敞口但本地无风险 reservation 时立即停止账户新入场
     fn reconcile_symbol(
         &self,
         symbol: &str,
@@ -1680,7 +1838,7 @@ impl AccountRisk {
         Ok(account_risk_snapshot(&state, symbol))
     }
 
-    /// Persists risk state before returning, restoring the in-memory copy on write failure.
+    /// 返回前持久化风险状态；写盘失败时恢复修改前内存快照，禁止仅内存生效的不一致状态
     fn persist_or_restore(
         &self,
         state: &mut AccountRiskState,
@@ -1696,7 +1854,7 @@ impl AccountRisk {
         Ok(())
     }
 
-    /// Writes the complete small state file and synchronizes it before orders can proceed.
+    /// 覆盖写入完整的小型风险状态文件并执行磁盘同步，成功后订单流程才可继续
     fn persist(&self, state: &AccountRiskState) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -1716,7 +1874,7 @@ impl AccountRisk {
     }
 }
 
-/// Rejects corrupt or unsafe values before persisted state can control live entries.
+/// 在持久化状态参与实盘风控前拒绝版本不兼容、非正风险或非正名义金额
 fn validate_account_risk_state(state: &AccountRiskState) -> anyhow::Result<()> {
     anyhow::ensure!(state.version == 1, "unsupported SLC risk state version");
     anyhow::ensure!(
@@ -1730,7 +1888,7 @@ fn validate_account_risk_state(state: &AccountRiskState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Starts a new US trading-day ledger while retaining risk reserved by overnight exposure.
+/// 切换到新的美股交易日，清零日内计数与 PnL，但保留意外隔夜敞口对应的风险预留
 fn roll_account_risk_date(state: &mut AccountRiskState, date: jiff::civil::Date) {
     let date = date.to_string();
     if state.date.as_deref() == Some(date.as_str()) {
@@ -1742,7 +1900,7 @@ fn roll_account_risk_date(state: &mut AccountRiskState, date: jiff::civil::Date)
     state.halted = false;
 }
 
-/// Returns exact aggregate account risk values from the persisted reservation ledger.
+/// 从 reservation 账本精确汇总账户 PnL、开放风险、名义金额、持仓数及单标的次数
 fn account_risk_snapshot(state: &AccountRiskState, symbol: &str) -> AccountRiskSnapshot {
     AccountRiskSnapshot {
         realized_pnl: state.realized_pnl,
@@ -1766,12 +1924,12 @@ fn account_risk_snapshot(state: &AccountRiskState, symbol: &str) -> AccountRiskS
     }
 }
 
-/// Returns whether two regular-session bar starts are not exactly five minutes apart.
+/// 判断相邻常规时段 Bar 的开始时间是否并非严格相差 5 分钟
 fn has_five_minute_gap(previous: UnixNanos, current: UnixNanos) -> bool {
     current.as_u64().saturating_sub(previous.as_u64()) != FIVE_MINUTE_NANOS
 }
 
-/// Requests the pre-close exit once, and only while the strategy still owns exposure.
+/// 仅在仍有敞口且尚未发起退出时触发一次收盘前退出
 fn should_request_preclose_exit(
     close_minute: u16,
     flatten_minute: u16,
@@ -1781,7 +1939,7 @@ fn should_request_preclose_exit(
     close_minute >= flatten_minute && has_exposure && !exit_pending
 }
 
-/// Returns the close-to-zone distance normalized by the current ATR.
+/// 计算确认收盘价到 zone 最近边界的距离，并使用 zone 创建时 ATR 归一化
 fn zone_distance_atr(zone: Zone, close: Price, atr: f64) -> f64 {
     if atr <= 0.0 {
         return f64::INFINITY;
@@ -1796,7 +1954,7 @@ fn zone_distance_atr(zone: Zone, close: Price, atr: f64) -> f64 {
     distance / atr
 }
 
-/// Returns how near the confirmation close is to the favorable end of its candle range.
+/// 返回确认 K 线收盘价靠近交易方向有利端的比例，实体方向越强该值越接近 1
 fn directional_close_location(bar: Bar, side: OrderSide) -> f64 {
     let range = bar.high.as_f64() - bar.low.as_f64();
     if range <= 0.0 {
@@ -1809,7 +1967,7 @@ fn directional_close_location(bar: Bar, side: OrderSide) -> f64 {
     }
 }
 
-/// Returns whether stale exposure lacks the configured favorable excursion.
+/// 判断持仓时间已到上限且最大有利波动仍不足，是否应触发 time stop
 fn should_request_time_stop(
     bars_held: u64,
     mfe_r: Decimal,
@@ -1821,7 +1979,7 @@ fn should_request_time_stop(
     has_exposure && !exit_pending && bars_held >= time_stop_bars && mfe_r < minimum_mfe_r
 }
 
-/// Caps one entry to an equal share of account notional so one order cannot consume every slot.
+/// 按持仓槽位均分账户名义上限，防止首个订单耗尽其他标的的全部容量
 fn per_position_notional_limit(
     account_notional: Decimal,
     open_positions: usize,
@@ -1831,7 +1989,7 @@ fn per_position_notional_limit(
     order_notional.min(account_notional / Decimal::from(open_positions))
 }
 
-/// Preserves stop-loss semantics across Nautilus simulation and Longbridge conditional orders.
+/// 在回测与 Longbridge 实盘之间选择语义等价的止损类型：StopMarket 或 MIT
 fn protective_stop_order_type(is_backtest: bool) -> OrderType {
     if is_backtest {
         OrderType::StopMarket
@@ -1840,7 +1998,7 @@ fn protective_stop_order_type(is_backtest: bool) -> OrderType {
     }
 }
 
-/// Builds an exit-only OUO pair so either backtest fill resizes or cancels its sibling.
+/// 构造仅减仓的回测 OUO 止损/目标组合，使任一成交都会缩量或取消另一保护单
 fn backtest_protective_orders(
     event: &OrderFilled,
     exit_side: OrderSide,
@@ -1910,6 +2068,7 @@ fn backtest_protective_orders(
     ])
 }
 
+/// 已平仓交易的退出归因；支持部分成交经过多条退出路径时标记为 `Mixed`
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TradeExitReason {
     Target,
@@ -1922,7 +2081,7 @@ enum TradeExitReason {
 }
 
 impl TradeExitReason {
-    /// Combines partial exits without hiding trades filled by more than one exit path.
+    /// 合并多次部分退出原因；若同一交易经不同路径成交则保留为 Mixed，避免误归因
     fn combine(current: Option<Self>, next: Self) -> Self {
         match current {
             None => next,
@@ -1946,6 +2105,9 @@ impl Display for TradeExitReason {
     }
 }
 
+/// 一笔已关闭交易的信号质量、风险、路径和成本统计快照
+///
+/// 使用 `Option<Decimal>` 保留券商或引擎未提供 realized PnL 的事实，不以零值掩盖缺失数据。
 #[derive(Clone, Copy, Debug)]
 struct ClosedTradeStatistics {
     side: OrderSide,
@@ -1972,12 +2134,12 @@ struct ClosedTradeStatistics {
 }
 
 impl ClosedTradeStatistics {
-    /// Returns realized PnL after the configured round-trip per-share cost estimate.
+    /// 从已实现 PnL 中扣除配置的每股往返成本，缺失券商 PnL 时不伪造结果
     fn cost_adjusted_pnl(self) -> Option<Decimal> {
         self.realized_pnl.map(|pnl| pnl - self.estimated_cost)
     }
 
-    /// Applies maximum permitted entry slippage and reprices ambiguous target bars as losses.
+    /// 再扣除最坏允许入场滑点，并把 OHLC 路径不明的目标成交重估为完整止损亏损
     fn conservative_pnl(self) -> Option<Decimal> {
         self.cost_adjusted_pnl().map(|pnl| {
             if self.ambiguous_exit_bar && self.exit_reason == TradeExitReason::Target {
@@ -1989,6 +2151,7 @@ impl ClosedTradeStatistics {
     }
 }
 
+/// 单个标的的信号漏斗、风控拒绝原因和逐笔交易结果
 #[derive(Debug, Default)]
 struct SymbolRunStatistics {
     funnel: SignalFunnel,
@@ -1997,13 +2160,14 @@ struct SymbolRunStatistics {
     trades: Vec<ClosedTradeStatistics>,
 }
 
+/// 全部策略实例共享的诊断容器，只影响观测性，不参与信号或下单
 #[derive(Debug, Default)]
 struct RunStatistics {
     symbols: HashMap<InstrumentId, SymbolRunStatistics>,
 }
 
 impl RunStatistics {
-    /// Returns deterministic diagnostic lines for console output after a run.
+    /// 生成顺序稳定、便于 grep 和跨轮比较的运行汇总、分标的及 cohort 诊断行
     fn lines(&self) -> Vec<String> {
         let all_trades = self
             .symbols
@@ -2108,6 +2272,7 @@ impl RunStatistics {
     }
 }
 
+/// 从保守逐日组合 PnL 计算的账户级回测风险指标
 #[derive(Clone, Copy, Debug, Default)]
 struct BacktestRiskMetrics {
     sharpe: Option<f64>,
@@ -2119,7 +2284,7 @@ struct BacktestRiskMetrics {
     flat_days: u64,
 }
 
-/// Computes daily equity risk metrics from exact PnL, including zero-trade sessions.
+/// 用逐日精确 PnL 和账户权益计算 Sharpe、回撤、年化及 Calmar，并保留零交易日
 fn risk_metrics_from_daily_pnl(
     daily_pnl: &[Decimal],
     starting_balance: Decimal,
@@ -2162,7 +2327,7 @@ fn risk_metrics_from_daily_pnl(
     Some(metrics)
 }
 
-/// Computes cost-, entry-slippage-, and ambiguous-path-stressed daily portfolio metrics.
+/// 汇总扣费、最坏入场滑点及模糊路径压力后的逐日组合风险指标
 fn conservative_risk_metrics(
     statistics: &RunStatistics,
     trading_days: &BTreeSet<String>,
@@ -2192,6 +2357,7 @@ fn conservative_risk_metrics(
     risk_metrics_from_daily_pnl(&daily_pnl, starting_balance.as_decimal())
 }
 
+/// 将逐笔交易汇总成总计或 cohort 共用的绩效字段
 #[derive(Debug, Default)]
 struct TradeAggregate {
     trades: u64,
@@ -2221,7 +2387,7 @@ struct TradeAggregate {
 }
 
 impl TradeAggregate {
-    /// Aggregates exact trade values while retaining missing-PnL observations in the trade count.
+    /// 聚合精确交易值；即使 PnL 缺失也保留交易计数，使数据质量问题不会被静默隐藏
     fn from_trades<'a>(trades: impl Iterator<Item = &'a ClosedTradeStatistics>) -> Self {
         let mut aggregate = Self::default();
         for trade in trades {
@@ -2267,7 +2433,7 @@ impl TradeAggregate {
         aggregate
     }
 
-    /// Formats the compact performance metrics shared by total and cohort reports.
+    /// 格式化总计与 cohort 共用的紧凑绩效字段，并明确输出缺失样本
     fn summary(&self) -> String {
         let win_rate = average(self.wins * 100, self.trades);
         let cost_adjusted_win_rate = average(self.cost_adjusted_wins * 100, self.trades);
@@ -2301,7 +2467,7 @@ impl TradeAggregate {
     }
 }
 
-/// Returns a stable four-decimal average or `n/a` when no observation is available.
+/// 返回稳定的四位小数 Decimal 平均值；无有效样本时输出 `n/a`
 fn decimal_average(total: Decimal, count: u64) -> String {
     if count == 0 {
         "n/a".to_string()
@@ -2310,12 +2476,12 @@ fn decimal_average(total: Decimal, count: u64) -> String {
     }
 }
 
-/// Returns an integer numerator average as a percentage-compatible decimal string.
+/// 将整数累计值转换成适合百分比统计的平均数字符串
 fn average(total: u64, count: u64) -> String {
     decimal_average(Decimal::from(total), count)
 }
 
-/// Returns a stable four-decimal floating-point average for normalized setup diagnostics.
+/// 为 ATR 距离、收盘位置等归一化 setup 指标返回稳定的四位浮点平均值
 fn float_average(total: f64, count: u64) -> String {
     if count == 0 {
         "n/a".to_string()
@@ -2325,7 +2491,7 @@ fn float_average(total: f64, count: u64) -> String {
     }
 }
 
-/// Computes a zero-risk-rate annualized sample Sharpe from daily returns.
+/// 使用零无风险利率和样本标准差计算日收益年化 Sharpe；样本不足或零方差返回 None
 fn annualized_sharpe(returns: &[f64]) -> Option<f64> {
     if returns.len() < 2 {
         return None;
@@ -2340,7 +2506,7 @@ fn annualized_sharpe(returns: &[f64]) -> Option<f64> {
     (variance > f64::EPSILON).then(|| mean / variance.sqrt() * 252.0_f64.sqrt())
 }
 
-/// Applies the predeclared IS/OOS degradation rule without rewarding losing samples.
+/// 应用预先声明的 IS/OOS Sharpe 衰减规则，任何非正样本都不会被判为可接受
 fn walk_forward_verdict(in_sample_sharpe: f64, out_of_sample_sharpe: f64) -> &'static str {
     if in_sample_sharpe <= 0.0 {
         "reject_non_positive_is"
@@ -2353,13 +2519,16 @@ fn walk_forward_verdict(in_sample_sharpe: f64, out_of_sample_sharpe: f64) -> &'s
     }
 }
 
-/// Detects OHLC bars whose unknown intrabar path reaches both protective prices.
+/// 检测高低范围同时覆盖止损与目标的 OHLC Bar，此时无法知道真实盘中触发顺序
 fn bar_reaches_stop_and_target(stop: Price, target: Price, bar: Bar) -> bool {
     let lower = stop.min(target);
     let upper = stop.max(target);
     bar.low <= lower && bar.high >= upper
 }
 
+/// 单标的策略实例运行时所需的已解析配置
+///
+/// 应用级配置在构造实例时转换成此结构，使交易热路径不再读取配置文件或重复计算交易时段。
 #[derive(Clone, Debug)]
 struct SlcStrategyConfig {
     instrument_id: InstrumentId,
@@ -2384,6 +2553,9 @@ struct SlcStrategyConfig {
     log_bars: bool,
 }
 
+/// 已提交但尚未完全成交的入场意图
+///
+/// 信号快照一直保留到成交、拒单或撤单，以便部分成交后仍能按原始 setup 构造保护单和统计。
 #[derive(Clone, Copy, Debug)]
 struct PendingEntry {
     client_order_id: ClientOrderId,
@@ -2401,6 +2573,10 @@ struct PendingEntry {
     had_fill: bool,
 }
 
+/// 一笔已发生入场成交、正在接受保护和退出管理的交易
+///
+/// `filled_qty` 与 `protected_qty` 分开累计：每次部分成交后只为新增数量补齐 stop/target，
+/// 同时用精确成交金额维护平均入场价、初始风险、MFE 和 MAE。
 #[derive(Debug)]
 struct ActiveTrade {
     side: OrderSide,
@@ -2427,12 +2603,12 @@ struct ActiveTrade {
 }
 
 impl ActiveTrade {
-    /// Returns the average entry price across all fills.
+    /// 根据累计成交金额和数量返回所有部分成交的精确加权平均入场价
     fn average_fill(&self) -> Decimal {
         self.fill_notional / self.filled_qty
     }
 
-    /// Records favorable and adverse movement at one executable or traded price.
+    /// 用一个可成交或实际成交价格更新最大有利波动 MFE 和最大不利波动 MAE
     fn observe_price(&mut self, price: Price) {
         let entry = self.average_fill();
         let price = price.as_decimal();
@@ -2449,24 +2625,24 @@ impl ActiveTrade {
             .max(adverse.max(Decimal::ZERO));
     }
 
-    /// Records both extremes of one completed post-entry bar.
+    /// 用持仓后的完整 Bar 高低点同时更新 MFE、MAE，并增加持仓 Bar 数
     fn observe_bar(&mut self, bar: Bar) {
         self.observe_price(bar.high);
         self.observe_price(bar.low);
         self.bars_held += 1;
     }
 
-    /// Returns maximum favorable excursion normalized by actual initial risk per share.
+    /// 返回以实际每股初始风险归一化的最大有利波动倍数
     fn mfe_r(&self) -> Decimal {
         self.normalized_excursion(self.maximum_favorable_excursion)
     }
 
-    /// Returns maximum adverse excursion normalized by actual initial risk per share.
+    /// 返回以实际每股初始风险归一化的最大不利波动倍数
     fn mae_r(&self) -> Decimal {
         self.normalized_excursion(self.maximum_adverse_excursion)
     }
 
-    /// Normalizes a per-share excursion without dividing by zero after exceptional fills.
+    /// 将每股波动转换为 R 倍数，并防止异常成交状态导致除零
     fn normalized_excursion(&self, excursion: Decimal) -> Decimal {
         if self.initial_risk <= Decimal::ZERO || self.filled_qty <= Decimal::ZERO {
             Decimal::ZERO
@@ -2476,6 +2652,7 @@ impl ActiveTrade {
     }
 }
 
+/// 回测中延迟判定同一根 OHLC Bar 同时触及止损和目标的保守路径探针
 #[derive(Clone, Copy, Debug)]
 struct AmbiguityProbe {
     stop: Price,
@@ -2483,6 +2660,10 @@ struct AmbiguityProbe {
     close_ts: UnixNanos,
 }
 
+/// Nautilus 单标的 SLC 策略实例，连接信号、订单生命周期与账户风险账本
+///
+/// 每个 symbol 各自维护指标、level、挂单和持仓，避免状态交叉；多个实例只共享 `AccountRisk`
+/// 和 `RunStatistics`。这种边界既符合 Nautilus 的订单归属模型，也能对某一标的独立停用。
 struct SlcStrategy {
     core: StrategyCore,
     config: SlcStrategyConfig,
@@ -2505,6 +2686,7 @@ struct SlcStrategy {
     entries_submitted: u64,
 }
 
+/// 构造单个策略实例时由回测或实盘 runner 注入的运行环境差异
 struct SlcRunConfig {
     flatten_minute: u16,
     backtest_four_hour_bars: Option<Vec<Bar>>,
@@ -2513,7 +2695,7 @@ struct SlcRunConfig {
     run_statistics: Arc<Mutex<RunStatistics>>,
 }
 
-/// Builds the stable per-symbol routing identity and shared strategy behavior.
+/// 为每个 symbol 构造稳定且唯一的策略路由身份，并声明其外部订单归属
 fn slc_strategy_config(instrument_id: InstrumentId) -> StrategyConfig {
     StrategyConfig {
         strategy_id: Some(StrategyId::from(
@@ -2529,7 +2711,10 @@ fn slc_strategy_config(instrument_id: InstrumentId) -> StrategyConfig {
 }
 
 impl SlcStrategy {
-    /// Creates one isolated per-symbol strategy sharing only the account risk ledger.
+    /// 创建一个信号与订单状态完全隔离的单标的策略实例，仅共享账户风险账本和运行统计
+    ///
+    /// 构造阶段先回放 warmup，并强制 5 分钟指标初始化成功。4 小时 pivot 未满足时允许节点启动，
+    /// 但趋势保持 Neutral 且不能入场；这是数据尚不足的可恢复状态，而不是启动失败。
     fn new(
         app_config: &AppConfig,
         instrument_id: InstrumentId,
@@ -2636,7 +2821,7 @@ impl SlcStrategy {
         })
     }
 
-    /// Updates non-critical diagnostics without allowing a poisoned lock to stop trading.
+    /// 更新非关键运行诊断；统计锁损坏只记录错误，不反向中断订单风险处理
     fn update_run_statistics(&self, update: impl FnOnce(&mut SymbolRunStatistics)) {
         match self.run_statistics.lock() {
             Ok(mut statistics) => update(
@@ -2652,7 +2837,7 @@ impl SlcStrategy {
         }
     }
 
-    /// Records the first account-risk gate which rejected a valid SLC signal.
+    /// 记录有效信号首先命中的账户风险拒绝原因，便于区分信号不足和容量不足
     fn record_risk_rejection(&mut self, reason: RiskRejectionReason) {
         self.risk_rejections += 1;
         self.update_run_statistics(|statistics| {
@@ -2660,14 +2845,14 @@ impl SlcStrategy {
         });
     }
 
-    /// Preserves the exit cause across partial fills and detects mixed exit paths.
+    /// 在多次部分成交之间保留退出原因，并识别止损、目标和管理退出混合成交
     fn mark_exit_reason(&mut self, reason: TradeExitReason) {
         if let Some(active) = self.active_trade.as_mut() {
             active.exit_reason = Some(TradeExitReason::combine(active.exit_reason, reason));
         }
     }
 
-    /// Classifies a protective or managed exit fill from the order's strategy-owned tag.
+    /// 根据策略自有订单 tag 把成交归类为止损、目标或管理式风险退出
     fn record_exit_fill(&mut self, event: &OrderFilled) {
         let reason = self
             .cache()
@@ -2694,7 +2879,7 @@ impl SlcStrategy {
         }
     }
 
-    /// Marks a backtest exit as path-ambiguous when one OHLC bar reaches both exit prices.
+    /// 当同一根回测 OHLC Bar 同时触及两个保护价时，把刚结束的交易标为路径不确定
     fn inspect_ambiguous_exit_bar(&mut self, bar: Bar) {
         let Some(probe) = self.ambiguity_probe else {
             return;
@@ -2711,7 +2896,7 @@ impl SlcStrategy {
         self.mark_ambiguous_exit_bar(probe, bar);
     }
 
-    /// Updates the matching closed trade after an ambiguous bar is identified.
+    /// 在识别模糊 Bar 后反向更新对应已平仓统计，供保守 PnL 将目标重估为止损
     fn mark_ambiguous_exit_bar(&self, probe: AmbiguityProbe, bar: Bar) {
         self.update_run_statistics(|statistics| {
             if let Some(trade) = statistics
@@ -2735,7 +2920,7 @@ impl SlcStrategy {
         );
     }
 
-    /// Applies one confirmed four-hour bar to structure without involving order matching.
+    /// 把一根确认的 4 小时 Bar 应用于结构判断，不让高周期数据进入订单撮合
     fn process_finalized_four_hour_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
         let local = bar
             .ts_event
@@ -2763,7 +2948,7 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Advances historical four-hour bars only when their next period has begun on the replay clock.
+    /// 仅当回放时钟已进入下一周期时推进历史 4 小时 Bar，防止回测提前看到完整高周期数据
     fn advance_backtest_four_hour_bars(&mut self, timestamp: UnixNanos) -> anyhow::Result<()> {
         loop {
             let Some(next) = self
@@ -2784,7 +2969,7 @@ impl SlcStrategy {
         }
     }
 
-    /// Returns whether this strategy owns any open order, in-flight order, or position.
+    /// 判断本策略是否拥有任何未结订单、在途订单或持仓，用于阻止重复暴露
     fn has_exposure(&self) -> bool {
         let strategy_id = self.strategy_id().expect("strategy is registered");
         let instrument_id = self.config.instrument_id;
@@ -2802,7 +2987,7 @@ impl SlcStrategy {
                 .is_empty()
     }
 
-    /// Returns whether this strategy owns a currently open position.
+    /// 判断本策略是否拥有当前 symbol 的未平仓头寸
     fn has_open_position(&self) -> bool {
         let strategy_id = self.strategy_id().expect("strategy is registered");
         !self
@@ -2817,7 +3002,7 @@ impl SlcStrategy {
             .is_empty()
     }
 
-    /// Returns whether this strategy owns an open or in-flight order.
+    /// 判断本策略是否拥有当前 symbol 的开放或仍在途订单
     fn has_open_orders(&self) -> bool {
         let strategy_id = self.strategy_id().expect("strategy is registered");
         let cache = self.cache();
@@ -2837,7 +3022,7 @@ impl SlcStrategy {
             ) > 0
     }
 
-    /// Submits a market exit for every open position owned by this strategy.
+    /// 为本策略拥有的当前 symbol 全部头寸提交带 `SLC_EXIT` 标签的市价退出
     fn close_positions(&mut self) -> anyhow::Result<()> {
         self.close_all_positions(
             self.config.instrument_id,
@@ -2851,7 +3036,7 @@ impl SlcStrategy {
         )
     }
 
-    /// Disables new entries after an order failure and starts managed market exit recovery.
+    /// 订单生命周期失败后永久禁止本次运行的新入场，并启动框架管理式市价退出恢复
     fn disable_after_order_failure(&mut self, reason: &str) {
         self.faulted = true;
         self.mark_exit_reason(TradeExitReason::RiskExit);
@@ -2867,7 +3052,11 @@ impl SlcStrategy {
         }
     }
 
-    /// Reserves account risk and submits a one-bar marketable limit entry at the worst allowed price.
+    /// 先预留账户容量，再按最坏允许价格计算数量并提交只存活一根 Bar 的可成交限价单
+    ///
+    /// 数量同时受风险预算、整手、最大数量和名义金额限制。reservation 使用最坏入场价计算，
+    /// 因而实际成交更优时只会降低风险；风险利用率低于最小阈值时直接跳过，避免产生经济意义
+    /// 很小且难以横向比较的交易。任何同步提交失败都会撤销尚未成交的风险预留。
     fn submit_signal(
         &mut self,
         signal: Signal,
@@ -3029,7 +3218,11 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Protects each fill immediately; backtests rest a linked per-fill 2R target at the venue.
+    /// 逐次保护每一笔入场成交；回测挂 OUO 止损/2R 目标，实盘向 Longbridge 提交 MIT 止损
+    ///
+    /// 部分成交会累计成交数量和金额，实际平均价变化后重新计算整个头寸的目标。每个 fill 都按
+    /// 相同区域止损单独保护，只有保护单成功提交后才更新 `protected_qty`。实盘目标不挂在券商，
+    /// 而由报价触发；因此进程中断时仍有止损，但没有自动 2R 止盈。
     fn protect_entry_fill(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
         let Some(pending) = self.pending_entry else {
             return Ok(());
@@ -3225,7 +3418,7 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Cancels an unfilled entry after the next completed five-minute bar makes it stale.
+    /// 下一根已完成 5 分钟 Bar 到达后取消尚未成交的 entry remainder，防止追逐过期信号
     fn cancel_stale_entry(&mut self, bar: Bar) -> anyhow::Result<()> {
         let Some(pending) = self.pending_entry else {
             return Ok(());
@@ -3248,7 +3441,7 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Returns whether a completed live bar reached the quote-trigger fallback target.
+    /// 判断已完成实盘 Bar 是否触及目标，作为实时一档报价触发可能遗漏时的兜底
     fn target_reached(&self, bar: Bar) -> bool {
         !self.exit_pending
             && self.active_trade.as_ref().is_some_and(|active| {
@@ -3256,7 +3449,7 @@ impl SlcStrategy {
             })
     }
 
-    /// Recognizes the normal OUO sibling cancellation after its paired exit order fills.
+    /// 识别 OUO 组合一侧成交后另一侧被正常取消，避免把预期联动误报为保护失效
     fn expected_protective_cancel(&self, client_order_id: ClientOrderId) -> bool {
         let Some(order) = self.cache().order(&client_order_id) else {
             return false;
@@ -3271,7 +3464,7 @@ impl SlcStrategy {
             })
     }
 
-    /// Clears a terminal entry and releases risk only when no fill created exposure.
+    /// 清理已终结入场；仅在从未产生成交敞口时同时回退交易次数和全部风险预留
     fn clear_terminal_entry(&mut self, client_order_id: ClientOrderId) -> anyhow::Result<bool> {
         let Some(pending) = self
             .pending_entry
@@ -3292,7 +3485,7 @@ impl SlcStrategy {
         Ok(true)
     }
 
-    /// Cancels all entry and protective orders before submitting a position-closing market order.
+    /// 先取消当前 symbol 的入场与保护单，再进入等待确认后市价平仓的退出状态
     fn request_exit(&mut self, reason: TradeExitReason, detail: &str) -> anyhow::Result<()> {
         self.mark_exit_reason(reason);
         self.exit_pending = true;
@@ -3308,7 +3501,7 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// Submits the closing order only after every prior order is confirmed closed.
+    /// 仅在所有旧订单确认关闭后提交市价平仓，避免遗留保护单在平仓后反向开仓
     fn finish_exit(&mut self) -> anyhow::Result<()> {
         if !self.exit_pending || self.has_open_orders() {
             return Ok(());
@@ -3339,7 +3532,7 @@ impl Debug for SlcStrategy {
 }
 
 nautilus_strategy!(SlcStrategy, {
-    // Protects entry fills before processing any later lifecycle event
+    // 在处理后续生命周期事件前优先为入场成交建立保护
     fn on_order_filled(&mut self, event: &OrderFilled) {
         if event.instrument_id != self.config.instrument_id {
             return;
@@ -3353,7 +3546,7 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
-    // Releases unfilled entry risk and disables trading after a venue rejection
+    // 券商拒单后释放未成交入场风险，并停止该策略本次运行的新交易
     fn on_order_rejected(&mut self, event: OrderRejected) {
         if event.instrument_id == self.config.instrument_id {
             if let Err(e) = self.clear_terminal_entry(event.client_order_id) {
@@ -3366,7 +3559,7 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
-    // Treats local risk denial as a terminal strategy fault
+    // 将本地 RiskEngine 拒单视为终止性策略故障，避免配置错误后继续尝试
     fn on_order_denied(&mut self, event: OrderDenied) {
         if event.instrument_id == self.config.instrument_id {
             if let Err(e) = self.clear_terminal_entry(event.client_order_id) {
@@ -3379,7 +3572,7 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
-    // Distinguishes an expiring entry remainder from an expiring protective order
+    // 区分正常到期的入场余量与危险的保护单到期
     fn on_order_expired(&mut self, event: OrderExpired) {
         if event.instrument_id != self.config.instrument_id {
             return;
@@ -3401,7 +3594,7 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
-    // Advances cancel-then-close exits and tolerates the expected stale-entry cancel
+    // 推进先撤单后平仓状态机，同时容忍预期的过期 entry 或 OUO 联动取消
     fn on_order_canceled(&mut self, event: &OrderCanceled) {
         if event.instrument_id != self.config.instrument_id {
             return;
@@ -3436,7 +3629,7 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
-    // Escalates a rejected cancel to the framework managed-exit reconciler
+    // 撤单被拒后升级到框架管理式退出和 reconciliation 恢复路径
     fn on_order_cancel_rejected(&mut self, event: OrderCancelRejected) {
         if event.instrument_id == self.config.instrument_id {
             self.faulted = true;
@@ -3458,7 +3651,7 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
-    // Persists account PnL while retaining risk for any still-live entry remainder
+    // 持久化账户 PnL；若 entry remainder 仍可能成交则继续保留风险 reservation
     fn on_position_closed(&mut self, event: PositionClosed) {
         if event.instrument_id != self.config.instrument_id {
             return;
@@ -3610,7 +3803,11 @@ nautilus_strategy!(SlcStrategy, {
 });
 
 impl DataActor for SlcStrategy {
-    /// Validates data contracts, restores shared risk state, and starts market-data subscriptions.
+    /// 启动时校验 Bar 合约和 instrument，恢复共享风险状态并建立行情订阅
+    ///
+    /// 回测只订阅 5 分钟数据，4 小时历史由回放时钟显式推进。实盘同时订阅 5 分钟、4 小时和
+    /// Quote；若 reconciliation 发现已有敞口，则先禁止新信号并执行平仓，而不是猜测丢失的
+    /// active trade、止损和目标状态。
     fn on_start(&mut self) -> anyhow::Result<()> {
         validate_bar_type(self.config.five_minute_bar_type, 5, BarAggregation::Minute)?;
         validate_bar_type(self.config.four_hour_bar_type, 4, BarAggregation::Hour)?;
@@ -3689,7 +3886,7 @@ impl DataActor for SlcStrategy {
         Ok(())
     }
 
-    /// Removes market-data subscriptions after managed stop reconciles orders and positions.
+    /// 管理式停止完成订单与持仓对账后取消行情订阅，并输出最终信号漏斗
     fn on_stop(&mut self) -> anyhow::Result<()> {
         log::info!(
             "[{}] SLC signal funnel: 5m_bars={}, directional_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, risk_rejections={}, entries_submitted={}",
@@ -3712,7 +3909,10 @@ impl DataActor for SlcStrategy {
         Ok(())
     }
 
-    /// Starts the existing cancel-then-close exit when the executable quote reaches 2R.
+    /// 当可立即成交的一档报价达到实际成交价计算的 2R 时，启动先撤保护单再市价退出
+    ///
+    /// 多头使用 bid、空头使用 ask，避免用不可成交的报价另一侧虚假触发盈利目标。该路径依赖
+    /// 本地进程和实时 Quote；完成 Bar 检测只承担兜底职责，不能消除撤单与市价成交之间的延迟。
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         if quote.instrument_id != self.config.instrument_id
             || self.faulted
@@ -3751,7 +3951,11 @@ impl DataActor for SlcStrategy {
         )
     }
 
-    /// Routes completed bars through structure, data-integrity, risk, and execution gates.
+    /// 按结构、数据完整性、时段、风险和执行顺序处理已完成 Bar
+    ///
+    /// 4 小时 Bar 只更新结构。5 分钟 Bar 先检查跨日与断档，再更新持仓 MFE/MAE、计算信号、
+    /// 执行收盘前退出和 time stop、取消过期入场、检查实盘目标兜底，最后才允许新订单进入风险
+    /// 预留流程。任一故障、会话禁用、已有敞口或退出未完成都会阻断新入场。
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         if bar.bar_type == self.config.four_hour_bar_type {
             let Some(finalized) = self.signals.finalize_four_hour(*bar) else {
@@ -3917,7 +4121,7 @@ impl DataActor for SlcStrategy {
     }
 }
 
-/// Validates the exact external LAST bar contract required by the SLC state machine.
+/// 校验 SLC 状态机要求的精确 external LAST Bar 合约，防止错误周期或内部聚合混入
 fn validate_bar_type(
     bar_type: BarType,
     step: usize,
@@ -3934,7 +4138,7 @@ fn validate_bar_type(
     Ok(())
 }
 
-/// Returns the zone stop and marketable entry limit at the configured worst slippage.
+/// 根据 zone 边界、tick buffer 和最大允许滑点返回止损价及可成交入场限价
 fn entry_prices(
     signal: Signal,
     increment: Price,
@@ -3968,7 +4172,7 @@ fn entry_prices(
     ))
 }
 
-/// Returns a tick-aligned target at or beyond the configured reward multiple from actual fill.
+/// 从实际成交价和固定止损计算目标，并向有利方向取整到合法 tick，确保不少于目标 R 倍数
 fn target_price(
     side: OrderSide,
     entry: Decimal,
@@ -3996,7 +4200,7 @@ fn target_price(
     Ok(Price::from_decimal_dp(target, precision)?)
 }
 
-/// Returns whether the immediately executable quote side has reached the target.
+/// 使用可立即成交的报价侧判断目标：多头看 bid，空头看 ask
 fn quote_reaches_target(side: OrderSide, target: Price, quote: &QuoteTick) -> bool {
     match side {
         OrderSide::Buy => quote.bid_price >= target,
@@ -4005,7 +4209,7 @@ fn quote_reaches_target(side: OrderSide, target: Price, quote: &QuoteTick) -> bo
     }
 }
 
-/// Returns whether a completed bar not predating the first fill reached the target.
+/// 判断不早于首次成交的已完成 Bar 是否触及目标，避免入场前价格造成错误退出
 fn bar_reaches_target(side: OrderSide, target: Price, first_fill_ts: UnixNanos, bar: Bar) -> bool {
     bar.ts_event >= first_fill_ts
         && match side {
@@ -4015,7 +4219,10 @@ fn bar_reaches_target(side: OrderSide, target: Price, first_fill_ts: UnixNanos, 
         }
 }
 
-/// Returns the largest lot-aligned quantity fitting risk, quantity, and worst-price notional caps.
+/// 返回同时满足风险、最大数量和最坏入场价名义上限的最大整手数量
+///
+/// 先按每股风险得到理论数量，再依次应用数量与名义金额上限，最后向下取整到 lot size。
+/// 任一条件使结果小于一手时返回 None，不通过增加杠杆或四舍五入突破风险预算。
 fn risk_sized_quantity(
     entry: Price,
     stop: Price,
@@ -4048,11 +4255,12 @@ fn risk_sized_quantity(
     Ok(Some(Quantity::from_decimal(normalized)?))
 }
 
-/// Returns the exact fraction of the configured per-trade risk represented by an order.
+/// 返回订单预留风险占目标单笔风险的精确比例，用于识别资金约束导致的风险不足
 fn risk_utilization(reserved_risk: Decimal, risk_amount: Decimal) -> Decimal {
     reserved_risk / risk_amount
 }
 
+/// 实盘启动前已完整获取并验证的单标的数据与当日交易时段
 struct PreparedInputs {
     instrument_id: InstrumentId,
     instrument: InstrumentAny,
@@ -4062,7 +4270,7 @@ struct PreparedInputs {
     market_close_minute: u16,
 }
 
-/// Loads exact Longbridge instrument metadata once for every configured symbol.
+/// 为每个配置 symbol 一次性加载 Longbridge 静态信息，并构造精确 Instrument 定义
 async fn load_instruments(
     config: &AppConfig,
     context: &QuoteContext,
@@ -4100,7 +4308,7 @@ async fn load_instruments(
     Ok(instruments)
 }
 
-/// Loads exact instrument metadata and complete warmup histories before the live node starts.
+/// 实盘节点启动前加载全部 instrument、完整 5 分钟/4 小时 warmup 及当日收盘时间
 async fn prepare_inputs(
     config: &AppConfig,
     context: &QuoteContext,
@@ -4142,7 +4350,7 @@ async fn prepare_inputs(
     Ok(prepared)
 }
 
-/// Loads a complete, deduplicated, recent regular-session warmup for one bar period.
+/// 加载指定周期最近、完整、去重的常规时段 warmup，并排除仍在形成的末根 K 线
 async fn load_warmup_bars(
     context: &QuoteContext,
     symbol: &str,
@@ -4187,7 +4395,7 @@ async fn load_warmup_bars(
     Ok(bars)
 }
 
-/// Removes in-progress candles, then parses, orders, and validates one warmup response.
+/// 从 warmup 响应删除未完成 K 线，再解析、排序、去重并严格校验请求数量
 fn parse_warmup_bars(
     symbol: &str,
     period: Period,
@@ -4232,6 +4440,7 @@ fn parse_warmup_bars(
     Ok(bars)
 }
 
+/// 回测单标的的 warmup 与样本期数据；克隆仅用于参数候选复用同一份输入
 #[derive(Clone)]
 struct PreparedBacktestInputs {
     instrument_id: InstrumentId,
@@ -4242,6 +4451,10 @@ struct PreparedBacktestInputs {
     four_hour_bars: Vec<Bar>,
 }
 
+/// 一个参数候选在指定样本上的保守评估结果
+///
+/// walk-forward 只使用这里的保守指标选择 IS 胜者，避免用引擎未纳入全部压力成本的原始
+/// Sharpe 直接调参；OOS 只评估胜者，不再次选择。
 #[derive(Clone, Copy, Debug)]
 struct BacktestEvaluation {
     trade_direction: TradeDirection,
@@ -4259,7 +4472,7 @@ struct BacktestEvaluation {
 }
 
 impl BacktestEvaluation {
-    /// Produces one grep-friendly comparison record for target selection and review.
+    /// 生成单行且便于 grep 的参数评估记录，供 IS 选择和人工复核
     fn summary(self, sample: &str) -> String {
         format!(
             "SLC parameter evaluation: sample={sample}, direction={}, risk_reward={}, trades={}, conservative_pnl={}, conservative_cost_adjusted_sharpe={}, conservative_max_drawdown_pct={}, conservative_annualized_return_pct={}, conservative_calmar={}, positive_days={}, negative_days={}, flat_days={}, engine_sharpe={}",
@@ -4279,12 +4492,12 @@ impl BacktestEvaluation {
     }
 }
 
-/// Formats optional floating-point metrics without replacing unavailable evidence with zero.
+/// 格式化可选浮点指标；没有证据时输出 `n/a`，不使用零伪装缺失数据
 fn format_optional_metric(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}"))
 }
 
-/// Selects only by conservative IS Sharpe, then PnL and the smaller target for deterministic ties.
+/// 仅按保守 IS Sharpe 选择候选；并列时依次比较 PnL 和较小目标以保证结果确定
 fn select_in_sample_winner(
     evaluations: &[BacktestEvaluation],
 ) -> anyhow::Result<BacktestEvaluation> {
@@ -4306,7 +4519,7 @@ fn select_in_sample_winner(
         .context("no target candidate produced a defined in-sample Sharpe")
 }
 
-/// Returns the most recent complete bars before the OOS boundary as indicator warmup.
+/// 返回 OOS 边界之前最近的完整 Bar 作为指标 warmup，且不把这些 Bar 再计入 OOS 绩效
 fn split_warmup_bars(
     initial_warmup: &[Bar],
     replay_bars: &[Bar],
@@ -4331,7 +4544,7 @@ fn split_warmup_bars(
     Ok(bars.split_off(bars.len() - count))
 }
 
-/// Splits every symbol at the same timestamp without allowing OOS bars into IS selection.
+/// 在同一时间戳切分全部 symbol，禁止任何 OOS Bar 进入 IS 参数选择
 fn split_walk_forward_inputs(
     inputs: &[PreparedBacktestInputs],
     config: &AppConfig,
@@ -4388,7 +4601,7 @@ fn split_walk_forward_inputs(
     Ok((in_sample, out_of_sample))
 }
 
-/// Loads warmup and replay bars for every symbol through the rate-limited Longbridge context.
+/// 通过共享限流的 Longbridge QuoteContext 为所有 symbol 加载 warmup 和回放数据
 async fn prepare_backtest_inputs(
     config: &SlcBacktestConfig,
     context: &QuoteContext,
@@ -4398,7 +4611,7 @@ async fn prepare_backtest_inputs(
     let mut half_days = BTreeSet::new();
     let mut cursor = start_date;
     while cursor <= end_date {
-        // Longbridge requires each trading-days query interval to be shorter than one month.
+        // Longbridge 要求每次 trading-days 查询区间短于一个自然月
         let chunk_end = cursor
             .checked_add(time::Duration::days(TRADING_DAYS_CHUNK_DAYS - 1))
             .unwrap_or(end_date)
@@ -4498,7 +4711,7 @@ async fn prepare_backtest_inputs(
     Ok(prepared)
 }
 
-/// Loads bars ending no later than the backtest start for indicator and structure warmup.
+/// 加载结束时间不晚于回测起点的历史 Bar，用于初始化指标和高周期结构
 async fn load_backtest_warmup_bars(
     context: &QuoteContext,
     symbol: &str,
@@ -4537,7 +4750,7 @@ async fn load_backtest_warmup_bars(
     )
 }
 
-/// Downloads a bounded date range in small chunks so Longbridge cannot silently truncate 5m data.
+/// 将日期区间拆成小批下载，避免 Longbridge 的单次上限静默截断 5 分钟数据
 async fn load_backtest_bars(
     context: &QuoteContext,
     symbol: &str,
@@ -4591,7 +4804,7 @@ async fn load_backtest_bars(
     )
 }
 
-/// Parses complete historical candles and assigns their close as the replay arrival timestamp.
+/// 解析完整历史 K 线，并把 Bar 收盘时刻设为回放到达时间以维持无前视语义
 fn parse_backtest_bars(
     symbol: &str,
     period: Period,
@@ -4638,7 +4851,7 @@ fn parse_backtest_bars(
     Ok(bars)
 }
 
-/// Converts a UTC timestamp to the market-local datetime expected by Longbridge offset history.
+/// 将 UTC 时间戳转换为 Longbridge offset history 接口要求的美股市场本地时间
 fn us_market_datetime(timestamp: Timestamp) -> anyhow::Result<PrimitiveDateTime> {
     let local = timestamp.to_zoned(get_timezone(US_TIMEZONE)?);
     let date = local.date();
@@ -4656,7 +4869,7 @@ fn us_market_datetime(timestamp: Timestamp) -> anyhow::Result<PrimitiveDateTime>
     ))
 }
 
-/// Returns today's authoritative Longbridge US regular-session close and local minute.
+/// 从 Longbridge 交易日历返回当日权威美股常规收盘时刻及本地分钟数
 async fn current_us_market_close(context: &QuoteContext) -> anyhow::Result<(Timestamp, u16)> {
     let now = Timestamp::now();
     let market_date = us_market_date(now)?;
@@ -4689,7 +4902,7 @@ async fn current_us_market_close(context: &QuoteContext) -> anyhow::Result<(Time
     Ok((us_market_close_at(now, close_time)?, market_close_minute))
 }
 
-/// Converts a timestamp to its US market calendar date.
+/// 将时间戳转换成 America/New_York 时区下的美股市场日历日期
 fn us_market_date(now: Timestamp) -> anyhow::Result<Date> {
     let timezone = get_timezone(US_TIMEZONE)?;
     let local_date = now.to_zoned(timezone).date();
@@ -4700,7 +4913,7 @@ fn us_market_date(now: Timestamp) -> anyhow::Result<Date> {
     )?)
 }
 
-/// Resolves a local US market close across daylight-saving transitions.
+/// 在夏令时切换下解析美股本地收盘时间；遇到缺失或歧义时拒绝猜测
 fn us_market_close_at(now: Timestamp, close_time: Time) -> anyhow::Result<Timestamp> {
     let timezone = get_timezone(US_TIMEZONE)?;
     let local_date = now.to_zoned(timezone.clone()).date();
@@ -4716,7 +4929,7 @@ fn us_market_close_at(now: Timestamp, close_time: Time) -> anyhow::Result<Timest
         .context("US market close must resolve to one timestamp")
 }
 
-/// Stops the node at the session close after strategies have used their pre-close exit window.
+/// 在策略已经经过收盘前退出窗口后，于权威 session close 定时停止节点
 fn schedule_market_close_stop(node: &LiveNode, market_close: Timestamp) -> anyhow::Result<()> {
     let delay = Duration::try_from(Timestamp::now().duration_until(market_close))
         .context("US market close must be in the future")?;
@@ -4729,9 +4942,11 @@ fn schedule_market_close_stop(node: &LiveNode, market_close: Timestamp) -> anyho
     Ok(())
 }
 
-/// Builds Longbridge execution settings with live routing and outside-RTH trading disabled by default.
+/// 构造 Longbridge 执行配置，默认使用保证金账户并禁止常规时段外成交
 fn execution_config(config: &AppConfig) -> LongbridgeExecClientConfig {
     LongbridgeExecClientConfig {
+        oauth_client_id: Some(config.oauth_client_id.clone()),
+        oauth_callback_port: config.oauth_callback_port,
         account_type: AccountType::Margin,
         papertrading: config.papertrading,
         outside_rth: false,
@@ -4739,7 +4954,7 @@ fn execution_config(config: &AppConfig) -> LongbridgeExecClientConfig {
     }
 }
 
-/// Adds engine-level order throttles and exact per-order notional limits.
+/// 配置执行引擎级订单节流及各 instrument 的精确单笔名义金额上限
 fn risk_engine_config(config: &AppConfig) -> LiveRiskEngineConfig {
     LiveRiskEngineConfig {
         bypass: false,
@@ -4774,7 +4989,7 @@ impl Drop for TemporaryRiskState {
     }
 }
 
-/// Takes a consistent snapshot of shared per-symbol diagnostics after a runner stops.
+/// runner 停止后在同一把锁内复制所有 symbol 统计，获得一致的诊断快照
 fn run_statistics_lines(run_statistics: &Mutex<RunStatistics>) -> anyhow::Result<Vec<String>> {
     Ok(run_statistics
         .lock()
@@ -4782,7 +4997,10 @@ fn run_statistics_lines(run_statistics: &Mutex<RunStatistics>) -> anyhow::Result
         .lines())
 }
 
-/// Replays only five-minute bars through matching while four-hour bars advance strategy structure.
+/// 仅把 5 分钟 Bar 送入撮合；4 小时 Bar 在策略内部按回放时钟推进结构
+///
+/// 这种隔离防止高周期 OHLC 被误当成可成交行情，同时保证实盘和回测的结构确认时刻一致。
+/// 每次运行使用临时风险状态文件，避免参数候选之间共享 reservation 或日内 PnL。
 fn run_backtest_engine(
     config: &SlcBacktestConfig,
     prepared: Vec<PreparedBacktestInputs>,
@@ -4915,18 +5133,37 @@ fn run_backtest_engine(
     Ok(evaluation)
 }
 
-/// Selects the live or historical runner while keeping the SLC implementation shared.
+/// 从第一个可选命令行参数读取 TOML 路径；未提供时使用仓库内示例配置
+fn config_path_from_args() -> anyhow::Result<PathBuf> {
+    let mut args = env::args_os().skip(1);
+    let path = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    anyhow::ensure!(
+        args.next().is_none(),
+        "expected at most one argument: path to the SLC TOML configuration",
+    );
+    Ok(path)
+}
+
+/// 根据命令行模式选择实盘或历史 runner，始终复用同一份 TOML 和 SLC 策略实现
 pub(super) async fn run(backtest: bool) -> anyhow::Result<()> {
+    let config_path = config_path_from_args()?;
     if backtest {
-        run_backtest().await
+        run_backtest(&config_path).await
     } else {
-        run_live().await
+        run_live(&config_path).await
     }
 }
 
-/// Downloads Longbridge history and runs the parameterized multi-symbol SLC backtest.
-async fn run_backtest() -> anyhow::Result<()> {
-    let config = SlcBacktestConfig::from_env()?;
+/// 下载 Longbridge 历史数据并运行参数化多标的回测或 walk-forward 评估
+///
+/// 有切分点时先在 IS 比较目标候选，只把胜出参数运行于 OOS；无切分点时对全部候选分别运行。
+/// 参数选择只依据保守指标，原始 Nautilus 统计仍输出用于核对，但不作为最优参数依据。
+async fn run_backtest(config_path: &Path) -> anyhow::Result<()> {
+    let config = SlcBacktestConfig::load(config_path)?;
+    println!("SLC configuration loaded from {}", config_path.display());
     let prepared = tokio::time::timeout(Duration::from_secs(config.timeout_secs), async {
         let sdk_config = config.strategy.data_config().sdk_config().await?;
         let (context, _receiver) = QuoteContext::new(sdk_config);
@@ -4984,9 +5221,10 @@ async fn run_backtest() -> anyhow::Result<()> {
     }
 }
 
-/// Prepares all symbols before constructing the reconciled live trading node.
-async fn run_live() -> anyhow::Result<()> {
-    let config = AppConfig::from_env(true)?;
+/// 在构建带 reconciliation 的实盘节点前准备全部 symbol，任何一个失败都阻止整体启动
+async fn run_live(config_path: &Path) -> anyhow::Result<()> {
+    let config = AppConfig::load(config_path, true)?;
+    log::info!("SLC configuration loaded from {}", config_path.display());
     let account_risk = Arc::new(AccountRisk::load(config.risk_state_path.clone())?);
     let run_statistics = Arc::new(Mutex::new(RunStatistics::default()));
     log::info!(
@@ -5417,21 +5655,20 @@ open_updated = true
 
     #[rstest::rstest]
     fn test_parse_multiple_symbol_configs() {
-        let instruments = parse_symbol_config(
-            r#"
-                [[symbols]]
-                symbol = "QQQ.US"
-                price_increment = "0.01"
-
-                [[symbols]]
-                symbol = "AAPL.US"
-                price_increment = "0.01"
-
-                [[symbols]]
-                symbol = "MSFT.US"
-                price_increment = "0.01"
-            "#,
-        )
+        let instruments = parse_instruments(&[
+            SymbolConfigEntry {
+                symbol: "QQQ.US".to_string(),
+                price_increment: "0.01".to_string(),
+            },
+            SymbolConfigEntry {
+                symbol: "AAPL.US".to_string(),
+                price_increment: "0.01".to_string(),
+            },
+            SymbolConfigEntry {
+                symbol: "MSFT.US".to_string(),
+                price_increment: "0.01".to_string(),
+            },
+        ])
         .unwrap();
 
         assert_eq!(instruments.len(), 3);
@@ -5444,17 +5681,16 @@ open_updated = true
     #[rstest::rstest]
     fn test_parse_symbol_config_rejects_duplicates() {
         assert!(
-            parse_symbol_config(
-                r#"
-                    [[symbols]]
-                    symbol = "QQQ.US"
-                    price_increment = "0.01"
-
-                    [[symbols]]
-                    symbol = "QQQ.US"
-                    price_increment = "0.01"
-                "#,
-            )
+            parse_instruments(&[
+                SymbolConfigEntry {
+                    symbol: "QQQ.US".to_string(),
+                    price_increment: "0.01".to_string(),
+                },
+                SymbolConfigEntry {
+                    symbol: "QQQ.US".to_string(),
+                    price_increment: "0.01".to_string(),
+                },
+            ])
             .is_err()
         );
     }
@@ -5462,15 +5698,29 @@ open_updated = true
     #[rstest::rstest]
     fn test_parse_symbol_config_rejects_non_us_equities() {
         assert!(
-            parse_symbol_config(
-                r#"
-                    [[symbols]]
-                    symbol = "0700.HK"
-                    price_increment = "0.001"
-                "#,
-            )
+            parse_instruments(&[SymbolConfigEntry {
+                symbol: "0700.HK".to_string(),
+                price_increment: "0.001".to_string(),
+            }])
             .is_err()
         );
+    }
+
+    #[rstest::rstest]
+    fn example_toml_contains_a_complete_valid_configuration() {
+        let file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
+        let config =
+            AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH), false).unwrap();
+
+        assert_eq!(config.instruments.len(), file.symbols.len());
+        assert!(!config.instruments.is_empty());
+        assert_eq!(config.risk_amount, Decimal::from(25));
+        assert_eq!(config.trade_direction, TradeDirection::Both);
+        assert!(config.papertrading);
+
+        let backtest = SlcBacktestConfig::load(Path::new(DEFAULT_CONFIG_PATH)).unwrap();
+        assert!(backtest.start < backtest.end);
+        assert_eq!(backtest.risk_rewards, vec![Decimal::from(2)]);
     }
 
     #[rstest::rstest]
@@ -5999,7 +6249,13 @@ open_updated = true
     #[rstest::rstest]
     fn test_risk_reward_grid_is_sorted_and_deduplicated() {
         assert_eq!(
-            parse_decimal_grid("2,1.5,1.75,2").unwrap(),
+            parse_decimal_grid(&[
+                "2".to_string(),
+                "1.5".to_string(),
+                "1.75".to_string(),
+                "2".to_string(),
+            ])
+            .unwrap(),
             vec![Decimal::new(15, 1), Decimal::new(175, 2), Decimal::from(2),],
         );
     }
