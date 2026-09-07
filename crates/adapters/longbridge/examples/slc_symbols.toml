@@ -8,12 +8,37 @@ oauth_client_id = "2bcd116c-41bc-4ad5-8d73-280f0d53b1e4"
 oauth_callback_port = 60355
 # true 路由到 Longbridge 模拟盘；false 路由到真实账户。
 papertrading = true
-# 仅 papertrading=false 时校验；必须精确填写 I_UNDERSTAND_LIVE_ORDERS 才允许实盘启动。
-live_order_ack = ""
 # 风险账本保存当日交易次数、已实现盈亏和未释放风险；相对路径以本文件目录为基准。
 paper_risk_state_path = "../../../../target/longbridge-slc-paper-risk-state.toml"
 # 实盘使用独立账本，禁止与模拟盘共享状态。
 live_risk_state_path = "../../../../target/longbridge-slc-live-risk-state.toml"
+
+[universe]
+# 实盘标的池模式：fixed 使用本文件底部的 [[symbols]]；dynamic 读取盘前选择器生成的当日快照。
+# 回测始终使用固定 [[symbols]]，避免把某一天的动态池错误套用到历史区间。
+mode = "dynamic"
+# 动态池快照路径；相对路径以本配置文件目录为基准。动态模式下文件缺失、日期过期或方向不一致
+# 都会阻止交易节点启动，不会静默回退到固定池。
+dynamic_pool_path = "../../../../target/longbridge-slc-dynamic-pool.toml"
+# 最终动态池最多保留的标的数；所有标的仍共享 [risk] 下的仓位和风险额度。
+max_symbols = 50
+# Longbridge 每个方向先返回的候选数。both 会分别请求多头和空头并交替选取，最多共请求两倍数量。
+candidate_count_per_side = 60
+# Longbridge 静态信息不提供美股逐标的 tick；此处为动态池统一使用的保守报价格点。默认 0.01
+# 对当前 minimum_price > 1 的主板池不会生成亚分价格；若券商规则变化，应先人工核对再修改。
+price_increment = "0.01"
+# 价格筛选范围，单位 USD；排除过低价格导致的跳动/滑点放大，也排除单股名义金额过高的标的。
+minimum_price = "10"
+maximum_price = "500"
+# Longbridge 市值筛选输入值；美股筛选值 50 约对应 50 亿 USD，快照保存 API 返回的原始市值供审计。
+minimum_market_cap = "50"
+# 近一个月日均成交额下限，Longbridge 筛选单位为“万”；500 即约 500 万 USD。
+minimum_average_daily_turnover = "500"
+# 最近交易日振幅下限，单位百分比；保证候选有足够日内活动，但不直接构成 SLC 入场信号。
+minimum_daily_amplitude_pct = "1.5"
+# 多头候选要求最近涨幅位于该绝对值区间，空头候选使用对称负区间；用于构造方向均衡的活跃池。
+minimum_daily_change_pct = "0.5"
+maximum_daily_change_pct = "12"
 
 [risk]
 # 单笔交易计划承担的最大初始风险，单位 USD；100 USD 为 100,000 USD 初始资金的 0.10%。

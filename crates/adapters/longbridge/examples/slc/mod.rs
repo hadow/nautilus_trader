@@ -16,10 +16,9 @@
 //!
 //! # 风险提示
 //!
-//! 本示例会真实提交订单。默认配置连接 Longbridge 模拟盘；把配置项 `papertrading` 改为
-//! `false` 后会把订单路由到真实保证金账户，同时必须把 `live_order_ack` 设置为
-//! `I_UNDERSTAND_LIVE_ORDERS`。该确认只防止误启动，不代表策略已经具备稳定盈利能力。
-//! 首次运行必须使用隔离的模拟账户，并在每次关闭节点后人工核对券商侧订单与持仓。
+//! 本示例会真实提交订单。`papertrading = true` 连接 Longbridge 模拟盘；改为 `false` 后会把
+//! 订单直接路由到真实保证金账户。首次运行必须使用隔离的模拟账户，并在每次关闭节点后人工
+//! 核对券商侧订单与持仓；配置切换不代表策略已经具备稳定盈利能力。
 //!
 //! # 策略底层逻辑
 //!
@@ -59,11 +58,15 @@
 //!
 //! # 运行方式
 //!
+//! `cargo run -p nautilus-longbridge --features examples --example longbridge-slc-selector`
+//!
 //! `cargo run -p nautilus-longbridge --features examples --example longbridge-slc-trader`
 //!
 //! 策略、风控、回测和 Longbridge OAuth 公共客户端 ID 均在 `examples/slc_symbols.toml`
 //! 配置；OAuth token 仍由官方 SDK 的本地安全存储管理。若要使用其他配置文件，在命令后
-//! 添加文件路径，例如 `cargo run ... -- /path/to/slc.toml`。
+//! 添加文件路径，例如 `cargo run ... -- /path/to/slc.toml`。盘前选择器生成带目标交易日的
+//! 动态池；`universe.mode = "fixed"` 使用配置内固定池，`dynamic` 要求实盘加载匹配当天与
+//! 交易方向的动态快照。回测始终使用固定池，避免使用当前快照造成历史前视偏差。
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -80,8 +83,11 @@ use std::{
 use anyhow::Context;
 use jiff::{Timestamp, civil::Time as CivilTime, tz::TimeZone};
 use longbridge::{
-    Market,
-    quote::{AdjustType, Candlestick, Period, QuoteContext, TradeSession, TradeSessions},
+    Market, ScreenerContext,
+    quote::{
+        AdjustType, Candlestick, Period, QuoteContext, SecurityBoard, TradeSession, TradeSessions,
+    },
+    screener::types::{ScreenerCondition, ScreenerSearchResponse},
 };
 use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
@@ -149,7 +155,6 @@ const HISTORY_CHUNK_DAYS: i64 = 7;
 const TRADING_DAYS_CHUNK_DAYS: i64 = 28;
 const MAX_WARMUP_AGE_NANOS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 const MAX_WARMUP_BARS: usize = 1_000;
-const LIVE_ACK: &str = "I_UNDERSTAND_LIVE_ORDERS";
 const DEFAULT_CONFIG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/slc_symbols.toml");
 
 /// 美股常规时段内允许入场、禁止新单和强制平仓的时间约束
@@ -231,6 +236,8 @@ impl FromStr for TradeDirection {
 #[derive(Clone, Debug)]
 struct AppConfig {
     instruments: Vec<SlcInstrument>,
+    universe_mode: UniverseMode,
+    dynamic_pool_path: PathBuf,
     oauth_client_id: String,
     oauth_callback_port: u16,
     papertrading: bool,
@@ -281,6 +288,7 @@ struct SlcInstrument {
 #[serde(deny_unknown_fields)]
 struct SlcFileConfig {
     longbridge: LongbridgeSettings,
+    universe: UniverseSettings,
     risk: RiskSettings,
     signal: SignalSettings,
     warmup: WarmupSettings,
@@ -295,9 +303,34 @@ struct LongbridgeSettings {
     oauth_client_id: String,
     oauth_callback_port: u16,
     papertrading: bool,
-    live_order_ack: String,
     paper_risk_state_path: PathBuf,
     live_risk_state_path: PathBuf,
+}
+
+/// 实盘标的池来源；回测始终使用配置文件内固定 `[[symbols]]`，防止当日筛选结果污染历史样本
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum UniverseMode {
+    Fixed,
+    Dynamic,
+}
+
+/// 固定池/动态池切换，以及 Longbridge 盘前筛选器使用的基础流动性与波动条件
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UniverseSettings {
+    mode: UniverseMode,
+    dynamic_pool_path: PathBuf,
+    max_symbols: usize,
+    candidate_count_per_side: u32,
+    price_increment: String,
+    minimum_price: String,
+    maximum_price: String,
+    minimum_market_cap: String,
+    minimum_average_daily_turnover: String,
+    minimum_daily_amplitude_pct: String,
+    minimum_daily_change_pct: String,
+    maximum_daily_change_pct: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,22 +415,69 @@ struct WalkForwardSettings {
     minimum_pass_rate: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SymbolConfigEntry {
     symbol: String,
     price_increment: String,
 }
 
+/// 盘前筛选快照中的单标的审计信息；数值保留为十进制定点字符串，避免 JSON 浮点二次舍入
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicSymbolEntry {
+    symbol: String,
+    name: String,
+    price_increment: String,
+    side_bias: String,
+    previous_change_pct: String,
+    daily_amplitude_pct: String,
+    average_daily_turnover: String,
+    market_cap: String,
+}
+
+/// 每次盘前运行生成的不可变当日标的池；实盘启动时必须同时匹配交易日和方向配置
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DynamicUniverseSnapshot {
+    trading_date: String,
+    generated_at_utc: String,
+    source: String,
+    trade_direction: String,
+    symbols: Vec<DynamicSymbolEntry>,
+}
+
+/// Longbridge 筛选响应转换后的内部候选；`side` 仅表示盘前偏向，不替代 SLC 4 小时方向
+#[derive(Clone, Debug)]
+struct ScreenerCandidate {
+    symbol: String,
+    name: String,
+    side: OrderSide,
+    previous_change_pct: Decimal,
+    daily_amplitude_pct: Decimal,
+    average_daily_turnover: Decimal,
+    market_cap: Decimal,
+}
+
 impl AppConfig {
     /// 加载统一 TOML 配置，并拒绝不安全、越界或彼此矛盾的参数组合
-    fn load(path: &Path, live: bool) -> anyhow::Result<Self> {
+    fn load(path: &Path) -> anyhow::Result<Self> {
         let config = load_config_file(path)?;
-        Self::from_file_config(&config, path, live)
+        let mut app_config = Self::from_file_config(&config, path)?;
+        if config.universe.mode == UniverseMode::Dynamic {
+            let symbols = load_dynamic_symbol_pool(
+                &config.universe,
+                path,
+                &us_market_date(Timestamp::now())?.to_string(),
+                app_config.trade_direction,
+            )?;
+            app_config.instruments = parse_instruments(&symbols)?;
+        }
+        Ok(app_config)
     }
 
     /// 把已反序列化配置转换成交易热路径使用的精确领域类型
-    fn from_file_config(config: &SlcFileConfig, path: &Path, live: bool) -> anyhow::Result<Self> {
+    fn from_file_config(config: &SlcFileConfig, path: &Path) -> anyhow::Result<Self> {
         let longbridge = &config.longbridge;
         let oauth_client_id = longbridge.oauth_client_id.trim().to_string();
         anyhow::ensure!(
@@ -409,11 +489,18 @@ impl AppConfig {
             "longbridge.oauth_callback_port must be positive",
         );
         let papertrading = longbridge.papertrading;
-        if live {
-            validate_live_guard(papertrading, Some(longbridge.live_order_ack.trim()))?;
-        }
 
         let instruments = parse_instruments(&config.symbols)?;
+        anyhow::ensure!(
+            config.universe.max_symbols > 0
+                && config.universe.max_symbols <= MAX_QUOTE_SUBSCRIPTION_SYMBOLS,
+            "universe.max_symbols must be between 1 and {MAX_QUOTE_SUBSCRIPTION_SYMBOLS}",
+        );
+        anyhow::ensure!(
+            !config.universe.dynamic_pool_path.as_os_str().is_empty(),
+            "universe.dynamic_pool_path must not be empty",
+        );
+        let dynamic_pool_path = resolve_config_path(path, &config.universe.dynamic_pool_path);
         let signal = &config.signal;
         let risk = &config.risk;
         let trade_direction =
@@ -571,6 +658,8 @@ impl AppConfig {
 
         Ok(Self {
             instruments,
+            universe_mode: config.universe.mode,
+            dynamic_pool_path,
             oauth_client_id,
             oauth_callback_port: longbridge.oauth_callback_port,
             papertrading,
@@ -667,7 +756,7 @@ impl SlcBacktestConfig {
     /// 从统一 TOML 加载共享策略和回测区间、资金、成本及 walk-forward 配置
     fn load(path: &Path) -> anyhow::Result<Self> {
         let config = load_config_file(path)?;
-        let mut strategy = AppConfig::from_file_config(&config, path, false)?;
+        let mut strategy = AppConfig::from_file_config(&config, path)?;
         let backtest = &config.backtest;
         let start = parse_config_value("backtest.start", &backtest.start)?;
         let end = parse_config_value("backtest.end", &backtest.end)?;
@@ -759,6 +848,329 @@ fn load_config_file(path: &Path) -> anyhow::Result<SlcFileConfig> {
     let value = fs::read_to_string(path)
         .with_context(|| format!("failed to read SLC config {}", path.display()))?;
     toml::from_str(&value).with_context(|| format!("invalid SLC config {}", path.display()))
+}
+
+/// 从当日动态池快照提取交易标的；日期或方向不匹配时拒绝启动，绝不静默回退固定池
+fn load_dynamic_symbol_pool(
+    settings: &UniverseSettings,
+    config_path: &Path,
+    expected_date: &str,
+    expected_direction: TradeDirection,
+) -> anyhow::Result<Vec<SymbolConfigEntry>> {
+    let path = resolve_config_path(config_path, &settings.dynamic_pool_path);
+    let encoded = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read SLC dynamic universe {}", path.display()))?;
+    let snapshot: DynamicUniverseSnapshot = toml::from_str(&encoded)
+        .with_context(|| format!("invalid SLC dynamic universe {}", path.display()))?;
+    anyhow::ensure!(
+        snapshot.source == "longbridge_custom_screener",
+        "unsupported dynamic universe source {:?} in {}",
+        snapshot.source,
+        path.display(),
+    );
+    anyhow::ensure!(
+        snapshot.trading_date == expected_date,
+        "stale SLC dynamic universe {}: snapshot trading_date={}, expected={expected_date}",
+        path.display(),
+        snapshot.trading_date,
+    );
+    anyhow::ensure!(
+        snapshot.trade_direction == expected_direction.to_string(),
+        "SLC dynamic universe direction mismatch in {}: snapshot={}, configured={expected_direction}",
+        path.display(),
+        snapshot.trade_direction,
+    );
+    let generated_at: Timestamp =
+        parse_config_value("dynamic_pool.generated_at_utc", &snapshot.generated_at_utc)?;
+    anyhow::ensure!(
+        generated_at <= Timestamp::now(),
+        "SLC dynamic universe {} was generated in the future: {generated_at}",
+        path.display(),
+    );
+    anyhow::ensure!(
+        !snapshot.symbols.is_empty() && snapshot.symbols.len() <= settings.max_symbols,
+        "SLC dynamic universe {} must contain between 1 and {} symbols, received {}",
+        path.display(),
+        settings.max_symbols,
+        snapshot.symbols.len(),
+    );
+    anyhow::ensure!(
+        snapshot
+            .symbols
+            .iter()
+            .all(|entry| match expected_direction {
+                TradeDirection::Both => matches!(entry.side_bias.as_str(), "long" | "short"),
+                TradeDirection::Long => entry.side_bias == "long",
+                TradeDirection::Short => entry.side_bias == "short",
+            }),
+        "SLC dynamic universe {} contains a side_bias excluded by signal.trade_direction={expected_direction}",
+        path.display(),
+    );
+    Ok(snapshot
+        .symbols
+        .into_iter()
+        .map(|entry| SymbolConfigEntry {
+            symbol: entry.symbol,
+            price_increment: entry.price_increment,
+        })
+        .collect())
+}
+
+/// 已校验的盘前筛选条件；价格、百分比和供应商筛选单位均使用 Decimal 保存
+struct SelectorRules {
+    max_symbols: usize,
+    candidate_count_per_side: u32,
+    price_increment: Price,
+    minimum_price: Decimal,
+    maximum_price: Decimal,
+    minimum_market_cap: Decimal,
+    minimum_average_daily_turnover: Decimal,
+    minimum_daily_amplitude_pct: Decimal,
+    minimum_daily_change_pct: Decimal,
+    maximum_daily_change_pct: Decimal,
+}
+
+impl SelectorRules {
+    /// 解析并交叉校验盘前筛选范围，避免空池或反向区间被提交给 Longbridge
+    fn from_settings(
+        settings: &UniverseSettings,
+        direction: TradeDirection,
+    ) -> anyhow::Result<Self> {
+        let price_increment =
+            parse_config_value("universe.price_increment", &settings.price_increment)?;
+        let minimum_price = parse_config_value("universe.minimum_price", &settings.minimum_price)?;
+        let maximum_price = parse_config_value("universe.maximum_price", &settings.maximum_price)?;
+        let minimum_market_cap =
+            parse_config_value("universe.minimum_market_cap", &settings.minimum_market_cap)?;
+        let minimum_average_daily_turnover = parse_config_value(
+            "universe.minimum_average_daily_turnover",
+            &settings.minimum_average_daily_turnover,
+        )?;
+        let minimum_daily_amplitude_pct = parse_config_value(
+            "universe.minimum_daily_amplitude_pct",
+            &settings.minimum_daily_amplitude_pct,
+        )?;
+        let minimum_daily_change_pct = parse_config_value(
+            "universe.minimum_daily_change_pct",
+            &settings.minimum_daily_change_pct,
+        )?;
+        let maximum_daily_change_pct = parse_config_value(
+            "universe.maximum_daily_change_pct",
+            &settings.maximum_daily_change_pct,
+        )?;
+        anyhow::ensure!(
+            Price::is_positive(&price_increment),
+            "universe.price_increment must be positive",
+        );
+        anyhow::ensure!(
+            minimum_price > Decimal::ZERO && maximum_price > minimum_price,
+            "universe price range must satisfy 0 < minimum_price < maximum_price",
+        );
+        anyhow::ensure!(
+            minimum_market_cap > Decimal::ZERO
+                && minimum_average_daily_turnover > Decimal::ZERO
+                && minimum_daily_amplitude_pct > Decimal::ZERO,
+            "universe liquidity and amplitude minimums must be positive",
+        );
+        anyhow::ensure!(
+            minimum_daily_change_pct > Decimal::ZERO
+                && maximum_daily_change_pct > minimum_daily_change_pct,
+            "universe daily change range must satisfy 0 < minimum < maximum",
+        );
+        anyhow::ensure!(
+            (1..=100).contains(&settings.candidate_count_per_side),
+            "universe.candidate_count_per_side must be between 1 and 100",
+        );
+        let query_count = if direction == TradeDirection::Both {
+            2
+        } else {
+            1
+        };
+        anyhow::ensure!(
+            settings.max_symbols
+                <= usize::try_from(settings.candidate_count_per_side)? * query_count,
+            "universe.max_symbols exceeds the configured screener candidate capacity",
+        );
+        Ok(Self {
+            max_symbols: settings.max_symbols,
+            candidate_count_per_side: settings.candidate_count_per_side,
+            price_increment,
+            minimum_price,
+            maximum_price,
+            minimum_market_cap,
+            minimum_average_daily_turnover,
+            minimum_daily_amplitude_pct,
+            minimum_daily_change_pct,
+            maximum_daily_change_pct,
+        })
+    }
+}
+
+/// 为多头或空头候选构造 Longbridge 自定义筛选条件；方向仅影响昨日涨跌幅区间
+fn screener_conditions(rules: &SelectorRules, side: OrderSide) -> Vec<ScreenerCondition> {
+    let condition = |key: &str, min: Decimal, max: Option<Decimal>| ScreenerCondition {
+        key: key.to_string(),
+        min: min.to_string(),
+        max: max.map_or_else(String::new, |value| value.to_string()),
+        ..Default::default()
+    };
+    let (change_min, change_max) = match side {
+        OrderSide::Buy => (
+            rules.minimum_daily_change_pct,
+            rules.maximum_daily_change_pct,
+        ),
+        OrderSide::Sell => (
+            -rules.maximum_daily_change_pct,
+            -rules.minimum_daily_change_pct,
+        ),
+        _ => unreachable!("SLC selector only supports buy or sell side bias"),
+    };
+    vec![
+        condition("marketcap", rules.minimum_market_cap, None),
+        condition("prevclose", rules.minimum_price, Some(rules.maximum_price)),
+        condition(
+            "onemonthbalance",
+            rules.minimum_average_daily_turnover,
+            None,
+        ),
+        condition("amplitude", rules.minimum_daily_amplitude_pct, None),
+        condition("prevchg", change_min, Some(change_max)),
+    ]
+}
+
+/// 把 Longbridge JSON 数值无损转成 Decimal；字符串和 JSON number 两种响应形态均支持
+fn decimal_json_field(value: &serde_json::Value, field: &str) -> anyhow::Result<Decimal> {
+    let raw = value
+        .get(field)
+        .or_else(|| {
+            value
+                .get("indicators")?
+                .as_array()?
+                .iter()
+                .find(|indicator| {
+                    indicator.get("key").and_then(serde_json::Value::as_str) == Some(field)
+                })?
+                .get("value")
+        })
+        .with_context(|| format!("Longbridge screener item is missing {field}"))?;
+    let raw = raw
+        .as_str()
+        .map_or_else(|| raw.to_string(), ToString::to_string);
+    parse_config_value(&format!("Longbridge screener {field}"), &raw)
+}
+
+/// 校验并解析筛选响应，再按绝对涨跌幅、振幅、月均成交额和 symbol 稳定排序
+fn parse_screener_candidates(
+    response: &ScreenerSearchResponse,
+    side: OrderSide,
+) -> anyhow::Result<Vec<ScreenerCandidate>> {
+    if let Some(market) = response
+        .data
+        .get("market")
+        .and_then(serde_json::Value::as_str)
+    {
+        anyhow::ensure!(
+            market.eq_ignore_ascii_case("US"),
+            "Longbridge screener returned non-US market {market:?}",
+        );
+    }
+    let items = response
+        .data
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("Longbridge screener response is missing items")?;
+    let mut symbols = BTreeSet::new();
+    let mut candidates = Vec::with_capacity(items.len());
+    for item in items {
+        let symbol = if let Some(symbol) = item.get("symbol").and_then(serde_json::Value::as_str) {
+            symbol.trim().to_string()
+        } else {
+            let counter_id = item
+                .get("counter_id")
+                .and_then(serde_json::Value::as_str)
+                .with_context(|| {
+                    format!("Longbridge screener item is missing symbol/counter_id: {item}")
+                })?;
+            let mut parts = counter_id.split('/');
+            let _security_type = parts.next();
+            let market = parts.next();
+            let ticker = parts.next();
+            anyhow::ensure!(
+                market == Some("US") && ticker.is_some_and(|value| !value.is_empty()),
+                "invalid Longbridge US screener counter_id {counter_id:?}",
+            );
+            anyhow::ensure!(
+                parts.next().is_none(),
+                "unexpected Longbridge screener counter_id {counter_id:?}",
+            );
+            format!("{}.US", ticker.expect("ticker checked above"))
+        };
+        anyhow::ensure!(
+            symbol.ends_with(".US"),
+            "Longbridge US screener returned invalid symbol {symbol:?}",
+        );
+        if !symbols.insert(symbol.clone()) {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        candidates.push(ScreenerCandidate {
+            symbol,
+            name,
+            side,
+            previous_change_pct: decimal_json_field(item, "prevchg")?,
+            daily_amplitude_pct: decimal_json_field(item, "amplitude")?,
+            average_daily_turnover: decimal_json_field(item, "onemonthbalance")?,
+            market_cap: decimal_json_field(item, "marketcap")?,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .previous_change_pct
+            .abs()
+            .cmp(&left.previous_change_pct.abs())
+            .then_with(|| right.daily_amplitude_pct.cmp(&left.daily_amplitude_pct))
+            .then_with(|| {
+                right
+                    .average_daily_turnover
+                    .cmp(&left.average_daily_turnover)
+            })
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+    Ok(candidates)
+}
+
+/// 双向模式按多空交替取样，单向模式顺序截断；任一方向不足时自动由另一方向补足
+fn select_balanced_candidates(
+    longs: Vec<ScreenerCandidate>,
+    shorts: Vec<ScreenerCandidate>,
+    direction: TradeDirection,
+    max_symbols: usize,
+) -> Vec<ScreenerCandidate> {
+    let mut selected = Vec::with_capacity(max_symbols);
+    let mut longs = longs.into_iter();
+    let mut shorts = shorts.into_iter();
+    while selected.len() < max_symbols {
+        let before = selected.len();
+        if direction != TradeDirection::Short
+            && let Some(candidate) = longs.next()
+        {
+            selected.push(candidate);
+        }
+        if selected.len() < max_symbols
+            && direction != TradeDirection::Long
+            && let Some(candidate) = shorts.next()
+        {
+            selected.push(candidate);
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    selected
 }
 
 /// 把字符串配置解析成精确领域类型，并在错误中保留 TOML 字段名和原始值
@@ -872,18 +1284,6 @@ fn resolve_config_path(config_path: &Path, configured_path: &Path) -> PathBuf {
             .unwrap_or_else(|| Path::new("."))
             .join(configured_path)
     }
-}
-
-/// 在允许示例路由真实订单前要求第二道完全匹配的人工确认字符串
-fn validate_live_guard(papertrading: bool, live_ack: Option<&str>) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        papertrading || live_ack == Some(LIVE_ACK),
-        concat!(
-            "live trading requires longbridge.live_order_ack=",
-            "I_UNDERSTAND_LIVE_ORDERS",
-        ),
-    );
-    Ok(())
 }
 
 /// 4 小时确认 pivot 推导出的方向许可，不直接代表 5 分钟入场信号
@@ -5346,10 +5746,230 @@ fn config_path_from_args() -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
-/// 根据命令行模式选择实盘或历史 runner，始终复用同一份 TOML 和 SLC 策略实现
-pub(super) async fn run(backtest: bool) -> anyhow::Result<()> {
+/// 根据纽约当地时间和 Longbridge 交易日历决定快照服务的交易日
+///
+/// 当日开盘前生成当天池；常规交易时段内拒绝重选，避免盘中幸存者偏差；收盘后、周末或节假日
+/// 生成下一个交易日的池。半日市使用 13:00 收盘边界。
+async fn selector_target_trading_date(
+    context: &QuoteContext,
+    now: Timestamp,
+) -> anyhow::Result<Date> {
+    let today = us_market_date(now)?;
+    let end = today
+        .checked_add(time::Duration::days(14))
+        .context("failed to build Longbridge trading-day query range")?;
+    let calendar = quote_api_call_with_retry(|| context.trading_days(Market::US, today, end))
+        .await
+        .context("failed to query upcoming US trading days from Longbridge")?;
+    let timezone = get_timezone(US_TIMEZONE)?;
+    let local = now.to_zoned(timezone);
+    let current_minute = u16::try_from(local.hour())? * 60 + u16::try_from(local.minute())?;
+    let today_is_trading = calendar.trading_days.contains(&today);
+    let today_close = if calendar.half_trading_days.contains(&today) {
+        13 * 60
+    } else {
+        RTH_CLOSE_MINUTE
+    };
+    if today_is_trading && current_minute < RTH_OPEN_MINUTE {
+        return Ok(today);
+    }
+    anyhow::ensure!(
+        !today_is_trading || current_minute >= today_close,
+        "SLC premarket selector cannot rebuild the pool during the US regular session",
+    );
+    calendar
+        .trading_days
+        .into_iter()
+        .find(|date| *date > today)
+        .context("Longbridge returned no upcoming US trading day within 14 days")
+}
+
+/// 提交一次带共享限流和有界重试的 Longbridge 自定义筛选，并解析为确定顺序的候选列表
+async fn request_screener_candidates(
+    context: &ScreenerContext,
+    rules: &SelectorRules,
+    side: OrderSide,
+) -> anyhow::Result<Vec<ScreenerCandidate>> {
+    let conditions = screener_conditions(rules, side);
+    let response = quote_api_call_with_retry(|| {
+        context.screener_search(
+            "US",
+            None,
+            conditions.clone(),
+            Vec::new(),
+            0,
+            rules.candidate_count_per_side,
+        )
+    })
+    .await
+    .with_context(|| format!("failed to request Longbridge {side:?} screener candidates"))?;
+    parse_screener_candidates(&response, side)
+}
+
+/// 用 Longbridge 静态证券信息排除粉单市场、非美元或无有效整手单位的标的
+async fn retain_supported_screener_candidates(
+    context: &QuoteContext,
+    longs: &mut Vec<ScreenerCandidate>,
+    shorts: &mut Vec<ScreenerCandidate>,
+) -> anyhow::Result<()> {
+    let symbols = longs
+        .iter()
+        .chain(shorts.iter())
+        .map(|candidate| candidate.symbol.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !symbols.is_empty(),
+        "Longbridge screener returned no candidates for the configured filters",
+    );
+    let static_info = quote_api_call_with_retry(|| context.static_info(symbols.clone()))
+        .await
+        .context("failed to validate Longbridge screener candidates with static security info")?;
+    let mut returned = BTreeSet::new();
+    let supported = static_info
+        .into_iter()
+        .filter_map(|info| {
+            returned.insert(info.symbol.clone());
+            let accepted =
+                info.board == SecurityBoard::USMain && info.currency == "USD" && info.lot_size > 0;
+            if !accepted {
+                println!(
+                    "SLC selector rejected {}: board={}, currency={}, lot_size={}",
+                    info.symbol, info.board, info.currency, info.lot_size,
+                );
+            }
+            accepted.then_some(info.symbol)
+        })
+        .collect::<BTreeSet<_>>();
+    for symbol in symbols {
+        if !returned.contains(&symbol) {
+            println!("SLC selector excluded {symbol}: Longbridge static security info was missing",);
+        }
+    }
+    longs.retain(|candidate| supported.contains(&candidate.symbol));
+    shorts.retain(|candidate| supported.contains(&candidate.symbol));
+    Ok(())
+}
+
+/// 覆盖写入一份完整 TOML 快照并同步文件内容，交易节点只能在本程序成功退出后启动
+fn write_dynamic_universe_snapshot(
+    path: &Path,
+    snapshot: &DynamicUniverseSnapshot,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create SLC dynamic universe directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let encoded = toml::to_string_pretty(snapshot)
+        .context("failed to serialize SLC dynamic universe snapshot")?;
+    let mut file = fs::File::create(path)
+        .with_context(|| format!("failed to create SLC dynamic universe {}", path.display()))?;
+    file.write_all(encoded.as_bytes())
+        .with_context(|| format!("failed to write SLC dynamic universe {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync SLC dynamic universe {}", path.display()))
+}
+
+/// 独立盘前选股入口：Longbridge 筛选负责候选池，SLC 策略仍负责盘中 Structure/Level/Confirmation
+async fn run_selector(config_path: &Path) -> anyhow::Result<()> {
+    let file_config = load_config_file(config_path)?;
+    let app_config = AppConfig::from_file_config(&file_config, config_path)?;
+    let rules = SelectorRules::from_settings(&file_config.universe, app_config.trade_direction)?;
+    let sdk_config = app_config.data_config().sdk_config().await?;
+    let screener_context = ScreenerContext::new(Arc::clone(&sdk_config));
+    let (quote_context, _receiver) = QuoteContext::new(sdk_config);
+    let trading_date = selector_target_trading_date(&quote_context, Timestamp::now()).await?;
+    println!(
+        "SLC premarket selector: config={}, target_trading_date={}, direction={}, configured_mode={:?}",
+        config_path.display(),
+        trading_date,
+        app_config.trade_direction,
+        app_config.universe_mode,
+    );
+
+    let mut longs = if app_config.trade_direction == TradeDirection::Short {
+        Vec::new()
+    } else {
+        request_screener_candidates(&screener_context, &rules, OrderSide::Buy).await?
+    };
+    let mut shorts = if app_config.trade_direction == TradeDirection::Long {
+        Vec::new()
+    } else {
+        if !longs.is_empty() {
+            // Longbridge screener endpoint has a tighter burst limit than market-data methods.
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+        }
+        request_screener_candidates(&screener_context, &rules, OrderSide::Sell).await?
+    };
+    println!(
+        "SLC selector candidates received: long={}, short={}",
+        longs.len(),
+        shorts.len(),
+    );
+    retain_supported_screener_candidates(&quote_context, &mut longs, &mut shorts).await?;
+    let selected =
+        select_balanced_candidates(longs, shorts, app_config.trade_direction, rules.max_symbols);
+    anyhow::ensure!(
+        !selected.is_empty(),
+        "Longbridge screener produced no supported SLC universe symbols",
+    );
+    let symbols = selected
+        .into_iter()
+        .map(|candidate| {
+            let side_bias = match candidate.side {
+                OrderSide::Buy => "long",
+                OrderSide::Sell => "short",
+                _ => unreachable!("SLC selector only supports buy or sell side bias"),
+            };
+            println!(
+                "SLC selector selected {}: side_bias={}, prevchg={}%, amplitude={}%, average_daily_turnover={}, market_cap={}",
+                candidate.symbol,
+                side_bias,
+                candidate.previous_change_pct,
+                candidate.daily_amplitude_pct,
+                candidate.average_daily_turnover,
+                candidate.market_cap,
+            );
+            DynamicSymbolEntry {
+                symbol: candidate.symbol,
+                name: candidate.name,
+                price_increment: rules.price_increment.to_string(),
+                side_bias: side_bias.to_string(),
+                previous_change_pct: candidate.previous_change_pct.to_string(),
+                daily_amplitude_pct: candidate.daily_amplitude_pct.to_string(),
+                average_daily_turnover: candidate.average_daily_turnover.to_string(),
+                market_cap: candidate.market_cap.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let snapshot = DynamicUniverseSnapshot {
+        trading_date: trading_date.to_string(),
+        generated_at_utc: Timestamp::now().to_string(),
+        source: "longbridge_custom_screener".to_string(),
+        trade_direction: app_config.trade_direction.to_string(),
+        symbols,
+    };
+    write_dynamic_universe_snapshot(&app_config.dynamic_pool_path, &snapshot)?;
+    println!(
+        "SLC dynamic universe ready: path={}, trading_date={}, symbols={}; set universe.mode=dynamic to use it",
+        app_config.dynamic_pool_path.display(),
+        snapshot.trading_date,
+        snapshot.symbols.len(),
+    );
+    Ok(())
+}
+
+/// 根据入口选择盘前筛选、实盘或历史 runner，三者始终复用同一份 TOML 配置
+pub(super) async fn run(backtest: bool, selector: bool) -> anyhow::Result<()> {
     let config_path = config_path_from_args()?;
-    if backtest {
+    if selector {
+        run_selector(&config_path).await
+    } else if backtest {
         run_backtest(&config_path).await
     } else {
         run_live(&config_path).await
@@ -5493,8 +6113,21 @@ async fn run_backtest(config_path: &Path) -> anyhow::Result<()> {
 
 /// 在构建带 reconciliation 的实盘节点前准备全部 symbol，任何一个失败都阻止整体启动
 async fn run_live(config_path: &Path) -> anyhow::Result<()> {
-    let config = AppConfig::load(config_path, true)?;
+    let config = AppConfig::load(config_path)?;
     log::info!("SLC configuration loaded from {}", config_path.display());
+    log::info!(
+        "SLC universe loaded: mode={:?}, symbols={}, dynamic_pool_path={}",
+        config.universe_mode,
+        config.instruments.len(),
+        config.dynamic_pool_path.display(),
+    );
+    if config.papertrading {
+        log::info!("SLC order routing: papertrading=true, Longbridge paper account");
+    } else {
+        log::warn!(
+            "SLC order routing: papertrading=false, Longbridge live account; orders use real capital"
+        );
+    }
     let account_risk = Arc::new(AccountRisk::load(config.risk_state_path.clone())?);
     let run_statistics = Arc::new(Mutex::new(RunStatistics::default()));
     log::info!(
@@ -6005,11 +6638,115 @@ open_updated = true
         );
     }
 
+    #[test]
+    fn dynamic_pool_snapshot_is_dated_directional_and_bounded() {
+        let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
+        let now = Timestamp::now();
+        let trading_date = us_market_date(now).unwrap().to_string();
+        let path = env::temp_dir().join(format!(
+            "nautilus-slc-dynamic-universe-{}-{}.toml",
+            std::process::id(),
+            UnixNanos::from(now).as_u64(),
+        ));
+        file.universe.dynamic_pool_path = path.clone();
+        let snapshot = DynamicUniverseSnapshot {
+            trading_date: trading_date.clone(),
+            generated_at_utc: now.to_string(),
+            source: "longbridge_custom_screener".to_string(),
+            trade_direction: "both".to_string(),
+            symbols: vec![DynamicSymbolEntry {
+                symbol: "QQQ.US".to_string(),
+                name: "Invesco QQQ Trust".to_string(),
+                price_increment: "0.01".to_string(),
+                side_bias: "long".to_string(),
+                previous_change_pct: "1.2".to_string(),
+                daily_amplitude_pct: "2.1".to_string(),
+                average_daily_turnover: "1000000".to_string(),
+                market_cap: "1000000000".to_string(),
+            }],
+        };
+        write_dynamic_universe_snapshot(&path, &snapshot).unwrap();
+
+        let symbols = load_dynamic_symbol_pool(
+            &file.universe,
+            Path::new(DEFAULT_CONFIG_PATH),
+            &trading_date,
+            TradeDirection::Both,
+        )
+        .unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].symbol, "QQQ.US");
+        assert!(
+            load_dynamic_symbol_pool(
+                &file.universe,
+                Path::new(DEFAULT_CONFIG_PATH),
+                "2000-01-01",
+                TradeDirection::Both,
+            )
+            .is_err()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn both_direction_selector_interleaves_long_and_short_candidates() {
+        let candidate = |symbol: &str, side: OrderSide| ScreenerCandidate {
+            symbol: symbol.to_string(),
+            name: symbol.to_string(),
+            side,
+            previous_change_pct: Decimal::ONE,
+            daily_amplitude_pct: Decimal::ONE,
+            average_daily_turnover: Decimal::ONE,
+            market_cap: Decimal::ONE,
+        };
+        let selected = select_balanced_candidates(
+            vec![
+                candidate("LONG1.US", OrderSide::Buy),
+                candidate("LONG2.US", OrderSide::Buy),
+            ],
+            vec![
+                candidate("SHORT1.US", OrderSide::Sell),
+                candidate("SHORT2.US", OrderSide::Sell),
+            ],
+            TradeDirection::Both,
+            3,
+        );
+
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].side, OrderSide::Buy);
+        assert_eq!(selected[1].side, OrderSide::Sell);
+        assert_eq!(selected[2].side, OrderSide::Buy);
+    }
+
+    #[test]
+    fn longbridge_screener_wire_shape_parses_counter_and_indicators() {
+        let response = ScreenerSearchResponse {
+            data: serde_json::json!({
+                "items": [{
+                    "counter_id": "ST/US/NVDA",
+                    "name": "NVIDIA",
+                    "indicators": [
+                        {"key": "prevchg", "value": "2.5"},
+                        {"key": "amplitude", "value": "3.2"},
+                        {"key": "onemonthbalance", "value": "1000000"},
+                        {"key": "marketcap", "value": "5000000000"},
+                    ],
+                }],
+            }),
+        };
+
+        let candidates = parse_screener_candidates(&response, OrderSide::Buy).unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].symbol, "NVDA.US");
+        assert_eq!(candidates[0].previous_change_pct, Decimal::new(25, 1));
+    }
+
     #[rstest::rstest]
     fn example_toml_contains_a_complete_valid_configuration() {
         let file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
-        let config =
-            AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH), false).unwrap();
+        let config = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap();
 
         assert_eq!(config.instruments.len(), file.symbols.len());
         assert!(!config.instruments.is_empty());
@@ -6019,6 +6756,7 @@ open_updated = true
         assert_eq!(config.max_order_notional, Decimal::from(20_000));
         assert_eq!(config.per_position_notional_limit(), Decimal::from(20_000));
         assert_eq!(config.trade_direction, TradeDirection::Both);
+        assert_eq!(config.universe_mode, UniverseMode::Fixed);
         assert!(config.papertrading);
 
         let backtest = SlcBacktestConfig::load(Path::new(DEFAULT_CONFIG_PATH)).unwrap();
@@ -6028,10 +6766,13 @@ open_updated = true
     }
 
     #[rstest::rstest]
-    fn test_live_guard_requires_explicit_acknowledgement() {
-        assert!(validate_live_guard(true, None).is_ok());
-        assert!(validate_live_guard(false, None).is_err());
-        assert!(validate_live_guard(false, Some(LIVE_ACK)).is_ok());
+    fn test_papertrading_false_routes_execution_to_live_account() {
+        let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
+        file.longbridge.papertrading = false;
+        let config = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap();
+
+        assert!(!config.papertrading);
+        assert!(!execution_config(&config).papertrading);
     }
 
     #[rstest::rstest]

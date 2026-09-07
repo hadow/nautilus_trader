@@ -18,6 +18,7 @@ cargo run -p nautilus-longbridge --features examples --example longbridge-data-t
 cargo run -p nautilus-longbridge --features examples --example longbridge-exec-tester
 cargo run -p nautilus-longbridge --features examples --example longbridge-grid-mm
 cargo run -p nautilus-longbridge --features examples --example longbridge-range-fakeout-backtest
+cargo run -p nautilus-longbridge --features examples --example longbridge-slc-selector
 cargo run -p nautilus-longbridge --features examples --example longbridge-slc-backtest
 cargo run -p nautilus-longbridge --features examples --example longbridge-slc-trader
 ```
@@ -37,9 +38,19 @@ and routing settings, strategy, risk, session, warmup, backtest and symbols are 
 different TOML as the sole program argument when needed:
 
 ```bash
+cargo run -p nautilus-longbridge --features examples --example longbridge-slc-selector -- /path/to/slc.toml
 cargo run -p nautilus-longbridge --features examples --example longbridge-slc-trader -- /path/to/slc.toml
 cargo run -p nautilus-longbridge --features examples --example longbridge-slc-backtest -- /path/to/slc.toml
 ```
+
+The selector is a separate premarket process. It screens Longbridge US-main-board equities by the
+configured price, market-cap, average-turnover, amplitude and prior-day change ranges, validates
+static metadata, balances long/short candidates, and writes a dated TOML snapshot. Set
+`universe.mode = "dynamic"` for the live trader to require that day's snapshot, or keep `"fixed"`
+to use the explicit `[[symbols]]` list. A missing, stale, wrong-direction, or malformed dynamic
+snapshot stops startup instead of falling back. The selector and trader must not run concurrently,
+because one account is allowed only one Longbridge quote connection. Historical backtests always
+use `[[symbols]]`; faithfully testing dynamic selection requires point-in-time screener snapshots.
 
 The OAuth public client ID is read from the TOML, while OAuth tokens remain in the official SDK's
 local secure storage. The example defaults to Longbridge paper trading and creates one strategy per
@@ -72,11 +83,11 @@ positions owned by other strategies remain outside this ledger, so use an isolat
 
 At INFO level it reports per-symbol warmup counts, finalized 5-minute OHLCV and indicators, 4-hour
 structure trends, active zone counts, data readiness, account risk, orders, exits and realized P&L.
-Live routing requires both `longbridge.papertrading = false` and
-`longbridge.live_order_ack = "I_UNDERSTAND_LIVE_ORDERS"` in the TOML. Reconciled strategy exposure
-is flattened before new entries are accepted, and managed stop keeps reconciling orders and
-positions during shutdown. Paper-test the strategy and inspect the broker account after every
-shutdown; profitability and a flat shutdown state cannot be guaranteed.
+`longbridge.papertrading = true` routes orders to the paper account; `false` routes them directly
+to the live account. Reconciled strategy exposure is flattened before new entries are accepted,
+and managed stop keeps reconciling orders and positions during shutdown. Paper-test the strategy
+and inspect the broker account after every shutdown; profitability and a flat shutdown state cannot
+be guaranteed.
 
 Python tester nodes are available in
 [`examples/live/longbridge`](../../../examples/live/longbridge). The tester examples register an

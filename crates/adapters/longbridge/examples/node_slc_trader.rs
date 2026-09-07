@@ -17,5 +17,5 @@ mod slc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    slc::run(false).await
+    slc::run(false, false).await
 }

@@ -83,6 +83,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 nautilus-trading = { workspace = true }
 
 rstest = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true, features = ["display"] }
 
 [[example]]
@@ -118,6 +119,12 @@ doc = false
 [[example]]
 name = "longbridge-slc-backtest"
 path = "examples/node_slc_backtest.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-slc-selector"
+path = "examples/node_slc_selector.rs"
 required-features = ["examples"]
 doc = false
 
