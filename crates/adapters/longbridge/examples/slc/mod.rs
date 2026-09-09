@@ -30,8 +30,9 @@
 //!    近期顶部的 Supply 保持最小离开时间后可首次回测；过早回访直接失效。其他强位移区域必须
 //!    先完成一次破位收复。区域取位移前最后一根反向 K 线完整高低区间，趋势改变时丢弃旧 level。
 //! 3. **Confirmation（确认）**：价格进入有效区域后开启有限确认窗口，要求 Stochastics %K
-//!    曾进入 20/80 极值区并重新穿越阈值。上涨结构只允许 demand 做多，下跌结构只允许
-//!    supply 做空；确认 Bar 收盘后立即产生入场信号。
+//!    曾进入 20/80 极值区并重新穿越阈值，且确认收盘价仍位于 level 的配置 ATR 距离内。
+//!    上涨结构只允许 demand 做多，下跌结构只允许 supply 做空；超过空间限制的回穿会作废，
+//!    防止把离开 level 后的滞后指标信号误当成有效确认。
 //!
 //! 这种分层设计把“方向、位置、触发”分开，避免仅因指标超买超卖就逆势入场。所有判断只消费
 //! 已完成 Bar；实时订阅收到同一时间戳的多次更新时，必须等下一根 Bar 出现才确认上一根，防止
@@ -40,13 +41,18 @@
 //!
 //! # 订单与风险模型
 //!
-//! 每个 symbol 创建独立策略实例和信号状态，多个实例只共享账户风险账本。信号出现后提交仅保留
-//! 一根 5 分钟 Bar 的可成交限价单；数量按照“最坏允许入场价到区域止损”的每股风险计算，并受
-//! 整手、最大数量、单仓名义金额、账户总名义金额、最大持仓数和开放风险共同约束。
+//! 每个 symbol 创建独立策略实例和信号状态，多个实例共享账户风险账本与短时信号归集器。同一根
+//! 5 分钟 K 线的候选先按 Reclaimed、Fresh、symbol 排序，再占用共享仓位；选中的入场单仅保留
+//! 一根 5 分钟 Bar。初始止损可选择 level 创建/入场时较大 ATR 的波动下限、
+//! 最近若干根已完成 5 分钟 K 线完整高低区间的配置倍数，或同时使用两者的
+//! 混合模型；最终仍取区域远端与波动下限中更远者，避免止损落回结构失效位之内。
+//! 数量按照最坏允许入场价到该止损的每股风险计算，
+//! 并受整手、最大数量、单仓名义金额、账户总名义金额、最大持仓数和开放风险共同约束。
 //!
 //! 实盘每一次部分成交都会立即创建券商托管的 Longbridge Market-If-Touched 止损。2R 目标按
 //! 实际平均成交价重新计算，由可立即成交的一档 bid/ask 触发撤单后市价平仓；已完成 5 分钟 Bar
-//! 仅作遗漏报价时的补偿。回测为每次成交提交 OUO 保护组合。
+//! 仅作遗漏报价时的补偿。为避免显著浮盈在尾盘全部回吐，价格曾到达配置的 R 触发线后，
+//! 回落到保护线会执行管理式平仓。回测为每次成交提交 OUO 保护组合。
 //! 实盘目标依赖本地进程和行情连接，因此当前实现不能等同于券商原子 bracket order。
 //!
 //! # 回测解释边界
@@ -55,6 +61,9 @@
 //! 及真实止损滑点。保守统计额外扣除每股往返成本，假设入场成交在允许的最差限价，并把同一根
 //! Bar 同时触及止损与目标的未知路径按亏损处理。Sharpe、年化收益和 Calmar 仍然只是给定样本
 //! 的估计值，不能证明未来收益。
+//! 每笔平仓另输出目标、入场 ATR、MFE、估算成本和净边际的百分比/bps，并把前方最近反向 level
+//! 距离换算为 R。剩余日振幅使用最近五个可用完整交易日的平均高低差，扣除入场时当日已走高低
+//! 差；历史或对向 level 不足时输出 `n/a`。这些经济性指标只用于诊断，不参与信号和订单决策。
 //!
 //! # 运行方式
 //!
@@ -66,7 +75,8 @@
 //! 配置；OAuth token 仍由官方 SDK 的本地安全存储管理。若要使用其他配置文件，在命令后
 //! 添加文件路径，例如 `cargo run ... -- /path/to/slc.toml`。盘前选择器生成带目标交易日的
 //! 动态池；`universe.mode = "fixed"` 使用配置内固定池，`dynamic` 要求实盘加载匹配当天与
-//! 交易方向的动态快照。回测始终使用固定池，避免使用当前快照造成历史前视偏差。
+//! 交易方向的动态快照。回测始终使用固定池，避免使用当前快照造成历史前视偏差。港股使用
+//! `examples/slc_hk_symbols.toml`，当前安全边界为固定主板股票池、只做多，并在午休前平仓。
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -93,7 +103,7 @@ use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
 };
-use nautilus_common::{actor::DataActor, enums::Environment, live::get_runtime};
+use nautilus_common::{actor::DataActor, enums::Environment, live::get_runtime, timer::TimeEvent};
 use nautilus_core::{
     UUID4, UnixNanos,
     datetime::get_timezone,
@@ -136,7 +146,10 @@ use nautilus_trading::{
     nautilus_strategy,
     strategy::{Strategy, StrategyConfig, StrategyCore},
 };
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::{
+    Decimal,
+    prelude::{FromPrimitive, ToPrimitive},
+};
 use serde::{Deserialize, Serialize};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use ustr::Ustr;
@@ -146,18 +159,97 @@ const ACCOUNT_ID: &str = "LONGBRIDGE-001";
 const NODE_NAME: &str = "LONGBRIDGE-SLC-001";
 const STRATEGY_ID: &str = "SLC-001";
 const US_TIMEZONE: &str = "America/New_York";
+const HK_TIMEZONE: &str = "Asia/Hong_Kong";
 const RTH_OPEN_MINUTE: u16 = 9 * 60 + 30;
 const RTH_CLOSE_MINUTE: u16 = 16 * 60;
+const HK_LUNCH_START_MINUTE: u16 = 12 * 60;
+const HK_LUNCH_END_MINUTE: u16 = 13 * 60;
 const FIVE_MINUTES: u16 = 5;
 const FIVE_MINUTE_NANOS: u64 = 5 * 60 * 1_000_000_000;
+const NANOSECONDS_PER_MILLISECOND: u64 = 1_000_000;
 const FOUR_HOUR_NANOS: u64 = 4 * 60 * 60 * 1_000_000_000;
 const HISTORY_CHUNK_DAYS: i64 = 7;
 const TRADING_DAYS_CHUNK_DAYS: i64 = 28;
+const LIQUIDITY_WINDOW_START_MINUTE: u16 = 11 * 60 + 30;
+const LIQUIDITY_WINDOW_END_MINUTE: u16 = 14 * 60;
+const ECONOMIC_DAILY_RANGE_LOOKBACK: usize = 5;
 const MAX_WARMUP_AGE_NANOS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 const MAX_WARMUP_BARS: usize = 1_000;
 const DEFAULT_CONFIG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/slc_symbols.toml");
 
-/// 美股常规时段内允许入场、禁止新单和强制平仓的时间约束
+/// SLC 运行市场；集中保存时区、币种、代码后缀和交易时段差异，信号算法保持共用
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SlcMarket {
+    Us,
+    Hk,
+}
+
+impl SlcMarket {
+    fn sdk_market(self) -> Market {
+        match self {
+            Self::Us => Market::US,
+            Self::Hk => Market::HK,
+        }
+    }
+
+    fn timezone_name(self) -> &'static str {
+        match self {
+            Self::Us => US_TIMEZONE,
+            Self::Hk => HK_TIMEZONE,
+        }
+    }
+
+    fn symbol_suffix(self) -> &'static str {
+        match self {
+            Self::Us => ".US",
+            Self::Hk => ".HK",
+        }
+    }
+
+    fn currency(self) -> Currency {
+        match self {
+            Self::Us => Currency::USD(),
+            Self::Hk => Currency::HKD(),
+        }
+    }
+
+    fn half_day_close_minute(self) -> u16 {
+        match self {
+            Self::Us => 13 * 60,
+            Self::Hk => HK_LUNCH_START_MINUTE,
+        }
+    }
+
+    /// 判断 Bar 开始时刻是否处于常规连续交易；港股午休不接收新 Bar
+    fn is_regular_bar_start(self, minute: u16) -> bool {
+        match self {
+            Self::Us => (RTH_OPEN_MINUTE..RTH_CLOSE_MINUTE).contains(&minute),
+            Self::Hk => {
+                (RTH_OPEN_MINUTE..HK_LUNCH_START_MINUTE).contains(&minute)
+                    || (HK_LUNCH_END_MINUTE..RTH_CLOSE_MINUTE).contains(&minute)
+            }
+        }
+    }
+
+    fn accepts_static_info(self, board: SecurityBoard, currency: &str) -> bool {
+        match self {
+            Self::Us => board == SecurityBoard::USMain && currency == "USD",
+            Self::Hk => board == SecurityBoard::HKEquity && currency == "HKD",
+        }
+    }
+}
+
+impl Display for SlcMarket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Us => write!(f, "US"),
+            Self::Hk => write!(f, "HK"),
+        }
+    }
+}
+
+/// 当地常规时段内允许入场、禁止新单和强制平仓的时间约束
 #[derive(Clone, Copy, Debug)]
 struct SessionRules {
     entry_start_minute: u16,
@@ -167,20 +259,26 @@ struct SessionRules {
 }
 
 impl SessionRules {
-    /// 校验入场时间窗和收盘前平仓规则均位于美股常规交易时段内
-    fn validate(self) -> anyhow::Result<()> {
+    /// 校验入场时间窗和收盘前平仓规则均位于所选市场常规交易时段内
+    fn validate(self, market: SlcMarket) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.entry_start_minute >= RTH_OPEN_MINUTE,
-            "entry window must start no earlier than 09:30 New York time",
+            "entry window must start no earlier than 09:30 {market} market time",
         );
         anyhow::ensure!(
             self.entry_start_minute < self.entry_end_minute
                 && self.entry_end_minute <= RTH_CLOSE_MINUTE,
-            "entry window must be non-empty and end by 16:00 New York time",
+            "entry window must be non-empty and end by 16:00 {market} market time",
         );
         anyhow::ensure!(
-            self.flatten_before_close_minutes > 0,
-            "flatten-before-close minutes must be positive",
+            self.flatten_before_close_minutes > 0
+                && self.flatten_before_close_minutes
+                    < if market == SlcMarket::Hk {
+                        HK_LUNCH_START_MINUTE - RTH_OPEN_MINUTE
+                    } else {
+                        RTH_CLOSE_MINUTE - RTH_OPEN_MINUTE
+                    },
+            "flatten-before-close minutes must fit inside a {market} regular trading segment",
         );
         anyhow::ensure!(
             self.max_trades_per_day > 0,
@@ -232,10 +330,70 @@ impl FromStr for TradeDirection {
     }
 }
 
+/// 初始止损使用的波动距离模型；所有模型共享同一结构失效位和仓位计算路径
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopDistanceModel {
+    Atr,
+    RecentRange,
+    Hybrid,
+}
+
+impl Display for StopDistanceModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Atr => write!(f, "atr"),
+            Self::RecentRange => write!(f, "recent_range"),
+            Self::Hybrid => write!(f, "hybrid"),
+        }
+    }
+}
+
+impl FromStr for StopDistanceModel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "atr" => Ok(Self::Atr),
+            "recent_range" => Ok(Self::RecentRange),
+            "hybrid" => Ok(Self::Hybrid),
+            _ => Err("expected one of: atr, recent_range, hybrid".to_string()),
+        }
+    }
+}
+
+/// 控制首次回测与破位收复 level 是否允许产生入场信号
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignalLevelSelection {
+    All,
+    ReclaimedOnly,
+}
+
+impl Display for SignalLevelSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::All => write!(f, "all"),
+            Self::ReclaimedOnly => write!(f, "reclaimed_only"),
+        }
+    }
+}
+
+impl FromStr for SignalLevelSelection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "reclaimed_only" => Ok(Self::ReclaimedOnly),
+            _ => Err("expected one of: all, reclaimed_only".to_string()),
+        }
+    }
+}
+
 /// 从统一 TOML 加载并完成交叉校验的应用级策略配置
 #[derive(Clone, Debug)]
 struct AppConfig {
     instruments: Vec<SlcInstrument>,
+    market: SlcMarket,
     universe_mode: UniverseMode,
     dynamic_pool_path: PathBuf,
     oauth_client_id: String,
@@ -252,7 +410,15 @@ struct AppConfig {
     minimum_risk_utilization: Decimal,
     max_entry_slippage_ticks: u64,
     risk_reward: Decimal,
+    signal_level_selection: SignalLevelSelection,
+    signal_batch_delay_ms: u64,
+    profit_protection_trigger_r: Decimal,
+    profit_protection_floor_r: Decimal,
     stop_buffer_ticks: u64,
+    stop_distance_model: StopDistanceModel,
+    minimum_stop_atr_multiple: f64,
+    recent_range_lookback_bars: usize,
+    recent_range_multiple: Decimal,
     atr_period: usize,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
@@ -263,6 +429,7 @@ struct AppConfig {
     minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
+    maximum_confirmation_distance_atr: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
@@ -271,6 +438,7 @@ struct AppConfig {
     five_minute_warmup: usize,
     four_hour_warmup: usize,
     minimum_target_time_minutes: u16,
+    round_trip_cost_per_share: Decimal,
     risk_state_path: PathBuf,
     timezone: TimeZone,
     session: SessionRules,
@@ -319,6 +487,7 @@ enum UniverseMode {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UniverseSettings {
+    market: SlcMarket,
     mode: UniverseMode,
     dynamic_pool_path: PathBuf,
     max_symbols: usize,
@@ -328,6 +497,9 @@ struct UniverseSettings {
     maximum_price: String,
     minimum_market_cap: String,
     minimum_average_daily_turnover: String,
+    liquidity_lookback_days: usize,
+    minimum_average_volume_per_minute: String,
+    maximum_stale_bar_ratio: String,
     minimum_daily_amplitude_pct: String,
     minimum_daily_change_pct: String,
     maximum_daily_change_pct: String,
@@ -352,7 +524,15 @@ struct RiskSettings {
 struct SignalSettings {
     trade_direction: String,
     risk_reward: String,
+    level_selection: String,
+    batch_delay_ms: u64,
+    profit_protection_trigger_r: String,
+    profit_protection_floor_r: String,
     stop_buffer_ticks: u64,
+    stop_distance_model: String,
+    minimum_stop_atr_multiple: f64,
+    recent_range_lookback_bars: usize,
+    recent_range_multiple: String,
     atr_period: usize,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
@@ -363,6 +543,7 @@ struct SignalSettings {
     minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
+    maximum_confirmation_distance_atr: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
@@ -433,6 +614,8 @@ struct DynamicSymbolEntry {
     previous_change_pct: String,
     daily_amplitude_pct: String,
     average_daily_turnover: String,
+    average_volume_per_minute: String,
+    stale_bar_ratio: String,
     market_cap: String,
 }
 
@@ -459,19 +642,32 @@ struct ScreenerCandidate {
     market_cap: Decimal,
 }
 
+/// 历史午間 5 分鐘 Bar 的流動性連續性；缺失 Bar 會同時壓低均量並計入窒息率
+#[derive(Clone, Copy, Debug)]
+struct LiquidityContinuity {
+    average_volume_per_minute: Decimal,
+    stale_bar_ratio: Decimal,
+    observed_bars: usize,
+    expected_bars: usize,
+}
+
 impl AppConfig {
     /// 加载统一 TOML 配置，并拒绝不安全、越界或彼此矛盾的参数组合
     fn load(path: &Path) -> anyhow::Result<Self> {
         let config = load_config_file(path)?;
         let mut app_config = Self::from_file_config(&config, path)?;
         if config.universe.mode == UniverseMode::Dynamic {
+            anyhow::ensure!(
+                app_config.market == SlcMarket::Us,
+                "the Longbridge SLC dynamic selector currently supports only market=us; use universe.mode=fixed for HK",
+            );
             let symbols = load_dynamic_symbol_pool(
                 &config.universe,
                 path,
-                &us_market_date(Timestamp::now())?.to_string(),
+                &market_date(Timestamp::now(), app_config.market)?.to_string(),
                 app_config.trade_direction,
             )?;
-            app_config.instruments = parse_instruments(&symbols)?;
+            app_config.instruments = parse_instruments(&symbols, app_config.market)?;
         }
         Ok(app_config)
     }
@@ -490,7 +686,8 @@ impl AppConfig {
         );
         let papertrading = longbridge.papertrading;
 
-        let instruments = parse_instruments(&config.symbols)?;
+        let market = config.universe.market;
+        let instruments = parse_instruments(&config.symbols, market)?;
         anyhow::ensure!(
             config.universe.max_symbols > 0
                 && config.universe.max_symbols <= MAX_QUOTE_SUBSCRIPTION_SYMBOLS,
@@ -505,6 +702,10 @@ impl AppConfig {
         let risk = &config.risk;
         let trade_direction =
             parse_config_value("signal.trade_direction", &signal.trade_direction)?;
+        anyhow::ensure!(
+            market != SlcMarket::Hk || trade_direction == TradeDirection::Long,
+            "HK SLC currently requires signal.trade_direction=long because the adapter does not validate HK short-sale eligibility or borrow availability",
+        );
         let risk_amount = parse_config_value("risk.risk_amount", &risk.risk_amount)?;
         let daily_loss_limit = parse_config_value("risk.daily_loss_limit", &risk.daily_loss_limit)?;
         let max_open_risk = parse_config_value("risk.max_open_risk", &risk.max_open_risk)?;
@@ -521,6 +722,25 @@ impl AppConfig {
         )?;
         let max_entry_slippage_ticks = risk.max_entry_slippage_ticks;
         let risk_reward = parse_config_value("signal.risk_reward", &signal.risk_reward)?;
+        let signal_level_selection =
+            parse_config_value("signal.level_selection", &signal.level_selection)?;
+        let signal_batch_delay_ms = signal.batch_delay_ms;
+        let profit_protection_trigger_r = parse_config_value(
+            "signal.profit_protection_trigger_r",
+            &signal.profit_protection_trigger_r,
+        )?;
+        let profit_protection_floor_r = parse_config_value(
+            "signal.profit_protection_floor_r",
+            &signal.profit_protection_floor_r,
+        )?;
+        let stop_distance_model =
+            parse_config_value("signal.stop_distance_model", &signal.stop_distance_model)?;
+        let minimum_stop_atr_multiple = signal.minimum_stop_atr_multiple;
+        let recent_range_lookback_bars = signal.recent_range_lookback_bars;
+        let recent_range_multiple = parse_config_value(
+            "signal.recent_range_multiple",
+            &signal.recent_range_multiple,
+        )?;
         anyhow::ensure!(risk_amount > Decimal::ZERO, "risk amount must be positive");
         anyhow::ensure!(
             daily_loss_limit > Decimal::ZERO,
@@ -562,6 +782,32 @@ impl AppConfig {
             risk_reward >= Decimal::from(2),
             "SLC risk reward must be at least 2R",
         );
+        anyhow::ensure!(
+            (1..=30_000).contains(&signal_batch_delay_ms),
+            "SLC signal batch delay must be between 1 and 30000 milliseconds",
+        );
+        anyhow::ensure!(
+            (profit_protection_trigger_r == Decimal::ZERO
+                && profit_protection_floor_r == Decimal::ZERO)
+                || (profit_protection_trigger_r > Decimal::ZERO
+                    && profit_protection_floor_r >= Decimal::ZERO
+                    && profit_protection_floor_r < profit_protection_trigger_r
+                    && profit_protection_trigger_r < risk_reward),
+            "SLC profit protection must be disabled with 0/0 or satisfy 0 <= floor < trigger < target",
+        );
+        anyhow::ensure!(
+            minimum_stop_atr_multiple.is_finite()
+                && (0.0..=8.0).contains(&minimum_stop_atr_multiple),
+            "minimum stop ATR multiple must be finite and between 0 and 8",
+        );
+        anyhow::ensure!(
+            (1..=78).contains(&recent_range_lookback_bars),
+            "recent range lookback bars must be between 1 and 78",
+        );
+        anyhow::ensure!(
+            recent_range_multiple > Decimal::ZERO && recent_range_multiple <= Decimal::from(8),
+            "recent range multiple must be greater than 0 and no more than 8",
+        );
 
         let atr_period = signal.atr_period;
         let displacement_atr_multiple = signal.displacement_atr_multiple;
@@ -573,6 +819,7 @@ impl AppConfig {
         let minimum_fresh_level_age_bars = signal.minimum_fresh_level_age_bars;
         let max_zones_per_side = signal.max_zones_per_side;
         let confirmation_window_bars = signal.confirmation_window_bars;
+        let maximum_confirmation_distance_atr = signal.maximum_confirmation_distance_atr;
         let stochastic_k_period = signal.stochastic_k_period;
         let stochastic_k_smoothing = signal.stochastic_k_smoothing;
         let stochastic_d_period = signal.stochastic_d_period;
@@ -613,6 +860,12 @@ impl AppConfig {
             "confirmation window must be positive and not exceed zone TTL",
         );
         anyhow::ensure!(
+            maximum_confirmation_distance_atr.is_finite()
+                && maximum_confirmation_distance_atr > 0.0
+                && maximum_confirmation_distance_atr <= 8.0,
+            "maximum confirmation distance ATR must be finite, positive and no more than 8",
+        );
+        anyhow::ensure!(
             stochastic_k_period > 0 && stochastic_k_smoothing > 0 && stochastic_d_period > 0,
             "stochastic periods must be positive",
         );
@@ -623,11 +876,13 @@ impl AppConfig {
 
         let five_minute_warmup = config.warmup.five_minute_bars;
         let four_hour_warmup = config.warmup.four_hour_bars;
-        let minimum_five_minute_warmup = atr_period.max(
-            stochastic_k_period
-                .saturating_add(stochastic_k_smoothing)
-                .saturating_add(stochastic_d_period),
-        );
+        let minimum_five_minute_warmup = atr_period
+            .max(
+                stochastic_k_period
+                    .saturating_add(stochastic_k_smoothing)
+                    .saturating_add(stochastic_d_period),
+            )
+            .max(recent_range_lookback_bars);
         anyhow::ensure!(
             five_minute_warmup > minimum_five_minute_warmup && five_minute_warmup < MAX_WARMUP_BARS,
             "5-minute warmup must initialize ATR and stochastic periods and be less than {MAX_WARMUP_BARS}",
@@ -643,11 +898,19 @@ impl AppConfig {
             flatten_before_close_minutes: config.session.flatten_before_close_minutes,
             max_trades_per_day: config.session.max_trades_per_day,
         };
-        session.validate()?;
+        session.validate(market)?;
         let minimum_target_time_minutes = signal.minimum_target_time_minutes;
         anyhow::ensure!(
             minimum_target_time_minutes > 0,
             "minimum target time minutes must be positive",
+        );
+        let round_trip_cost_per_share = parse_config_value(
+            "backtest.round_trip_cost_per_share",
+            &config.backtest.round_trip_cost_per_share,
+        )?;
+        anyhow::ensure!(
+            round_trip_cost_per_share >= Decimal::ZERO,
+            "backtest.round_trip_cost_per_share must be non-negative",
         );
         let configured_risk_state_path = if papertrading {
             &longbridge.paper_risk_state_path
@@ -658,6 +921,7 @@ impl AppConfig {
 
         Ok(Self {
             instruments,
+            market,
             universe_mode: config.universe.mode,
             dynamic_pool_path,
             oauth_client_id,
@@ -674,7 +938,15 @@ impl AppConfig {
             minimum_risk_utilization,
             max_entry_slippage_ticks,
             risk_reward,
+            signal_level_selection,
+            signal_batch_delay_ms,
+            profit_protection_trigger_r,
+            profit_protection_floor_r,
             stop_buffer_ticks: signal.stop_buffer_ticks,
+            stop_distance_model,
+            minimum_stop_atr_multiple,
+            recent_range_lookback_bars,
+            recent_range_multiple,
             atr_period,
             displacement_atr_multiple,
             displacement_close_fraction,
@@ -685,6 +957,7 @@ impl AppConfig {
             minimum_fresh_level_age_bars,
             max_zones_per_side,
             confirmation_window_bars,
+            maximum_confirmation_distance_atr,
             stochastic_k_period,
             stochastic_k_smoothing,
             stochastic_d_period,
@@ -693,8 +966,9 @@ impl AppConfig {
             five_minute_warmup,
             four_hour_warmup,
             minimum_target_time_minutes,
+            round_trip_cost_per_share,
             risk_state_path,
-            timezone: get_timezone(US_TIMEZONE)?,
+            timezone: get_timezone(market.timezone_name())?,
             session,
         })
     }
@@ -748,7 +1022,6 @@ struct SlcBacktestConfig {
     starting_balance: Money,
     timeout_secs: u64,
     log_bars: bool,
-    round_trip_cost_per_share: Decimal,
     walk_forward: Option<WalkForwardSettings>,
 }
 
@@ -777,16 +1050,14 @@ impl SlcBacktestConfig {
             Money::is_positive(&starting_balance),
             "backtest.starting_balance must be positive",
         );
+        anyhow::ensure!(
+            starting_balance.currency == strategy.market.currency(),
+            "backtest.starting_balance currency must be {} for market={}",
+            strategy.market.currency(),
+            strategy.market,
+        );
         let timeout_secs = backtest.timeout_secs;
         anyhow::ensure!(timeout_secs > 0, "backtest.timeout_secs must be positive");
-        let round_trip_cost_per_share = parse_config_value(
-            "backtest.round_trip_cost_per_share",
-            &backtest.round_trip_cost_per_share,
-        )?;
-        anyhow::ensure!(
-            round_trip_cost_per_share >= Decimal::ZERO,
-            "backtest.round_trip_cost_per_share must be non-negative",
-        );
         strategy.risk_state_path = env::temp_dir().join(format!(
             "nautilus-slc-backtest-risk-{}-{}.toml",
             std::process::id(),
@@ -800,7 +1071,6 @@ impl SlcBacktestConfig {
             starting_balance,
             timeout_secs,
             log_bars: backtest.log_bars,
-            round_trip_cost_per_share,
             walk_forward: backtest.walk_forward,
         })
     }
@@ -894,6 +1164,27 @@ fn load_dynamic_symbol_pool(
         settings.max_symbols,
         snapshot.symbols.len(),
     );
+    let rules = SelectorRules::from_settings(settings, expected_direction)?;
+    for entry in &snapshot.symbols {
+        let average_volume_per_minute: Decimal = parse_config_value(
+            &format!("dynamic_pool.{}.average_volume_per_minute", entry.symbol),
+            &entry.average_volume_per_minute,
+        )?;
+        let stale_bar_ratio: Decimal = parse_config_value(
+            &format!("dynamic_pool.{}.stale_bar_ratio", entry.symbol),
+            &entry.stale_bar_ratio,
+        )?;
+        anyhow::ensure!(
+            average_volume_per_minute >= rules.minimum_average_volume_per_minute
+                && stale_bar_ratio >= Decimal::ZERO
+                && stale_bar_ratio <= rules.maximum_stale_bar_ratio,
+            "SLC dynamic universe {} contains {} below the current liquidity rules: average_volume_per_minute={}, stale_bar_ratio={}",
+            path.display(),
+            entry.symbol,
+            average_volume_per_minute,
+            stale_bar_ratio,
+        );
+    }
     anyhow::ensure!(
         snapshot
             .symbols
@@ -925,6 +1216,9 @@ struct SelectorRules {
     maximum_price: Decimal,
     minimum_market_cap: Decimal,
     minimum_average_daily_turnover: Decimal,
+    liquidity_lookback_days: usize,
+    minimum_average_volume_per_minute: Decimal,
+    maximum_stale_bar_ratio: Decimal,
     minimum_daily_amplitude_pct: Decimal,
     minimum_daily_change_pct: Decimal,
     maximum_daily_change_pct: Decimal,
@@ -945,6 +1239,14 @@ impl SelectorRules {
         let minimum_average_daily_turnover = parse_config_value(
             "universe.minimum_average_daily_turnover",
             &settings.minimum_average_daily_turnover,
+        )?;
+        let minimum_average_volume_per_minute = parse_config_value(
+            "universe.minimum_average_volume_per_minute",
+            &settings.minimum_average_volume_per_minute,
+        )?;
+        let maximum_stale_bar_ratio = parse_config_value(
+            "universe.maximum_stale_bar_ratio",
+            &settings.maximum_stale_bar_ratio,
         )?;
         let minimum_daily_amplitude_pct = parse_config_value(
             "universe.minimum_daily_amplitude_pct",
@@ -969,8 +1271,17 @@ impl SelectorRules {
         anyhow::ensure!(
             minimum_market_cap > Decimal::ZERO
                 && minimum_average_daily_turnover > Decimal::ZERO
+                && minimum_average_volume_per_minute > Decimal::ZERO
                 && minimum_daily_amplitude_pct > Decimal::ZERO,
             "universe liquidity and amplitude minimums must be positive",
+        );
+        anyhow::ensure!(
+            (1..=10).contains(&settings.liquidity_lookback_days),
+            "universe.liquidity_lookback_days must be between 1 and 10",
+        );
+        anyhow::ensure!(
+            maximum_stale_bar_ratio >= Decimal::ZERO && maximum_stale_bar_ratio < Decimal::ONE,
+            "universe.maximum_stale_bar_ratio must be between 0 inclusive and 1 exclusive",
         );
         anyhow::ensure!(
             minimum_daily_change_pct > Decimal::ZERO
@@ -978,7 +1289,7 @@ impl SelectorRules {
             "universe daily change range must satisfy 0 < minimum < maximum",
         );
         anyhow::ensure!(
-            (1..=100).contains(&settings.candidate_count_per_side),
+            (1..=1000).contains(&settings.candidate_count_per_side),
             "universe.candidate_count_per_side must be between 1 and 100",
         );
         let query_count = if direction == TradeDirection::Both {
@@ -999,6 +1310,9 @@ impl SelectorRules {
             maximum_price,
             minimum_market_cap,
             minimum_average_daily_turnover,
+            liquidity_lookback_days: settings.liquidity_lookback_days,
+            minimum_average_volume_per_minute,
+            maximum_stale_bar_ratio,
             minimum_daily_amplitude_pct,
             minimum_daily_change_pct,
             maximum_daily_change_pct,
@@ -1206,8 +1520,11 @@ fn parse_decimal_grid(configured: &[String]) -> anyhow::Result<Vec<Decimal>> {
     Ok(values)
 }
 
-/// 把配置项转换成唯一的 Longbridge 美股 InstrumentId，并校验精确且为正的价格步长
-fn parse_instruments(configured: &[SymbolConfigEntry]) -> anyhow::Result<Vec<SlcInstrument>> {
+/// 把配置项转换成所选市场唯一的 Longbridge InstrumentId，并校验代码后缀与价格步长
+fn parse_instruments(
+    configured: &[SymbolConfigEntry],
+    market: SlcMarket,
+) -> anyhow::Result<Vec<SlcInstrument>> {
     anyhow::ensure!(
         !configured.is_empty(),
         "symbols must contain at least one instrument",
@@ -1221,16 +1538,20 @@ fn parse_instruments(configured: &[SymbolConfigEntry]) -> anyhow::Result<Vec<Slc
     for entry in configured {
         let symbol = entry.symbol.trim();
         anyhow::ensure!(
-            symbol.ends_with(".US"),
-            "SLC live example currently requires a Longbridge US symbol such as QQQ.US: {symbol}",
+            symbol.ends_with(market.symbol_suffix()),
+            "SLC market={market} requires a Longbridge symbol ending in {}: {symbol}",
+            market.symbol_suffix(),
         );
         let instrument_id: InstrumentId = format!("{symbol}.LONGBRIDGE")
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid Longbridge symbol {symbol:?}: {e}"))?;
         anyhow::ensure!(
             instrument_id.venue.as_str() == "LONGBRIDGE"
-                && instrument_id.symbol.as_str().ends_with(".US"),
-            "SLC live example currently requires US equities on venue LONGBRIDGE: {instrument_id}",
+                && instrument_id
+                    .symbol
+                    .as_str()
+                    .ends_with(market.symbol_suffix()),
+            "SLC market={market} requires matching equities on venue LONGBRIDGE: {instrument_id}",
         );
         anyhow::ensure!(
             !instruments
@@ -1371,6 +1692,25 @@ impl PivotStructure {
             Trend::Neutral
         }
     }
+
+    /// 返回交易方向前方最近的已确认 4 小时 pivot，供经济空间统计使用
+    fn opposing_level(&self, side: OrderSide, entry: Price) -> Option<Price> {
+        match side {
+            OrderSide::Buy => self
+                .highs
+                .iter()
+                .copied()
+                .filter(|price| *price > entry)
+                .min(),
+            OrderSide::Sell => self
+                .lows
+                .iter()
+                .copied()
+                .filter(|price| *price < entry)
+                .max(),
+            OrderSide::NoOrderSide => None,
+        }
+    }
 }
 
 /// 仅保留结构分类所需的最近两个确认 pivot，避免历史状态无界增长
@@ -1486,13 +1826,15 @@ impl Zone {
     /// 状态转换遵循以下约束：首次有效破位只把区域标记为 `BrokenOnce`，待价格从反方向完整
     /// 收复后才允许作为 `Reclaimed` 再次回测；非近期极值只跳过 Fresh 入场，仍可等待一次破位
     /// 收复。可 Fresh 入场的 Level 若过早回访则直接失效，表示价格没有真正离开。收复后的再次
-    /// 破位、确认超时或超过 TTL 都会删除区域。只有趋势、方向和随机指标回穿成立才返回信号。
+    /// 破位、确认超时或超过 TTL 都会删除区域。只有趋势、方向、随机指标回穿和确认收盘价到
+    /// level 的 ATR 归一化距离同时成立才返回信号。
     fn observe(
         &mut self,
         bar: Bar,
         confirmation: Confirmation,
         allow_entry: bool,
         side: OrderSide,
+        current_atr: f64,
         rules: SignalRules,
     ) -> ZoneObservation {
         self.age += 1;
@@ -1525,7 +1867,11 @@ impl Zone {
         }
 
         match self.state {
-            ZoneState::Fresh if self.fresh_entry_eligible && self.intersects(bar) => {
+            ZoneState::Fresh
+                if self.fresh_entry_eligible
+                    && rules.level_selection == SignalLevelSelection::All
+                    && self.intersects(bar) =>
+            {
                 self.begin_confirmation(confirmation, rules.confirmation_window_bars);
             }
             ZoneState::Reclaimed if self.intersects(bar) => {
@@ -1542,9 +1888,14 @@ impl Zone {
         }
 
         self.confirmation_armed |= confirmation.extreme;
-        let distance_atr = zone_distance_atr(*self, bar.close, self.atr_at_creation);
+        let risk_atr = self.atr_at_creation.max(current_atr);
+        let distance_atr = zone_distance_atr(*self, bar.close, risk_atr);
         let close_location = directional_close_location(bar, side);
         if allow_entry && self.confirmation_armed && confirmation.reentry {
+            if distance_atr > rules.maximum_confirmation_distance_atr {
+                return ZoneObservation::Remove;
+            }
+
             return ZoneObservation::Signal(Signal {
                 side,
                 level: if self.break_count == 0 {
@@ -1555,6 +1906,8 @@ impl Zone {
                 entry: bar.close,
                 zone_low: self.low,
                 zone_high: self.high,
+                risk_atr,
+                recent_range: None,
                 level_age_bars: u64::try_from(self.age).unwrap_or(u64::MAX),
                 confirmation_bars: u64::try_from(
                     rules.confirmation_window_bars + 1 - self.confirmation_bars_left,
@@ -1587,6 +1940,8 @@ struct Signal {
     entry: Price,
     zone_low: Price,
     zone_high: Price,
+    risk_atr: f64,
+    recent_range: Option<Decimal>,
     level_age_bars: u64,
     confirmation_bars: u64,
     confirmation_close_location: f64,
@@ -1609,6 +1964,164 @@ impl Display for SignalLevel {
             Self::Fresh => write!(f, "fresh"),
             Self::Reclaimed => write!(f, "reclaimed"),
         }
+    }
+}
+
+/// 同一根 5 分钟 K 线产生的跨标的候选及其固定归集截止时间
+#[derive(Debug)]
+struct SignalBatch {
+    deadline: UnixNanos,
+    candidates: BTreeMap<String, SignalLevel>,
+    winners: Option<BTreeSet<String>>,
+    capacity: usize,
+    decided: BTreeSet<String>,
+}
+
+/// 已完成批次之外只保留尚未决策的同时间戳候选
+#[derive(Debug, Default)]
+struct SignalArbiterState {
+    batches: HashMap<UnixNanos, SignalBatch>,
+    last_decided_signal_ts: Option<UnixNanos>,
+}
+
+/// 多标的共享的短时信号归集器，保证 Reclaimed 在 Fresh 之前竞争可用仓位
+#[derive(Debug, Default)]
+struct SignalArbiter {
+    state: Mutex<SignalArbiterState>,
+}
+
+/// 单个候选在其同时间戳批次中的稳定排序结果
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SignalArbitrationDecision {
+    selected: bool,
+    rank: usize,
+    candidates: usize,
+    capacity: usize,
+}
+
+impl SignalArbiter {
+    /// 将候选加入同时间戳批次；已完成或超过归集截止时间的迟到信号拒绝重新开批
+    fn queue(
+        &self,
+        symbol: &str,
+        level: SignalLevel,
+        signal_ts: UnixNanos,
+        now: UnixNanos,
+        delay_ms: u64,
+    ) -> anyhow::Result<Option<UnixNanos>> {
+        let delay_ns = delay_ms
+            .checked_mul(NANOSECONDS_PER_MILLISECOND)
+            .context("SLC signal batch delay overflowed nanoseconds")?;
+        let proposed_deadline = now
+            .checked_add(delay_ns)
+            .context("SLC signal batch deadline overflowed UnixNanos")?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SLC signal arbiter mutex was poisoned"))?;
+        if state
+            .last_decided_signal_ts
+            .is_some_and(|closed| signal_ts <= closed)
+        {
+            return Ok(None);
+        }
+        let batch = state
+            .batches
+            .entry(signal_ts)
+            .or_insert_with(|| SignalBatch {
+                deadline: proposed_deadline,
+                candidates: BTreeMap::new(),
+                winners: None,
+                capacity: 0,
+                decided: BTreeSet::new(),
+            });
+        if batch.deadline <= now || batch.winners.is_some() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            batch.candidates.insert(symbol.to_string(), level).is_none(),
+            "SLC signal arbiter received a duplicate candidate for {symbol} at {signal_ts}",
+        );
+        Ok(Some(batch.deadline))
+    }
+
+    /// 首次决策时按 Reclaimed、Fresh、symbol 排序并冻结赢家，后续回调只读取同一结果
+    fn decide(
+        &self,
+        symbol: &str,
+        signal_ts: UnixNanos,
+        available_slots: usize,
+    ) -> anyhow::Result<SignalArbitrationDecision> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SLC signal arbiter mutex was poisoned"))?;
+        let (decision, completed) = {
+            let batch = state
+                .batches
+                .get_mut(&signal_ts)
+                .context("SLC signal arbitration batch is missing")?;
+            let mut ranked = batch.candidates.iter().collect::<Vec<_>>();
+            ranked.sort_by(|(left_symbol, left_level), (right_symbol, right_level)| {
+                right_level
+                    .cmp(left_level)
+                    .then_with(|| left_symbol.cmp(right_symbol))
+            });
+            if batch.winners.is_none() {
+                batch.capacity = available_slots.min(ranked.len());
+                batch.winners = Some(
+                    ranked
+                        .iter()
+                        .take(batch.capacity)
+                        .map(|(symbol, _)| (*symbol).clone())
+                        .collect(),
+                );
+            }
+            let rank = ranked
+                .iter()
+                .position(|(candidate, _)| candidate.as_str() == symbol)
+                .with_context(|| format!("SLC signal candidate {symbol} is missing"))?
+                + 1;
+            anyhow::ensure!(
+                batch.decided.insert(symbol.to_string()),
+                "SLC signal candidate {symbol} was decided more than once",
+            );
+            let decision = SignalArbitrationDecision {
+                selected: batch
+                    .winners
+                    .as_ref()
+                    .is_some_and(|winners| winners.contains(symbol)),
+                rank,
+                candidates: ranked.len(),
+                capacity: batch.capacity,
+            };
+            (decision, batch.decided.len() == batch.candidates.len())
+        };
+        if completed {
+            state.batches.remove(&signal_ts);
+            state.last_decided_signal_ts = Some(
+                state
+                    .last_decided_signal_ts
+                    .map_or(signal_ts, |previous| previous.max(signal_ts)),
+            );
+        }
+        Ok(decision)
+    }
+
+    /// 定时器创建失败或策略停止时移除尚未决策的候选
+    fn cancel(&self, symbol: &str, signal_ts: UnixNanos) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SLC signal arbiter mutex was poisoned"))?;
+        let remove_batch = state.batches.get_mut(&signal_ts).is_some_and(|batch| {
+            batch.candidates.remove(symbol);
+            batch.candidates.is_empty()
+        });
+        if remove_batch {
+            state.batches.remove(&signal_ts);
+        }
+        Ok(())
     }
 }
 
@@ -1661,11 +2174,16 @@ impl FinalBarBuffer {
 /// 从应用配置提取的纯信号规则，便于同一状态机在回测和实盘中复用
 #[derive(Clone, Copy, Debug)]
 struct SignalRules {
+    market: SlcMarket,
     trade_direction: TradeDirection,
+    level_selection: SignalLevelSelection,
+    stop_distance_model: StopDistanceModel,
+    recent_range_lookback_bars: usize,
     zone_ttl_bars: usize,
     minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
+    maximum_confirmation_distance_atr: f64,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
@@ -1712,6 +2230,75 @@ impl SignalFunnel {
     }
 }
 
+/// 跟踪最近五个完整交易日及当日已消耗振幅，仅为交易经济性诊断提供只读快照
+#[derive(Debug)]
+struct DailyRangeTracker {
+    market: SlcMarket,
+    timezone: TimeZone,
+    current_date: Option<jiff::civil::Date>,
+    current_high: Option<Price>,
+    current_low: Option<Price>,
+    completed_ranges: VecDeque<Decimal>,
+}
+
+impl DailyRangeTracker {
+    /// 创建按市场常规交易时段聚合的固定五日振幅窗口
+    fn new(market: SlcMarket, timezone: TimeZone) -> Self {
+        Self {
+            market,
+            timezone,
+            current_date: None,
+            current_high: None,
+            current_low: None,
+            completed_ranges: VecDeque::with_capacity(ECONOMIC_DAILY_RANGE_LOOKBACK),
+        }
+    }
+
+    /// 更新当日高低点，并在交易日切换时保存上一完整日的绝对振幅
+    fn update(&mut self, bar: Bar) {
+        let local = bar
+            .ts_event
+            .to_datetime_utc()
+            .to_zoned(self.timezone.clone());
+        let minute = u16::try_from(local.hour()).expect("hour fits u16") * 60
+            + u16::try_from(local.minute()).expect("minute fits u16");
+        if !self.market.is_regular_bar_start(minute) {
+            return;
+        }
+        let date = local.date();
+        if self.current_date != Some(date) {
+            if let (Some(high), Some(low)) = (self.current_high, self.current_low) {
+                if self.completed_ranges.len() == ECONOMIC_DAILY_RANGE_LOOKBACK {
+                    self.completed_ranges.pop_front();
+                }
+                self.completed_ranges
+                    .push_back(high.as_decimal() - low.as_decimal());
+            }
+            self.current_date = Some(date);
+            self.current_high = None;
+            self.current_low = None;
+        }
+        self.current_high = Some(
+            self.current_high
+                .map_or(bar.high, |high| high.max(bar.high)),
+        );
+        self.current_low = Some(self.current_low.map_or(bar.low, |low| low.min(bar.low)));
+    }
+
+    /// 返回历史平均完整日振幅扣除当日已走振幅后的剩余绝对空间
+    fn remaining_range(&self) -> Option<Decimal> {
+        let (Some(high), Some(low)) = (self.current_high, self.current_low) else {
+            return None;
+        };
+        let count = u64::try_from(self.completed_ranges.len()).ok()?;
+        if count == 0 {
+            return None;
+        }
+        let average_range = self.completed_ranges.iter().sum::<Decimal>() / Decimal::from(count);
+        Some((average_range - (high.as_decimal() - low.as_decimal())).max(Decimal::ZERO))
+    }
+}
+
 /// 单个标的的 SLC 信号引擎，封装 Bar 完成、指标、结构、level 与确认状态
 ///
 /// 它只产生 `Signal`，不读取账户余额、不计算数量也不提交订单，使信号规则能在回测和实盘
@@ -1729,6 +2316,7 @@ struct SlcSignalState {
     previous_k: Option<f64>,
     demand: VecDeque<Zone>,
     supply: VecDeque<Zone>,
+    daily_range: DailyRangeTracker,
     funnel: SignalFunnel,
     rules: SignalRules,
 }
@@ -1754,7 +2342,8 @@ impl SlcSignalState {
                 StochasticsDMethod::MovingAverage,
             ),
             recent_five_minute_bars: VecDeque::with_capacity(
-                config.displacement_max_bars + config.level_extreme_lookback_bars + 1,
+                (config.displacement_max_bars + config.level_extreme_lookback_bars + 1)
+                    .max(config.recent_range_lookback_bars),
             ),
             level_trend: Trend::Neutral,
             last_demand_source: None,
@@ -1762,13 +2351,19 @@ impl SlcSignalState {
             previous_k: None,
             demand: VecDeque::with_capacity(config.max_zones_per_side),
             supply: VecDeque::with_capacity(config.max_zones_per_side),
+            daily_range: DailyRangeTracker::new(config.market, config.timezone.clone()),
             funnel: SignalFunnel::default(),
             rules: SignalRules {
+                market: config.market,
                 trade_direction: config.trade_direction,
+                level_selection: config.signal_level_selection,
+                stop_distance_model: config.stop_distance_model,
+                recent_range_lookback_bars: config.recent_range_lookback_bars,
                 zone_ttl_bars: config.zone_ttl_bars,
                 minimum_fresh_level_age_bars: config.minimum_fresh_level_age_bars,
                 max_zones_per_side: config.max_zones_per_side,
                 confirmation_window_bars: config.confirmation_window_bars,
+                maximum_confirmation_distance_atr: config.maximum_confirmation_distance_atr,
                 displacement_atr_multiple: config.displacement_atr_multiple,
                 displacement_close_fraction: config.displacement_close_fraction,
                 displacement_max_bars: config.displacement_max_bars,
@@ -1833,6 +2428,23 @@ impl SlcSignalState {
     /// 当作历史 level 使用，也避免把当前大幅波动提前计入用于判定自身的 ATR 基准。
     fn process_five_minute(&mut self, bar: Bar, allow_signal: bool) -> Option<Signal> {
         self.funnel.five_minute_bars += 1;
+        self.daily_range.update(bar);
+        let has_gap = self.recent_five_minute_bars.back().is_some_and(|previous| {
+            has_five_minute_gap(previous.ts_event, bar.ts_event, self.rules.market)
+        });
+        let recent_range = (!has_gap)
+            .then(|| {
+                recent_bar_range(
+                    &self.recent_five_minute_bars,
+                    bar,
+                    self.rules.recent_range_lookback_bars,
+                )
+            })
+            .flatten();
+        let stop_history_ready = match self.rules.stop_distance_model {
+            StopDistanceModel::Atr => true,
+            StopDistanceModel::RecentRange | StopDistanceModel::Hybrid => recent_range.is_some(),
+        };
         let atr_before = self.atr.value;
         let atr_initialized = self.atr.initialized();
         self.stochastics.handle_bar(&bar);
@@ -1868,8 +2480,12 @@ impl SlcSignalState {
             &mut self.demand,
             bar,
             long_confirmation,
-            trend == Trend::Up && allow_signal && self.rules.trade_direction.allows(OrderSide::Buy),
+            trend == Trend::Up
+                && allow_signal
+                && stop_history_ready
+                && self.rules.trade_direction.allows(OrderSide::Buy),
             OrderSide::Buy,
+            atr_before,
             self.rules,
         );
         let short_signal = observe_zones(
@@ -1878,21 +2494,20 @@ impl SlcSignalState {
             short_confirmation,
             trend == Trend::Down
                 && allow_signal
+                && stop_history_ready
                 && self.rules.trade_direction.allows(OrderSide::Sell),
             OrderSide::Sell,
+            atr_before,
             self.rules,
         );
 
-        if self
-            .recent_five_minute_bars
-            .back()
-            .is_some_and(|previous| has_five_minute_gap(previous.ts_event, bar.ts_event))
-        {
+        if has_gap {
             self.recent_five_minute_bars.clear();
         }
         self.recent_five_minute_bars.push_back(bar);
         while self.recent_five_minute_bars.len()
-            > self.rules.displacement_max_bars + self.rules.level_extreme_lookback_bars + 1
+            > (self.rules.displacement_max_bars + self.rules.level_extreme_lookback_bars + 1)
+                .max(self.rules.recent_range_lookback_bars)
         {
             self.recent_five_minute_bars.pop_front();
         }
@@ -1931,9 +2546,36 @@ impl SlcSignalState {
 
         self.atr.handle_bar(&bar);
         self.previous_k = Some(current_k);
-        let signal = long_signal.or(short_signal);
+        let signal = long_signal.or(short_signal).map(|mut signal| {
+            signal.recent_range = recent_range;
+            signal
+        });
         self.funnel.signals += u64::from(signal.is_some());
         signal
+    }
+
+    /// 返回入场方向前方最近的 5 分钟反向区域或已确认 4 小时 pivot
+    fn opposing_level(&self, side: OrderSide, entry: Price) -> Option<Price> {
+        let zone_level = match side {
+            OrderSide::Buy => self
+                .supply
+                .iter()
+                .map(|zone| zone.low)
+                .filter(|price| *price > entry)
+                .min(),
+            OrderSide::Sell => self
+                .demand
+                .iter()
+                .map(|zone| zone.high)
+                .filter(|price| *price < entry)
+                .max(),
+            OrderSide::NoOrderSide => None,
+        };
+        match (side, zone_level, self.structure.opposing_level(side, entry)) {
+            (OrderSide::Buy, Some(zone), Some(pivot)) => Some(zone.min(pivot)),
+            (OrderSide::Sell, Some(zone), Some(pivot)) => Some(zone.max(pivot)),
+            (_, zone, pivot) => zone.or(pivot),
+        }
     }
 
     /// 4 小时方向变化时丢弃旧结构下生成的 level，后续只接受新方向同侧的 level
@@ -1956,6 +2598,7 @@ fn observe_zones(
     confirmation: Confirmation,
     allow_entry: bool,
     side: OrderSide,
+    current_atr: f64,
     rules: SignalRules,
 ) -> Option<Signal> {
     let mut signal = None;
@@ -1965,6 +2608,7 @@ fn observe_zones(
             confirmation,
             allow_entry && signal.is_none(),
             side,
+            current_atr,
             rules,
         );
         match observation {
@@ -2115,6 +2759,7 @@ impl Default for AccountRiskState {
 enum RiskRejectionReason {
     ZeroQuantity,
     RiskUnderutilized,
+    ConcurrentSignalPriority,
     SymbolTradeLimit,
     AccountHalted,
     DailyLoss,
@@ -2129,6 +2774,7 @@ impl Display for RiskRejectionReason {
         match self {
             Self::ZeroQuantity => write!(f, "zero_quantity"),
             Self::RiskUnderutilized => write!(f, "risk_underutilized"),
+            Self::ConcurrentSignalPriority => write!(f, "concurrent_signal_priority"),
             Self::SymbolTradeLimit => write!(f, "symbol_trade_limit"),
             Self::AccountHalted => write!(f, "account_halted"),
             Self::DailyLoss => write!(f, "daily_loss_limit"),
@@ -2237,6 +2883,15 @@ impl AccountRisk {
             ReservationOutcome::Reserved,
             account_risk_snapshot(&state, symbol),
         ))
+    }
+
+    /// 返回当前 reservation 尚未占用的账户持仓槽位，供同时间戳信号批次冻结赢家
+    fn available_position_slots(&self, limit: usize) -> anyhow::Result<usize> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SLC account risk state mutex was poisoned"))?;
+        Ok(limit.saturating_sub(state.reservations.len()))
     }
 
     /// 未发生任何成交时释放入场 reservation，并回退该 symbol 的当日交易次数
@@ -2371,7 +3026,7 @@ fn validate_account_risk_state(state: &AccountRiskState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 切换到新的美股交易日，清零日内计数与 PnL，但保留意外隔夜敞口对应的风险预留
+/// 切换到新的当地交易日，清零日内计数与 PnL，但保留意外隔夜敞口对应的风险预留
 fn roll_account_risk_date(state: &mut AccountRiskState, date: jiff::civil::Date) {
     let date = date.to_string();
     if state.date.as_deref() == Some(date.as_str()) {
@@ -2407,9 +3062,35 @@ fn account_risk_snapshot(state: &AccountRiskState, symbol: &str) -> AccountRiskS
     }
 }
 
-/// 判断相邻常规时段 Bar 的开始时间是否并非严格相差 5 分钟
-fn has_five_minute_gap(previous: UnixNanos, current: UnixNanos) -> bool {
-    current.as_u64().saturating_sub(previous.as_u64()) != FIVE_MINUTE_NANOS
+/// 判断相邻常规时段 Bar 是否断档；港股 11:55 到 13:00 的午休是合法边界
+fn has_five_minute_gap(previous: UnixNanos, current: UnixNanos, market: SlcMarket) -> bool {
+    let elapsed = current.as_u64().saturating_sub(previous.as_u64());
+    if elapsed == FIVE_MINUTE_NANOS {
+        return false;
+    }
+    if market != SlcMarket::Hk || elapsed != 65 * 60 * 1_000_000_000 {
+        return true;
+    }
+    let hk_minute = |timestamp: UnixNanos| {
+        ((timestamp.as_u64() / 1_000_000_000 + 8 * 60 * 60) % (24 * 60 * 60) / 60) as u16
+    };
+    hk_minute(previous) != 11 * 60 + 55 || hk_minute(current) != HK_LUNCH_END_MINUTE
+}
+
+/// 计算当前确认 K 线及其前若干根连续 5 分钟 K 线的完整高低区间
+fn recent_bar_range(bars: &VecDeque<Bar>, current: Bar, lookback: usize) -> Option<Decimal> {
+    if lookback == 0 || bars.len() + 1 < lookback {
+        return None;
+    }
+    let (high, low) = bars
+        .iter()
+        .rev()
+        .take(lookback - 1)
+        .fold((current.high, current.low), |(high, low), bar| {
+            (high.max(bar.high), low.min(bar.low))
+        });
+    let range = high.as_decimal() - low.as_decimal();
+    (range > Decimal::ZERO).then_some(range)
 }
 
 /// 仅在仍有敞口且尚未发起退出时触发一次收盘前退出
@@ -2448,6 +3129,13 @@ fn directional_close_location(bar: Bar, side: OrderSide) -> f64 {
         OrderSide::Sell => (bar.high.as_f64() - bar.close.as_f64()) / range,
         OrderSide::NoOrderSide => 0.0,
     }
+}
+
+/// 返回平均平仓价相对平均入场价的市场涨跌幅百分比，缺失或无效价格不伪造结果
+fn market_price_change_pct(average_entry: f64, average_exit: Option<f64>) -> Option<f64> {
+    let average_exit = average_exit.filter(|price| price.is_finite() && *price > 0.0)?;
+    (average_entry.is_finite() && average_entry > 0.0)
+        .then_some((average_exit / average_entry - 1.0) * 100.0)
 }
 
 /// 按持仓槽位均分账户名义上限，防止首个订单耗尽其他标的的全部容量
@@ -2544,6 +3232,7 @@ fn backtest_protective_orders(
 enum TradeExitReason {
     Target,
     Stop,
+    ProfitProtection,
     PreClose,
     RiskExit,
     Mixed,
@@ -2566,6 +3255,7 @@ impl Display for TradeExitReason {
         match self {
             Self::Target => write!(f, "target"),
             Self::Stop => write!(f, "stop"),
+            Self::ProfitProtection => write!(f, "profit_protection"),
             Self::PreClose => write!(f, "pre_close"),
             Self::RiskExit => write!(f, "risk_exit"),
             Self::Mixed => write!(f, "mixed"),
@@ -2574,7 +3264,7 @@ impl Display for TradeExitReason {
     }
 }
 
-/// 一笔已关闭交易的信号质量、风险、路径和成本统计快照
+/// 一笔已关闭交易的信号质量、实际进场、风险、路径和成本统计快照
 ///
 /// 使用 `Option<Decimal>` 保留券商或引擎未提供 realized PnL 的事实，不以零值掩盖缺失数据。
 #[derive(Clone, Copy, Debug)]
@@ -2592,6 +3282,19 @@ struct ClosedTradeStatistics {
     mfe_r: Decimal,
     mae_r: Decimal,
     exit_reason: TradeExitReason,
+    average_entry_price: Decimal,
+    entry_quantity: Decimal,
+    entry_notional: Decimal,
+    risk_atr: f64,
+    recent_range: Option<Decimal>,
+    stop_distance_model: StopDistanceModel,
+    minimum_stop_atr_multiple: f64,
+    recent_range_multiple: Decimal,
+    stop_price: Price,
+    target_price: Price,
+    opposing_level: Option<Price>,
+    remaining_daily_range: Option<Decimal>,
+    market_price_change_pct: Option<f64>,
     realized_pnl: Option<Decimal>,
     estimated_cost: Decimal,
     entry_slippage_stress: Decimal,
@@ -2603,6 +3306,123 @@ struct ClosedTradeStatistics {
 }
 
 impl ClosedTradeStatistics {
+    /// 生成每笔交易最常用的一行价格、风险和盈亏结果，供实时关闭与回测结果共用
+    fn result_summary(self) -> String {
+        let atr_stop_distance = self.risk_atr * self.minimum_stop_atr_multiple;
+        let recent_range = self
+            .recent_range
+            .map_or_else(|| "n/a".to_string(), |value| value.to_string());
+        let recent_range_stop_distance = self.recent_range.map_or_else(
+            || "n/a".to_string(),
+            |value| (value * self.recent_range_multiple).to_string(),
+        );
+        let market_price_change_pct = self
+            .market_price_change_pct
+            .map_or_else(|| "n/a".to_string(), |value| format!("{value:.4}"));
+        let realized_pnl = self
+            .realized_pnl
+            .map_or_else(|| "n/a".to_string(), |value| value.to_string());
+        let conservative_pnl = self
+            .conservative_pnl()
+            .map_or_else(|| "n/a".to_string(), |value| value.to_string());
+        let planned_target_pct = format_optional_decimal(self.planned_target_pct());
+        let entry_atr_pct = format_optional_decimal(self.entry_atr_pct());
+        let mfe_pct = format_optional_decimal(self.mfe_pct());
+        let mfe_to_target_ratio = format_optional_decimal(self.mfe_to_target_ratio());
+        let estimated_round_trip_cost_bps =
+            format_optional_decimal(self.estimated_round_trip_cost_bps());
+        let net_edge_bps = format_optional_decimal(self.net_edge_bps());
+        let room_to_opposing_level_r = format_optional_decimal(self.room_to_opposing_level_r());
+        let remaining_daily_range_pct = format_optional_decimal(self.remaining_daily_range_pct());
+        format!(
+            "side={}, exit_reason={}, entry_price={}, quantity={}, entry_notional={}, stop_distance_model={}, risk_atr={:.6}, minimum_stop_atr_multiple={}, atr_stop_distance={atr_stop_distance:.6}, recent_range={}, recent_range_multiple={}, recent_range_stop_distance={}, stop_price={}, risk_utilization={}, planned_target_pct={planned_target_pct}, entry_atr_pct={entry_atr_pct}, mfe_pct={mfe_pct}, mfe_to_target_ratio={mfe_to_target_ratio}, estimated_round_trip_cost_bps={estimated_round_trip_cost_bps}, net_edge_bps={net_edge_bps}, room_to_opposing_level_r={room_to_opposing_level_r}, remaining_daily_range_pct={remaining_daily_range_pct}, market_price_change_pct={market_price_change_pct}, realized_pnl={realized_pnl}, conservative_pnl={conservative_pnl}",
+            self.side,
+            self.exit_reason,
+            self.average_entry_price,
+            self.entry_quantity,
+            self.entry_notional,
+            self.stop_distance_model,
+            self.risk_atr,
+            self.minimum_stop_atr_multiple,
+            recent_range,
+            self.recent_range_multiple,
+            recent_range_stop_distance,
+            self.stop_price,
+            self.risk_utilization.round_dp(4),
+        )
+    }
+
+    /// 返回实际均价到最终计划目标的价格百分比
+    fn planned_target_pct(self) -> Option<Decimal> {
+        (self.average_entry_price > Decimal::ZERO).then(|| {
+            (self.target_price.as_decimal() - self.average_entry_price).abs()
+                / self.average_entry_price
+                * Decimal::from(100)
+        })
+    }
+
+    /// 返回 level 创建/入场时两者较大 ATR 相对实际均价的百分比
+    fn entry_atr_pct(self) -> Option<Decimal> {
+        let atr = Decimal::from_f64(self.risk_atr)?;
+        (self.average_entry_price > Decimal::ZERO)
+            .then(|| atr / self.average_entry_price * Decimal::from(100))
+    }
+
+    /// 返回持仓期间最大有利价格波动相对实际均价的百分比
+    fn mfe_pct(self) -> Option<Decimal> {
+        let risk_per_share = self.risk_per_share()?;
+        (self.average_entry_price > Decimal::ZERO)
+            .then(|| self.mfe_r * risk_per_share / self.average_entry_price * Decimal::from(100))
+    }
+
+    /// 返回最大有利价格波动占计划目标距离的比例
+    fn mfe_to_target_ratio(self) -> Option<Decimal> {
+        let target_distance = (self.target_price.as_decimal() - self.average_entry_price).abs();
+        let risk_per_share = self.risk_per_share()?;
+        (target_distance > Decimal::ZERO).then(|| self.mfe_r * risk_per_share / target_distance)
+    }
+
+    /// 返回配置的每股往返成本占入场名义金额的基点数
+    fn estimated_round_trip_cost_bps(self) -> Option<Decimal> {
+        (self.entry_notional > Decimal::ZERO)
+            .then(|| self.estimated_cost / self.entry_notional * Decimal::from(10_000))
+    }
+
+    /// 返回已实现 PnL 扣除估算往返成本后占入场名义金额的基点数
+    fn net_edge_bps(self) -> Option<Decimal> {
+        let cost_adjusted_pnl = self.cost_adjusted_pnl()?;
+        (self.entry_notional > Decimal::ZERO)
+            .then(|| cost_adjusted_pnl / self.entry_notional * Decimal::from(10_000))
+    }
+
+    /// 返回实际均价到前方最近对向 level 的空间，以实际每股初始风险归一化
+    fn room_to_opposing_level_r(self) -> Option<Decimal> {
+        let opposing_level = self.opposing_level?.as_decimal();
+        let distance = match self.side {
+            OrderSide::Buy if opposing_level > self.average_entry_price => {
+                opposing_level - self.average_entry_price
+            }
+            OrderSide::Sell if opposing_level < self.average_entry_price => {
+                self.average_entry_price - opposing_level
+            }
+            _ => return None,
+        };
+        Some(distance / self.risk_per_share()?)
+    }
+
+    /// 返回入场时估算剩余日振幅相对实际均价的百分比
+    fn remaining_daily_range_pct(self) -> Option<Decimal> {
+        let remaining_daily_range = self.remaining_daily_range?;
+        (self.average_entry_price > Decimal::ZERO)
+            .then(|| remaining_daily_range / self.average_entry_price * Decimal::from(100))
+    }
+
+    /// 返回按全部部分成交加权后的实际每股初始风险
+    fn risk_per_share(self) -> Option<Decimal> {
+        (self.entry_quantity > Decimal::ZERO && self.initial_risk > Decimal::ZERO)
+            .then(|| self.initial_risk / self.entry_quantity)
+    }
+
     /// 从已实现 PnL 中扣除配置的每股往返成本，缺失券商 PnL 时不伪造结果
     fn cost_adjusted_pnl(self) -> Option<Decimal> {
         self.realized_pnl.map(|pnl| pnl - self.estimated_cost)
@@ -2636,8 +3456,8 @@ struct RunStatistics {
 }
 
 impl RunStatistics {
-    /// 生成顺序稳定、便于 grep 和跨轮比较的运行汇总、分标的及 cohort 诊断行
-    fn lines(&self) -> Vec<String> {
+    /// 生成顺序稳定、便于 grep 和跨轮比较的运行汇总、逐日 PnL、分标的及 cohort 诊断行
+    fn lines(&self, timezone: &TimeZone) -> Vec<String> {
         let all_trades = self
             .symbols
             .values()
@@ -2667,6 +3487,33 @@ impl RunStatistics {
             lines.push(format!(
                 "SLC risk rejection: reason={reason}, count={count}",
             ));
+        }
+
+        let mut daily_symbols: BTreeMap<(String, String), Vec<&ClosedTradeStatistics>> =
+            BTreeMap::new();
+        for (instrument_id, statistics) in &self.symbols {
+            for trade in &statistics.trades {
+                let date = trade
+                    .close_ts
+                    .to_datetime_utc()
+                    .to_zoned(timezone.clone())
+                    .date()
+                    .to_string();
+                daily_symbols
+                    .entry((date, instrument_id.to_string()))
+                    .or_default()
+                    .push(trade);
+            }
+        }
+        for ((date, instrument_id), trades) in daily_symbols {
+            let trade_count = trades.len();
+            for (index, trade) in trades.into_iter().enumerate() {
+                lines.push(format!(
+                    "[{instrument_id}] SLC trade result: date={date}, trade={}/{trade_count}, {}",
+                    index + 1,
+                    trade.result_summary(),
+                ));
+            }
         }
 
         let mut exits: BTreeMap<TradeExitReason, Vec<&ClosedTradeStatistics>> = BTreeMap::new();
@@ -2851,6 +3698,28 @@ fn conservative_daily_pnl(
     )
 }
 
+/// 累计可缺失的十进制指标，并只用有效样本计算平均值
+#[derive(Debug, Default)]
+struct DecimalMetric {
+    total: Decimal,
+    count: u64,
+}
+
+impl DecimalMetric {
+    /// 记录存在的指标值，`None` 不进入分母
+    fn record(&mut self, value: Option<Decimal>) {
+        if let Some(value) = value {
+            self.total += value;
+            self.count += 1;
+        }
+    }
+
+    /// 输出有效样本的四位小数平均值，无样本时返回 `n/a`
+    fn average(&self) -> String {
+        decimal_average(self.total, self.count)
+    }
+}
+
 /// 将逐笔交易汇总成总计或 cohort 共用的绩效字段
 #[derive(Debug, Default)]
 struct TradeAggregate {
@@ -2877,6 +3746,14 @@ struct TradeAggregate {
     distance_atr_sum: f64,
     zone_width_atr_sum: f64,
     displacement_strength_atr_sum: f64,
+    planned_target_pct: DecimalMetric,
+    entry_atr_pct: DecimalMetric,
+    mfe_pct: DecimalMetric,
+    mfe_to_target_ratio: DecimalMetric,
+    estimated_round_trip_cost_bps: DecimalMetric,
+    net_edge_bps: DecimalMetric,
+    room_to_opposing_level_r: DecimalMetric,
+    remaining_daily_range_pct: DecimalMetric,
     ambiguous_exit_bars: u64,
 }
 
@@ -2897,6 +3774,24 @@ impl TradeAggregate {
             aggregate.distance_atr_sum += trade.distance_atr;
             aggregate.zone_width_atr_sum += trade.zone_width_atr;
             aggregate.displacement_strength_atr_sum += trade.displacement_strength_atr;
+            aggregate
+                .planned_target_pct
+                .record(trade.planned_target_pct());
+            aggregate.entry_atr_pct.record(trade.entry_atr_pct());
+            aggregate.mfe_pct.record(trade.mfe_pct());
+            aggregate
+                .mfe_to_target_ratio
+                .record(trade.mfe_to_target_ratio());
+            aggregate
+                .estimated_round_trip_cost_bps
+                .record(trade.estimated_round_trip_cost_bps());
+            aggregate.net_edge_bps.record(trade.net_edge_bps());
+            aggregate
+                .room_to_opposing_level_r
+                .record(trade.room_to_opposing_level_r());
+            aggregate
+                .remaining_daily_range_pct
+                .record(trade.remaining_daily_range_pct());
             aggregate.estimated_cost += trade.estimated_cost;
             aggregate.entry_slippage_stress += trade.entry_slippage_stress;
             aggregate.ambiguous_exit_bars += u64::from(trade.ambiguous_exit_bar);
@@ -2947,8 +3842,16 @@ impl TradeAggregate {
         let average_zone_width_atr = float_average(self.zone_width_atr_sum, self.trades);
         let average_displacement_atr =
             float_average(self.displacement_strength_atr_sum, self.trades);
+        let average_planned_target_pct = self.planned_target_pct.average();
+        let average_entry_atr_pct = self.entry_atr_pct.average();
+        let average_mfe_pct = self.mfe_pct.average();
+        let average_mfe_to_target_ratio = self.mfe_to_target_ratio.average();
+        let average_estimated_round_trip_cost_bps = self.estimated_round_trip_cost_bps.average();
+        let average_net_edge_bps = self.net_edge_bps.average();
+        let average_room_to_opposing_level_r = self.room_to_opposing_level_r.average();
+        let average_remaining_daily_range_pct = self.remaining_daily_range_pct.average();
         format!(
-            "trades={}, wins={}, win_rate_pct={win_rate}, cost_adjusted_win_rate_pct={cost_adjusted_win_rate}, realized_pnl={}, estimated_cost={}, entry_slippage_stress={}, cost_adjusted_pnl={}, conservative_pnl={}, average_r={average_r}, average_cost_adjusted_r={average_cost_adjusted_r}, average_conservative_r={average_conservative_r}, average_initial_risk={average_initial_risk}, average_risk_utilization={average_risk_utilization}, average_mfe_r={average_mfe_r}, average_mae_r={average_mae_r}, average_holding_bars={average_holding_bars}, average_level_age_bars={average_level_age_bars}, average_confirmation_bars={average_confirmation_bars}, average_confirmation_close_location={average_confirmation_close_location}, average_distance_atr={average_distance_atr}, average_zone_width_atr={average_zone_width_atr}, average_displacement_atr={average_displacement_atr}, ambiguous_exit_bars={}",
+            "trades={}, wins={}, win_rate_pct={win_rate}, cost_adjusted_win_rate_pct={cost_adjusted_win_rate}, realized_pnl={}, estimated_cost={}, entry_slippage_stress={}, cost_adjusted_pnl={}, conservative_pnl={}, average_r={average_r}, average_cost_adjusted_r={average_cost_adjusted_r}, average_conservative_r={average_conservative_r}, average_initial_risk={average_initial_risk}, average_risk_utilization={average_risk_utilization}, average_mfe_r={average_mfe_r}, average_mae_r={average_mae_r}, average_planned_target_pct={average_planned_target_pct}, average_entry_atr_pct={average_entry_atr_pct}, average_mfe_pct={average_mfe_pct}, average_mfe_to_target_ratio={average_mfe_to_target_ratio}, average_estimated_round_trip_cost_bps={average_estimated_round_trip_cost_bps}, average_net_edge_bps={average_net_edge_bps}, average_room_to_opposing_level_r={average_room_to_opposing_level_r}, average_remaining_daily_range_pct={average_remaining_daily_range_pct}, average_holding_bars={average_holding_bars}, average_level_age_bars={average_level_age_bars}, average_confirmation_bars={average_confirmation_bars}, average_confirmation_close_location={average_confirmation_close_location}, average_distance_atr={average_distance_atr}, average_zone_width_atr={average_zone_width_atr}, average_displacement_atr={average_displacement_atr}, ambiguous_exit_bars={}",
             self.trades,
             self.wins,
             self.realized_pnl,
@@ -2968,6 +3871,11 @@ fn decimal_average(total: Decimal, count: u64) -> String {
     } else {
         (total / Decimal::from(count)).round_dp(4).to_string()
     }
+}
+
+/// 格式化可选十进制经济指标；无可用参照数据时明确输出 `n/a`
+fn format_optional_decimal(value: Option<Decimal>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| value.round_dp(4).to_string())
 }
 
 /// 将整数累计值转换成适合百分比统计的平均数字符串
@@ -3028,9 +3936,12 @@ struct SlcStrategyConfig {
     instrument_id: InstrumentId,
     five_minute_bar_type: BarType,
     four_hour_bar_type: BarType,
+    market: SlcMarket,
     timezone: TimeZone,
     entry_start_minute: u16,
     entry_end_minute: u16,
+    morning_entry_end_minute: Option<u16>,
+    morning_flatten_minute: Option<u16>,
     flatten_minute: u16,
     max_trades_per_day: usize,
     risk_amount: Decimal,
@@ -3040,7 +3951,13 @@ struct SlcStrategyConfig {
     minimum_risk_utilization: Decimal,
     max_entry_slippage_ticks: u64,
     risk_reward: Decimal,
+    signal_batch_delay_ms: u64,
+    profit_protection_trigger_r: Decimal,
+    profit_protection_floor_r: Decimal,
     stop_buffer_ticks: u64,
+    stop_distance_model: StopDistanceModel,
+    minimum_stop_atr_multiple: f64,
+    recent_range_multiple: Decimal,
     round_trip_cost_per_share: Decimal,
     log_bars: bool,
 }
@@ -3059,10 +3976,21 @@ struct PendingEntry {
     distance_atr: f64,
     zone_width_atr: f64,
     displacement_strength_atr: f64,
+    risk_atr: f64,
+    recent_range: Option<Decimal>,
     entry_limit: Price,
     stop: Price,
+    opposing_level: Option<Price>,
+    remaining_daily_range: Option<Decimal>,
     signal_ts: UnixNanos,
     had_fill: bool,
+}
+
+/// 等待同一根 5 分钟 K 线其他标的候选归集完成的入场信号
+#[derive(Clone, Copy, Debug)]
+struct DeferredSignal {
+    signal: Signal,
+    local_date: jiff::civil::Date,
 }
 
 /// 一笔已发生入场成交、正在接受保护和退出管理的交易
@@ -3079,10 +4007,14 @@ struct ActiveTrade {
     distance_atr: f64,
     zone_width_atr: f64,
     displacement_strength_atr: f64,
+    risk_atr: f64,
+    recent_range: Option<Decimal>,
     entry_minute: u16,
     entry_limit: Price,
     stop: Price,
     target: Price,
+    opposing_level: Option<Price>,
+    remaining_daily_range: Option<Decimal>,
     first_fill_ts: UnixNanos,
     filled_qty: Decimal,
     protected_qty: Decimal,
@@ -3134,6 +4066,25 @@ impl ActiveTrade {
         self.normalized_excursion(self.maximum_adverse_excursion)
     }
 
+    /// 返回指定可成交价相对初始风险的当前 R，交易方向有利时为正
+    fn price_r(&self, price: Price) -> Decimal {
+        if self.initial_risk <= Decimal::ZERO || self.filled_qty <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+        let entry = self.average_fill();
+        let favorable_move = match self.side {
+            OrderSide::Buy => price.as_decimal() - entry,
+            OrderSide::Sell => entry - price.as_decimal(),
+            OrderSide::NoOrderSide => return Decimal::ZERO,
+        };
+        favorable_move / (self.initial_risk / self.filled_qty)
+    }
+
+    /// 判断交易是否曾越过浮盈触发线，且当前可成交价已回落到保护线
+    fn should_protect_profit(&self, price: Price, trigger_r: Decimal, floor_r: Decimal) -> bool {
+        trigger_r > Decimal::ZERO && self.mfe_r() >= trigger_r && self.price_r(price) <= floor_r
+    }
+
     /// 将每股波动转换为 R 倍数，并防止异常成交状态导致除零
     fn normalized_excursion(&self, excursion: Decimal) -> Decimal {
         if self.initial_risk <= Decimal::ZERO || self.filled_qty <= Decimal::ZERO {
@@ -3154,8 +4105,9 @@ struct AmbiguityProbe {
 
 /// Nautilus 单标的 SLC 策略实例，连接信号、订单生命周期与账户风险账本
 ///
-/// 每个 symbol 各自维护指标、level、挂单和持仓，避免状态交叉；多个实例只共享 `AccountRisk`
-/// 和 `RunStatistics`。这种边界既符合 Nautilus 的订单归属模型，也能对某一标的独立停用。
+/// 每个 symbol 各自维护指标、level、挂单和持仓，避免状态交叉；多个实例只共享 `AccountRisk`、
+/// `SignalArbiter` 和 `RunStatistics`。这种边界既符合 Nautilus 的订单归属模型，也能对某一
+/// 标的独立停用。
 struct SlcStrategy {
     core: StrategyCore,
     config: SlcStrategyConfig,
@@ -3163,7 +4115,10 @@ struct SlcStrategy {
     signals: SlcSignalState,
     backtest_four_hour_bars: Option<VecDeque<Bar>>,
     account_risk: Arc<AccountRisk>,
+    signal_arbiter: Arc<SignalArbiter>,
     run_statistics: Arc<Mutex<RunStatistics>>,
+    signal_timer_name: Ustr,
+    deferred_signal: Option<DeferredSignal>,
     pending_entry: Option<PendingEntry>,
     active_trade: Option<ActiveTrade>,
     ambiguity_probe: Option<AmbiguityProbe>,
@@ -3185,6 +4140,7 @@ struct SlcRunConfig {
     round_trip_cost_per_share: Decimal,
     log_bars: bool,
     run_statistics: Arc<Mutex<RunStatistics>>,
+    signal_arbiter: Arc<SignalArbiter>,
 }
 
 /// 为每个 symbol 构造稳定且唯一的策略路由身份，并声明其外部订单归属
@@ -3203,7 +4159,7 @@ fn slc_strategy_config(instrument_id: InstrumentId) -> StrategyConfig {
 }
 
 impl SlcStrategy {
-    /// 创建一个信号与订单状态完全隔离的单标的策略实例，仅共享账户风险账本和运行统计
+    /// 创建一个信号与订单状态隔离的单标的实例，仅共享风险账本、信号归集器和运行统计
     ///
     /// 构造阶段先回放 warmup，并强制 5 分钟指标初始化成功。4 小时 pivot 未满足时允许节点启动，
     /// 但趋势保持 Neutral 且不能入场；这是数据尚不足的可恢复状态，而不是启动失败。
@@ -3227,6 +4183,20 @@ impl SlcStrategy {
             app_config.session.entry_start_minute < entry_end_minute,
             "minimum target time leaves no valid SLC entry window",
         );
+        let morning_flatten_minute = (app_config.market == SlcMarket::Hk)
+            .then(|| {
+                HK_LUNCH_START_MINUTE
+                    .checked_sub(app_config.session.flatten_before_close_minutes)
+                    .context("flatten buffer exceeds the HK morning trading session")
+            })
+            .transpose()?;
+        let morning_entry_end_minute = morning_flatten_minute
+            .map(|flatten| {
+                flatten
+                    .checked_sub(app_config.minimum_target_time_minutes)
+                    .context("minimum target time exceeds the HK morning trading session")
+            })
+            .transpose()?;
         let five_minute_warmup_count = five_minute_bars.len();
         let four_hour_warmup_count = four_hour_bars.len();
         let mut signals = SlcSignalState::new(app_config);
@@ -3270,9 +4240,12 @@ impl SlcStrategy {
                 instrument_id,
                 five_minute_bar_type,
                 four_hour_bar_type,
+                market: app_config.market,
                 timezone: app_config.timezone.clone(),
                 entry_start_minute: app_config.session.entry_start_minute,
                 entry_end_minute,
+                morning_entry_end_minute,
+                morning_flatten_minute,
                 flatten_minute: run_config.flatten_minute,
                 max_trades_per_day: app_config.session.max_trades_per_day,
                 risk_amount: app_config.risk_amount,
@@ -3287,7 +4260,13 @@ impl SlcStrategy {
                 minimum_risk_utilization: app_config.minimum_risk_utilization,
                 max_entry_slippage_ticks: app_config.max_entry_slippage_ticks,
                 risk_reward: app_config.risk_reward,
+                signal_batch_delay_ms: app_config.signal_batch_delay_ms,
+                profit_protection_trigger_r: app_config.profit_protection_trigger_r,
+                profit_protection_floor_r: app_config.profit_protection_floor_r,
                 stop_buffer_ticks: app_config.stop_buffer_ticks,
+                stop_distance_model: app_config.stop_distance_model,
+                minimum_stop_atr_multiple: app_config.minimum_stop_atr_multiple,
+                recent_range_multiple: app_config.recent_range_multiple,
                 round_trip_cost_per_share: run_config.round_trip_cost_per_share,
                 log_bars: run_config.log_bars,
             },
@@ -3295,7 +4274,10 @@ impl SlcStrategy {
             signals,
             backtest_four_hour_bars: run_config.backtest_four_hour_bars.map(VecDeque::from),
             account_risk,
+            signal_arbiter: run_config.signal_arbiter,
             run_statistics: Arc::clone(&run_config.run_statistics),
+            signal_timer_name: Ustr::from(&format!("SLC-SIGNAL-{}", instrument_id.symbol)),
+            deferred_signal: None,
             pending_entry: None,
             active_trade: None,
             ambiguity_probe: None,
@@ -3417,7 +4399,7 @@ impl SlcStrategy {
             .to_datetime_utc()
             .to_zoned(self.config.timezone.clone());
         let minute = u16::try_from(local.hour())? * 60 + u16::try_from(local.minute())?;
-        if (RTH_OPEN_MINUTE..RTH_CLOSE_MINUTE).contains(&minute) {
+        if self.config.market.is_regular_bar_start(minute) {
             self.signals.process_four_hour(bar);
             if self.config.log_bars {
                 log::info!(
@@ -3542,6 +4524,112 @@ impl SlcStrategy {
         }
     }
 
+    /// 短暂归集同一根 5 分钟 K 线的跨标的候选，避免回调先后顺序抢占共享仓位
+    fn queue_signal(
+        &mut self,
+        signal: Signal,
+        local_date: jiff::civil::Date,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.deferred_signal.is_none(),
+            "SLC strategy already has a signal awaiting arbitration",
+        );
+        let now = self.clock().timestamp_ns();
+        let symbol = self.config.instrument_id.symbol.as_str();
+        let Some(deadline) = self.signal_arbiter.queue(
+            symbol,
+            signal.level,
+            signal.ts_event,
+            now,
+            self.config.signal_batch_delay_ms,
+        )?
+        else {
+            self.record_risk_rejection(RiskRejectionReason::ConcurrentSignalPriority);
+            log::warn!(
+                "[{}] Skipping late SLC signal: risk_rejection={}, level={}, signal_ts={}, now={}",
+                self.config.instrument_id,
+                RiskRejectionReason::ConcurrentSignalPriority,
+                signal.level,
+                signal.ts_event,
+                now,
+            );
+            return Ok(());
+        };
+        if let Err(e) =
+            self.clock()
+                .set_time_alert_ns(self.signal_timer_name.as_str(), deadline, None, None)
+        {
+            self.signal_arbiter.cancel(symbol, signal.ts_event)?;
+            return Err(e);
+        }
+        self.deferred_signal = Some(DeferredSignal { signal, local_date });
+        log::info!(
+            "[{}] Queued SLC signal: level={}, signal_ts={}, arbitration_deadline={}, batch_delay_ms={}",
+            self.config.instrument_id,
+            signal.level,
+            signal.ts_event,
+            deadline,
+            self.config.signal_batch_delay_ms,
+        );
+        Ok(())
+    }
+
+    /// 归集截止后只让冻结排名内的候选进入原有账户风险预留与下单路径
+    fn submit_ranked_signal(&mut self) -> anyhow::Result<()> {
+        let Some(deferred) = self.deferred_signal.take() else {
+            return Ok(());
+        };
+        let available_slots = self
+            .account_risk
+            .available_position_slots(self.config.account_risk_limits.open_positions)?;
+        let decision = self.signal_arbiter.decide(
+            self.config.instrument_id.symbol.as_str(),
+            deferred.signal.ts_event,
+            available_slots,
+        )?;
+        if !decision.selected {
+            let reason = if decision.capacity == 0 {
+                RiskRejectionReason::OpenPositions
+            } else {
+                RiskRejectionReason::ConcurrentSignalPriority
+            };
+            self.record_risk_rejection(reason);
+            log::info!(
+                "[{}] Skipping ranked SLC signal: risk_rejection={}, level={}, rank={}/{}, available_slots={}",
+                self.config.instrument_id,
+                reason,
+                deferred.signal.level,
+                decision.rank,
+                decision.candidates,
+                decision.capacity,
+            );
+            return Ok(());
+        }
+        if self.faulted || self.session_disabled || self.exit_pending || self.has_exposure() {
+            log::info!(
+                "[{}] Discarding selected SLC signal after state changed: level={}, rank={}/{}, faulted={}, session_disabled={}, exit_pending={}, has_exposure={}",
+                self.config.instrument_id,
+                deferred.signal.level,
+                decision.rank,
+                decision.candidates,
+                self.faulted,
+                self.session_disabled,
+                self.exit_pending,
+                self.has_exposure(),
+            );
+            return Ok(());
+        }
+        log::info!(
+            "[{}] Selected SLC signal: level={}, rank={}/{}, batch_capacity={}",
+            self.config.instrument_id,
+            deferred.signal.level,
+            decision.rank,
+            decision.candidates,
+            decision.capacity,
+        );
+        self.submit_signal(deferred.signal, deferred.local_date)
+    }
+
     /// 按确认 Bar 收盘价生成最坏可成交限价，预留账户容量后提交一根 Bar 有效的入场单
     fn submit_signal(
         &mut self,
@@ -3553,6 +4641,9 @@ impl SlcStrategy {
             self.instrument.price_increment(),
             self.instrument.price_precision(),
             self.config.stop_buffer_ticks,
+            self.config.stop_distance_model,
+            self.config.minimum_stop_atr_multiple,
+            self.config.recent_range_multiple,
             self.config.max_entry_slippage_ticks,
         )?;
         let lot_size = self
@@ -3593,6 +4684,11 @@ impl SlcStrategy {
             "SLC quantity sizing exceeded configured order notional",
         );
         let risk_utilization = risk_utilization(reservation.risk, self.config.risk_amount);
+        let planned_stop_distance_pct = (entry_limit.as_decimal() - stop.as_decimal()).abs()
+            / entry_limit.as_decimal()
+            * Decimal::from(100);
+        let planned_stop_distance_atr =
+            (entry_limit.as_f64() - stop.as_f64()).abs() / signal.risk_atr;
         if risk_utilization < self.config.minimum_risk_utilization {
             self.record_risk_rejection(RiskRejectionReason::RiskUnderutilized);
             log::warn!(
@@ -3670,8 +4766,12 @@ impl SlcStrategy {
             distance_atr: signal.distance_atr,
             zone_width_atr: signal.zone_width_atr,
             displacement_strength_atr: signal.displacement_strength_atr,
+            risk_atr: signal.risk_atr,
+            recent_range: signal.recent_range,
             entry_limit,
             stop,
+            opposing_level: self.signals.opposing_level(signal.side, entry_limit),
+            remaining_daily_range: self.signals.daily_range.remaining_range(),
             signal_ts: signal.ts_event,
             had_fill: false,
         });
@@ -3682,8 +4782,11 @@ impl SlcStrategy {
         }
         self.entries_submitted += 1;
         self.update_run_statistics(|statistics| statistics.entries_submitted += 1);
+        let recent_range = signal
+            .recent_range
+            .map_or_else(|| "n/a".to_string(), |value| value.to_string());
         log::info!(
-            "[{}] Submitted SLC {} entry: level={}, confirmation=stochastic_reentry, level_age_bars={}, confirmation_bars={}, quantity={}, signal_close={}, entry_limit={}, stop={}, target={}R, reserved_risk={}, risk_utilization={}, reserved_notional={}",
+            "[{}] Submitted SLC {} entry: level={}, confirmation=stochastic_reentry, level_age_bars={}, confirmation_bars={}, quantity={}, signal_close={}, entry_limit={}, stop={}, stop_distance_model={}, stop_reference_atr={:.6}, recent_range_bars={}, recent_range={}, planned_stop_distance_atr={:.4}, planned_stop_distance_pct={}, minimum_stop_atr_multiple={}, recent_range_multiple={}, target={}R, reserved_risk={}, risk_utilization={}, reserved_notional={}",
             self.config.instrument_id,
             signal.side,
             signal.level,
@@ -3693,6 +4796,14 @@ impl SlcStrategy {
             signal.entry,
             entry_limit,
             stop,
+            self.config.stop_distance_model,
+            signal.risk_atr,
+            self.signals.rules.recent_range_lookback_bars,
+            recent_range,
+            planned_stop_distance_atr,
+            planned_stop_distance_pct.round_dp(4),
+            self.config.minimum_stop_atr_multiple,
+            self.config.recent_range_multiple,
             self.config.risk_reward,
             reservation.risk,
             risk_utilization.round_dp(4),
@@ -3859,10 +4970,14 @@ impl SlcStrategy {
             distance_atr: pending.distance_atr,
             zone_width_atr: pending.zone_width_atr,
             displacement_strength_atr: pending.displacement_strength_atr,
+            risk_atr: pending.risk_atr,
+            recent_range: pending.recent_range,
             entry_minute,
             entry_limit: pending.entry_limit,
             stop: pending.stop,
             target,
+            opposing_level: pending.opposing_level,
+            remaining_daily_range: pending.remaining_daily_range,
             first_fill_ts,
             filled_qty,
             protected_qty,
@@ -4162,20 +5277,10 @@ nautilus_strategy!(SlcStrategy, {
             .to_zoned(self.config.timezone.clone())
             .date();
         let realized_pnl = event.realized_pnl.map(|pnl| pnl.as_decimal());
-        let mut exit_reason = TradeExitReason::Unknown;
-        let mut level = None;
-        let mut initial_risk = None;
-        let mut risk_utilization = None;
-        let mut r_multiple = None;
-        let mut holding_bars = None;
-        let mut mfe_r = None;
-        let mut mae_r = None;
-        let mut estimated_cost = None;
-        let mut entry_slippage_stress = None;
+        let price_change_pct = market_price_change_pct(event.avg_px_open, event.avg_px_close);
+        let mut trade_statistics = None;
         if let Some(active) = active_trade {
-            exit_reason = active.exit_reason.unwrap_or(TradeExitReason::Unknown);
-            level = Some(active.level);
-            initial_risk = Some(active.initial_risk);
+            let exit_reason = active.exit_reason.unwrap_or(TradeExitReason::Unknown);
             let utilization = active.initial_risk / self.config.risk_amount;
             let trade_mfe_r = active.mfe_r();
             let trade_mae_r = active.mae_r();
@@ -4185,43 +5290,53 @@ nautilus_strategy!(SlcStrategy, {
             } else {
                 Decimal::ZERO
             };
-            risk_utilization = Some(utilization);
-            holding_bars = Some(active.bars_held);
-            mfe_r = Some(trade_mfe_r);
-            mae_r = Some(trade_mae_r);
-            estimated_cost = Some(trade_estimated_cost);
-            entry_slippage_stress = Some(trade_entry_slippage_stress);
-            r_multiple = if active.initial_risk > Decimal::ZERO {
+            let average_fill = active.average_fill();
+            let r_multiple = if active.initial_risk > Decimal::ZERO {
                 realized_pnl.map(|pnl| pnl / active.initial_risk)
             } else {
                 None
             };
             let close_ts = event.ts_closed.unwrap_or(event.ts_event);
+            let closed_trade = ClosedTradeStatistics {
+                side: active.side,
+                level: active.level,
+                level_age_bars: active.level_age_bars,
+                confirmation_bars: active.confirmation_bars,
+                confirmation_close_location: active.confirmation_close_location,
+                distance_atr: active.distance_atr,
+                zone_width_atr: active.zone_width_atr,
+                displacement_strength_atr: active.displacement_strength_atr,
+                entry_minute: active.entry_minute,
+                holding_bars: active.bars_held,
+                mfe_r: trade_mfe_r,
+                mae_r: trade_mae_r,
+                exit_reason,
+                average_entry_price: average_fill,
+                entry_quantity: active.filled_qty,
+                entry_notional: active.fill_notional,
+                risk_atr: active.risk_atr,
+                recent_range: active.recent_range,
+                stop_distance_model: self.config.stop_distance_model,
+                minimum_stop_atr_multiple: self.config.minimum_stop_atr_multiple,
+                recent_range_multiple: self.config.recent_range_multiple,
+                stop_price: active.stop,
+                target_price: active.target,
+                opposing_level: active.opposing_level,
+                remaining_daily_range: active.remaining_daily_range,
+                market_price_change_pct: price_change_pct,
+                realized_pnl,
+                estimated_cost: trade_estimated_cost,
+                entry_slippage_stress: trade_entry_slippage_stress,
+                initial_risk: active.initial_risk,
+                risk_utilization: utilization,
+                r_multiple,
+                close_ts,
+                ambiguous_exit_bar: false,
+            };
             self.update_run_statistics(|statistics| {
-                statistics.trades.push(ClosedTradeStatistics {
-                    side: active.side,
-                    level: active.level,
-                    level_age_bars: active.level_age_bars,
-                    confirmation_bars: active.confirmation_bars,
-                    confirmation_close_location: active.confirmation_close_location,
-                    distance_atr: active.distance_atr,
-                    zone_width_atr: active.zone_width_atr,
-                    displacement_strength_atr: active.displacement_strength_atr,
-                    entry_minute: active.entry_minute,
-                    holding_bars: active.bars_held,
-                    mfe_r: trade_mfe_r,
-                    mae_r: trade_mae_r,
-                    exit_reason,
-                    realized_pnl,
-                    estimated_cost: trade_estimated_cost,
-                    entry_slippage_stress: trade_entry_slippage_stress,
-                    initial_risk: active.initial_risk,
-                    risk_utilization: utilization,
-                    r_multiple,
-                    close_ts,
-                    ambiguous_exit_bar: false,
-                });
+                statistics.trades.push(closed_trade);
             });
+            trade_statistics = Some(closed_trade);
             if self.backtest_four_hour_bars.is_some()
                 && matches!(exit_reason, TradeExitReason::Target | TradeExitReason::Stop)
             {
@@ -4250,29 +5365,18 @@ nautilus_strategy!(SlcStrategy, {
         ) {
             Ok(snapshot) => {
                 self.session_disabled |= snapshot.halted;
-                log::info!(
-                    "[{}] SLC position closed: exit_reason={}, level={}, realized_pnl={:?}, estimated_cost={}, entry_slippage_stress={}, initial_risk={}, risk_utilization={}, actual_r={}, holding_bars={}, mfe_r={}, mae_r={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}",
-                    self.config.instrument_id,
-                    exit_reason,
-                    level.map_or_else(|| "unknown".to_string(), |level| level.to_string()),
-                    realized_pnl,
-                    estimated_cost.map_or_else(|| "n/a".to_string(), |cost| cost.to_string()),
-                    entry_slippage_stress
-                        .map_or_else(|| "n/a".to_string(), |cost| cost.to_string()),
-                    initial_risk.map_or_else(|| "n/a".to_string(), |risk| risk.to_string()),
-                    risk_utilization
-                        .map_or_else(|| "n/a".to_string(), |value| value.round_dp(4).to_string()),
-                    r_multiple
-                        .map_or_else(|| "n/a".to_string(), |value| value.round_dp(4).to_string()),
-                    holding_bars.map_or_else(|| "n/a".to_string(), |bars| bars.to_string()),
-                    mfe_r.map_or_else(|| "n/a".to_string(), |value| value.round_dp(4).to_string()),
-                    mae_r.map_or_else(|| "n/a".to_string(), |value| value.round_dp(4).to_string()),
-                    snapshot.halted,
-                    snapshot.realized_pnl,
-                    snapshot.open_risk,
-                    snapshot.account_notional,
-                    snapshot.open_positions,
-                );
+                if let Some(statistics) = trade_statistics {
+                    log::info!(
+                        "[{}] SLC trade closed: {}",
+                        self.config.instrument_id,
+                        statistics.result_summary(),
+                    );
+                } else {
+                    log::warn!(
+                        "[{}] SLC position closed without active trade statistics: realized_pnl={realized_pnl:?}",
+                        self.config.instrument_id,
+                    );
+                }
             }
             Err(e) => {
                 self.faulted = true;
@@ -4302,9 +5406,13 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.five_minute_bar_type, None, None);
         if self.backtest_four_hour_bars.is_some() {
             log::info!(
-                "[{}] SLC backtest active: direction={}, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, target={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
+                "[{}] SLC backtest active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
                 self.config.instrument_id,
                 self.signals.rules.trade_direction,
+                self.signals.rules.level_selection,
+                self.config.signal_batch_delay_ms,
+                self.signals.rules.confirmation_window_bars,
+                self.signals.rules.maximum_confirmation_distance_atr,
                 self.config.five_minute_bar_type,
                 self.backtest_four_hour_bars
                     .as_ref()
@@ -4315,7 +5423,13 @@ impl DataActor for SlcStrategy {
                 self.config.entry_end_minute % 60,
                 self.config.flatten_minute / 60,
                 self.config.flatten_minute % 60,
+                self.config.stop_distance_model,
+                self.config.minimum_stop_atr_multiple,
+                self.signals.rules.recent_range_lookback_bars,
+                self.config.recent_range_multiple,
                 self.config.risk_reward,
+                self.config.profit_protection_trigger_r,
+                self.config.profit_protection_floor_r,
                 self.config.minimum_risk_utilization,
                 self.config.round_trip_cost_per_share,
             );
@@ -4335,9 +5449,13 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.four_hour_bar_type, None, None);
         self.subscribe_quotes(self.config.instrument_id, None, None);
         log::info!(
-            "[{}] SLC subscriptions active: direction={}, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, target={}R, minimum_risk_utilization={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
+            "[{}] SLC subscriptions active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
             self.config.instrument_id,
             self.signals.rules.trade_direction,
+            self.signals.rules.level_selection,
+            self.config.signal_batch_delay_ms,
+            self.signals.rules.confirmation_window_bars,
+            self.signals.rules.maximum_confirmation_distance_atr,
             self.config.five_minute_bar_type,
             self.config.four_hour_bar_type,
             self.config.entry_start_minute / 60,
@@ -4346,8 +5464,15 @@ impl DataActor for SlcStrategy {
             self.config.entry_end_minute % 60,
             self.config.flatten_minute / 60,
             self.config.flatten_minute % 60,
+            self.config.stop_distance_model,
+            self.config.minimum_stop_atr_multiple,
+            self.signals.rules.recent_range_lookback_bars,
+            self.config.recent_range_multiple,
             self.config.risk_reward,
+            self.config.profit_protection_trigger_r,
+            self.config.profit_protection_floor_r,
             self.config.minimum_risk_utilization,
+            self.config.round_trip_cost_per_share,
             snapshot.halted,
             snapshot.realized_pnl,
             snapshot.open_risk,
@@ -4367,6 +5492,13 @@ impl DataActor for SlcStrategy {
 
     /// 管理式停止完成订单与持仓对账后取消行情订阅，并输出最终信号漏斗
     fn on_stop(&mut self) -> anyhow::Result<()> {
+        if let Some(deferred) = self.deferred_signal.take() {
+            self.clock().cancel_timer(self.signal_timer_name.as_str());
+            self.signal_arbiter.cancel(
+                self.config.instrument_id.symbol.as_str(),
+                deferred.signal.ts_event,
+            )?;
+        }
         log::info!(
             "[{}] SLC signal funnel: 5m_bars={}, directional_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, risk_rejections={}, entries_submitted={}",
             self.config.instrument_id,
@@ -4388,10 +5520,19 @@ impl DataActor for SlcStrategy {
         Ok(())
     }
 
-    /// 当可立即成交的一档报价达到实际成交价计算的固定 R 目标时启动退出
+    /// 在统一截止时间执行同批次信号排序，同时保留框架自身的订单定时器处理
+    fn on_time_event(&mut self, event: &TimeEvent) -> anyhow::Result<()> {
+        Strategy::on_time_event(self, event)?;
+        if event.name == self.signal_timer_name {
+            self.submit_ranked_signal()?;
+        }
+        Ok(())
+    }
+
+    /// 当可立即成交的一档报价达到固定 R 目标或浮盈回落保护线时启动退出
     ///
-    /// 多头使用 bid、空头使用 ask，避免用不可成交的报价另一侧虚假触发盈利目标。该路径依赖
-    /// 本地进程和实时 Quote；完成 Bar 检测只承担兜底职责，不能消除撤单与市价成交之间的延迟。
+    /// 多头使用 bid、空头使用 ask，避免用不可成交的报价另一侧虚假触发。该路径依赖本地进程和
+    /// 实时 Quote；完成 Bar 检测只承担兜底职责，不能消除撤单与市价成交之间的延迟。
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         if quote.instrument_id != self.config.instrument_id
             || self.faulted
@@ -4400,7 +5541,7 @@ impl DataActor for SlcStrategy {
         {
             return Ok(());
         }
-        let (side, target) = {
+        let (side, target, protect_profit) = {
             let Some(active) = self.active_trade.as_mut() else {
                 return Ok(());
             };
@@ -4410,24 +5551,38 @@ impl DataActor for SlcStrategy {
                 OrderSide::NoOrderSide => return Ok(()),
             };
             active.observe_price(executable_price);
-            (active.side, active.target)
+            (
+                active.side,
+                active.target,
+                active.should_protect_profit(
+                    executable_price,
+                    self.config.profit_protection_trigger_r,
+                    self.config.profit_protection_floor_r,
+                ),
+            )
         };
-        if !quote_reaches_target(side, target, quote) {
-            return Ok(());
+        if quote_reaches_target(side, target, quote) {
+            log::info!(
+                "[{}] Realtime SLC target reached: side={}, target={}, bid={}, ask={}, ts_event={}",
+                self.config.instrument_id,
+                side,
+                target,
+                quote.bid_price,
+                quote.ask_price,
+                quote.ts_event,
+            );
+            return self.request_exit(
+                TradeExitReason::Target,
+                "executable top-of-book quote reached the actual-fill-based SLC target",
+            );
         }
-        log::info!(
-            "[{}] Realtime SLC target reached: side={}, target={}, bid={}, ask={}, ts_event={}",
-            self.config.instrument_id,
-            side,
-            target,
-            quote.bid_price,
-            quote.ask_price,
-            quote.ts_event,
-        );
-        self.request_exit(
-            TradeExitReason::Target,
-            "executable top-of-book quote reached the actual-fill-based SLC target",
-        )
+        if protect_profit {
+            return self.request_exit(
+                TradeExitReason::ProfitProtection,
+                "executable quote retraced to the configured profit-protection floor",
+            );
+        }
+        Ok(())
     }
 
     /// 按结构、数据完整性、时段、风险和执行顺序处理已完成 Bar
@@ -4465,7 +5620,7 @@ impl DataActor for SlcStrategy {
             .to_zoned(self.config.timezone.clone());
         let minute = u16::try_from(local.hour())? * 60 + u16::try_from(local.minute())?;
         let close_minute = minute.saturating_add(FIVE_MINUTES);
-        if !(RTH_OPEN_MINUTE..RTH_CLOSE_MINUTE).contains(&minute) {
+        if !self.config.market.is_regular_bar_start(minute) {
             return Ok(());
         }
         let new_date = self.current_date != Some(local.date());
@@ -4485,7 +5640,7 @@ impl DataActor for SlcStrategy {
             }
         }
         if let Some(previous) = self.last_five_minute_bar_start
-            && has_five_minute_gap(previous, finalized.ts_event)
+            && has_five_minute_gap(previous, finalized.ts_event, self.config.market)
         {
             self.session_disabled = true;
             log::error!(
@@ -4507,7 +5662,11 @@ impl DataActor for SlcStrategy {
             active.observe_bar(finalized);
         }
         let within_entry_window = close_minute >= self.config.entry_start_minute
-            && close_minute <= self.config.entry_end_minute;
+            && close_minute <= self.config.entry_end_minute
+            && !self
+                .config
+                .morning_entry_end_minute
+                .is_some_and(|end| close_minute <= HK_LUNCH_START_MINUTE && close_minute > end);
         let allow_signal = within_entry_window
             && !suppress_signal
             && !self.faulted
@@ -4537,6 +5696,27 @@ impl DataActor for SlcStrategy {
                 self.session_disabled,
             );
         }
+        if let Some(morning_flatten) = self.config.morning_flatten_minute
+            && close_minute >= morning_flatten
+            && close_minute <= HK_LUNCH_START_MINUTE
+        {
+            if let Some(deferred) = self.deferred_signal.take() {
+                self.clock().cancel_timer(self.signal_timer_name.as_str());
+                self.signal_arbiter.cancel(
+                    self.config.instrument_id.symbol.as_str(),
+                    deferred.signal.ts_event,
+                )?;
+            }
+            if should_request_preclose_exit(
+                close_minute,
+                morning_flatten,
+                self.has_exposure(),
+                self.exit_pending,
+            ) {
+                self.request_exit(TradeExitReason::PreClose, "HK lunch-break risk cutoff")?;
+            }
+            return Ok(());
+        }
         if close_minute >= self.config.flatten_minute {
             self.session_disabled = true;
             if should_request_preclose_exit(
@@ -4557,6 +5737,19 @@ impl DataActor for SlcStrategy {
             )?;
             return Ok(());
         }
+        if self.active_trade.as_ref().is_some_and(|active| {
+            active.should_protect_profit(
+                finalized.close,
+                self.config.profit_protection_trigger_r,
+                self.config.profit_protection_floor_r,
+            )
+        }) {
+            self.request_exit(
+                TradeExitReason::ProfitProtection,
+                "completed five-minute bar closed at the configured profit-protection floor",
+            )?;
+            return Ok(());
+        }
         if self.faulted
             || self.exit_pending
             || self.session_disabled
@@ -4566,7 +5759,7 @@ impl DataActor for SlcStrategy {
             return Ok(());
         }
         if let Some(signal) = signal {
-            self.submit_signal(signal, local.date())?;
+            self.queue_signal(signal, local.date())?;
         }
         Ok(())
     }
@@ -4589,27 +5782,77 @@ fn validate_bar_type(
     Ok(())
 }
 
-/// 根据 zone 边界、tick buffer 和最大允许滑点返回止损价及可成交入场限价
+/// 根据结构远端与所选波动距离中更远的位置，返回止损价及可成交入场限价
+///
+/// `Atr` 使用 level 创建/入场时较大 ATR 的配置倍数；`RecentRange` 使用确认 K 线及其前若干
+/// 根连续 5 分钟 K 线的 `Max High - Min Low` 配置倍数；`Hybrid` 取两种波动距离中较大者。
+/// 所有模型都以 zone 远端作为结构失效位，最终选择更远者，不会为了满足波动下限把止损移回结构区域内。
+#[expect(
+    clippy::too_many_arguments,
+    reason = "entry prices combine a signal with the configured execution limits"
+)]
 fn entry_prices(
     signal: Signal,
     increment: Price,
     precision: u8,
     stop_buffer_ticks: u64,
+    stop_distance_model: StopDistanceModel,
+    minimum_stop_atr_multiple: f64,
+    recent_range_multiple: Decimal,
     max_entry_slippage_ticks: u64,
 ) -> anyhow::Result<(Price, Price)> {
     let increment = increment.as_decimal();
     let stop_buffer = increment * Decimal::from(stop_buffer_ticks);
     let entry_buffer = increment * Decimal::from(max_entry_slippage_ticks);
+    let atr_distance = || -> anyhow::Result<Decimal> {
+        let atr = Decimal::from_f64(signal.risk_atr)
+            .context("SLC stop reference ATR is not a finite decimal")?;
+        let multiple = Decimal::from_f64(minimum_stop_atr_multiple)
+            .context("SLC minimum stop ATR multiple is not a finite decimal")?;
+        anyhow::ensure!(
+            atr > Decimal::ZERO,
+            "SLC stop reference ATR must be positive"
+        );
+        anyhow::ensure!(
+            multiple >= Decimal::ZERO,
+            "SLC minimum stop ATR multiple must not be negative",
+        );
+        Ok(atr * multiple)
+    };
+    let recent_range_distance = || -> anyhow::Result<Decimal> {
+        let recent_range = signal
+            .recent_range
+            .context("SLC recent-range stop requires enough consecutive 5m bars")?;
+        anyhow::ensure!(
+            recent_range > Decimal::ZERO,
+            "SLC recent 5m bar range must be positive",
+        );
+        anyhow::ensure!(
+            recent_range_multiple > Decimal::ZERO,
+            "SLC recent range multiple must be positive",
+        );
+        Ok(recent_range * recent_range_multiple)
+    };
+    let stop_distance = match stop_distance_model {
+        StopDistanceModel::Atr => atr_distance()?,
+        StopDistanceModel::RecentRange => recent_range_distance()?,
+        StopDistanceModel::Hybrid => atr_distance()?.max(recent_range_distance()?),
+    };
+    let minimum_stop_distance = (stop_distance / increment).ceil() * increment;
     let (stop, entry_limit) = match signal.side {
         OrderSide::Buy => {
-            let stop = signal.zone_low.as_decimal() - stop_buffer;
             let entry_limit = signal.entry.as_decimal() + entry_buffer;
+            let structural_stop = signal.zone_low.as_decimal() - stop_buffer;
+            let volatility_stop = entry_limit - minimum_stop_distance;
+            let stop = structural_stop.min(volatility_stop);
             anyhow::ensure!(stop < entry_limit, "long stop must be below entry limit");
             (stop, entry_limit)
         }
         OrderSide::Sell => {
-            let stop = signal.zone_high.as_decimal() + stop_buffer;
             let entry_limit = signal.entry.as_decimal() - entry_buffer;
+            let structural_stop = signal.zone_high.as_decimal() + stop_buffer;
+            let volatility_stop = entry_limit + minimum_stop_distance;
+            let stop = structural_stop.max(volatility_stop);
             anyhow::ensure!(stop > entry_limit, "short stop must be above entry limit");
             (stop, entry_limit)
         }
@@ -4755,14 +5998,27 @@ async fn load_instruments(
         let static_security_info = static_info_by_symbol.remove(symbol).with_context(|| {
             format!("Longbridge did not return exact static security info for {symbol}")
         })?;
+        anyhow::ensure!(
+            config
+                .market
+                .accepts_static_info(static_security_info.board, &static_security_info.currency,),
+            "SLC market={} requires a supported main-board equity and {} quote currency: symbol={}, board={}, currency={}",
+            config.market,
+            config.market.currency(),
+            symbol,
+            static_security_info.board,
+            static_security_info.currency,
+        );
         let instrument = parse_instrument(
             &static_security_info,
             configured.price_increment,
             UnixNanos::default(),
         )?;
         anyhow::ensure!(
-            instrument.quote_currency() == Currency::USD(),
-            "SLC risk controls currently require a USD-quoted equity: {instrument_id}",
+            instrument.quote_currency() == config.market.currency(),
+            "SLC market={} requires {}-quoted equities: {instrument_id}",
+            config.market,
+            config.market.currency(),
         );
         instruments.push((instrument_id, instrument));
     }
@@ -4774,7 +6030,7 @@ async fn prepare_inputs(
     config: &AppConfig,
     context: &QuoteContext,
 ) -> anyhow::Result<Vec<PreparedInputs>> {
-    let (market_close, market_close_minute) = current_us_market_close(context).await?;
+    let (market_close, market_close_minute) = current_market_close(context, config.market).await?;
     let mut prepared = Vec::with_capacity(config.instruments.len());
 
     for (instrument_id, instrument) in load_instruments(config, context).await? {
@@ -4856,7 +6112,10 @@ async fn load_warmup_bars(
     Ok(bars)
 }
 
-/// 从 warmup 响应删除未完成 K 线，再解析、排序、去重并严格校验请求数量
+/// 从 warmup 响应删除未完成 K 线，再解析、排序和去重
+///
+/// 5 分钟指标必须取得完整请求数量；4 小时结构允许使用新上市标的的全部可用历史，不足时保持
+/// Neutral，直到后续已完成 Bar 足以确认 pivot，避免一个历史较短的标的中断整个多标的节点。
 fn parse_warmup_bars(
     symbol: &str,
     period: Period,
@@ -4890,11 +6149,18 @@ fn parse_warmup_bars(
         .collect::<anyhow::Result<Vec<_>>>()?;
     bars.sort_unstable_by_key(|bar| bar.ts_event);
     bars.dedup_by_key(|bar| bar.ts_event);
-    anyhow::ensure!(
-        bars.len() >= count,
-        "Longbridge returned {} of {count} required {period:?} warmup bars for {symbol}",
-        bars.len(),
-    );
+    match period {
+        Period::FiveMinute => anyhow::ensure!(
+            bars.len() >= count,
+            "Longbridge returned {} of {count} required {period:?} warmup bars for {symbol}",
+            bars.len(),
+        ),
+        Period::FourHour => anyhow::ensure!(
+            !bars.is_empty(),
+            "Longbridge returned no completed {period:?} warmup bars for {symbol}",
+        ),
+        _ => unreachable!("period was validated above"),
+    }
     if bars.len() > count {
         bars = bars.split_off(bars.len() - count);
     }
@@ -5167,9 +6433,12 @@ async fn prepare_backtest_inputs(
     config: &SlcBacktestConfig,
     context: &QuoteContext,
 ) -> anyhow::Result<Vec<PreparedBacktestInputs>> {
-    let start_date = us_market_date(config.start)?;
-    let end_date = us_market_date(config.end)?;
-    println!("SLC data download: querying US trading calendar, range={start_date}..={end_date}",);
+    let market = config.strategy.market;
+    let start_date = market_date(config.start, market)?;
+    let end_date = market_date(config.end, market)?;
+    println!(
+        "SLC data download: querying {market} trading calendar, range={start_date}..={end_date}",
+    );
     let mut half_days = BTreeSet::new();
     let mut cursor = start_date;
     while cursor <= end_date {
@@ -5180,14 +6449,16 @@ async fn prepare_backtest_inputs(
             .min(end_date);
         println!("SLC data download: trading calendar chunk {cursor}..={chunk_end}");
         half_days.extend(
-            quote_api_call_with_retry(|| context.trading_days(Market::US, cursor, chunk_end))
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to query US half trading days from {cursor} through {chunk_end}",
-                    )
-                })?
-                .half_trading_days,
+            quote_api_call_with_retry(|| {
+                context.trading_days(market.sdk_market(), cursor, chunk_end)
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to query {market} half trading days from {cursor} through {chunk_end}",
+                )
+            })?
+            .half_trading_days,
         );
         if chunk_end == end_date {
             break;
@@ -5216,6 +6487,7 @@ async fn prepare_backtest_inputs(
             five_minute_bar_type,
             config.strategy.five_minute_warmup,
             config.start,
+            market,
             instrument.price_precision(),
         )
         .await?;
@@ -5232,6 +6504,7 @@ async fn prepare_backtest_inputs(
             four_hour_bar_type,
             config.strategy.four_hour_warmup,
             config.start,
+            market,
             instrument.price_precision(),
         )
         .await?;
@@ -5253,13 +6526,14 @@ async fn prepare_backtest_inputs(
             five_minute_bar_type,
             config.start,
             config.end,
+            market,
             instrument.price_precision(),
         )
         .await?;
         let mut five_minute_bars = Vec::with_capacity(downloaded_five_minute_bars.len());
         for bar in downloaded_five_minute_bars {
             let timestamp = Timestamp::from_nanosecond(i128::from(bar.ts_event.as_u64()))?;
-            if !half_days.contains(&us_market_date(timestamp)?) {
+            if !half_days.contains(&market_date(timestamp, market)?) {
                 five_minute_bars.push(bar);
             }
         }
@@ -5282,6 +6556,7 @@ async fn prepare_backtest_inputs(
             four_hour_bar_type,
             config.start,
             config.end,
+            market,
             instrument.price_precision(),
         )
         .await?;
@@ -5309,6 +6584,10 @@ async fn prepare_backtest_inputs(
 }
 
 /// 加载结束时间不晚于回测起点的历史 Bar，用于初始化指标和高周期结构
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Longbridge request needs explicit market, contract, time, count and precision"
+)]
 async fn load_backtest_warmup_bars(
     context: &QuoteContext,
     symbol: &str,
@@ -5316,13 +6595,14 @@ async fn load_backtest_warmup_bars(
     bar_type: BarType,
     count: usize,
     start: Timestamp,
+    market: SlcMarket,
     price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let request_count = count
         .checked_add(1)
         .filter(|request_count| *request_count <= MAX_WARMUP_BARS)
         .context("warmup count must leave room for the first non-warmup bar")?;
-    let start_datetime = us_market_datetime(start)?;
+    let start_datetime = market_datetime(start, market)?;
     let candlesticks = quote_api_call_with_retry(|| {
         context.history_candlesticks_by_offset(
             symbol,
@@ -5348,6 +6628,10 @@ async fn load_backtest_warmup_bars(
 }
 
 /// 将日期区间拆成小批下载，避免 Longbridge 的单次上限静默截断 5 分钟数据
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the Longbridge request needs explicit market, contract, time range and precision"
+)]
 async fn load_backtest_bars(
     context: &QuoteContext,
     symbol: &str,
@@ -5355,11 +6639,12 @@ async fn load_backtest_bars(
     bar_type: BarType,
     start: Timestamp,
     end: Timestamp,
+    market: SlcMarket,
     price_precision: u8,
 ) -> anyhow::Result<Vec<Bar>> {
     let mut candlesticks = Vec::new();
-    let mut cursor = us_market_date(start)?;
-    let end_date = us_market_date(end)?;
+    let mut cursor = market_date(start, market)?;
+    let end_date = market_date(end, market)?;
     while cursor <= end_date {
         let chunk_end = cursor
             .checked_add(time::Duration::days(HISTORY_CHUNK_DAYS - 1))
@@ -5448,9 +6733,9 @@ fn parse_backtest_bars(
     Ok(bars)
 }
 
-/// 将 UTC 时间戳转换为 Longbridge offset history 接口要求的美股市场本地时间
-fn us_market_datetime(timestamp: Timestamp) -> anyhow::Result<PrimitiveDateTime> {
-    let local = timestamp.to_zoned(get_timezone(US_TIMEZONE)?);
+/// 将 UTC 时间戳转换为 Longbridge offset history 接口要求的所选市场本地时间
+fn market_datetime(timestamp: Timestamp, market: SlcMarket) -> anyhow::Result<PrimitiveDateTime> {
+    let local = timestamp.to_zoned(get_timezone(market.timezone_name())?);
     let date = local.date();
     Ok(PrimitiveDateTime::new(
         Date::from_calendar_date(
@@ -5466,42 +6751,56 @@ fn us_market_datetime(timestamp: Timestamp) -> anyhow::Result<PrimitiveDateTime>
     ))
 }
 
-/// 从 Longbridge 交易日历返回当日权威美股常规收盘时刻及本地分钟数
-async fn current_us_market_close(context: &QuoteContext) -> anyhow::Result<(Timestamp, u16)> {
+/// 从 Longbridge 交易日历返回所选市场当日权威常规收盘时刻及本地分钟数
+async fn current_market_close(
+    context: &QuoteContext,
+    market: SlcMarket,
+) -> anyhow::Result<(Timestamp, u16)> {
     let now = Timestamp::now();
-    let market_date = us_market_date(now)?;
+    let market_date = market_date(now, market)?;
+    let sdk_market = market.sdk_market();
     let trading_days =
-        quote_api_call_with_retry(|| context.trading_days(Market::US, market_date, market_date))
+        quote_api_call_with_retry(|| context.trading_days(sdk_market, market_date, market_date))
             .await
-            .context("failed to query the current US trading day from Longbridge")?;
+            .with_context(|| {
+                format!("failed to query the current {market} trading day from Longbridge")
+            })?;
     if !trading_days.trading_days.contains(&market_date) {
-        anyhow::bail!("{market_date} is not a US trading day");
+        anyhow::bail!("{market_date} is not a {market} trading day");
     }
 
     let close_time = if trading_days.half_trading_days.contains(&market_date) {
-        time::macros::time!(13:00)
+        Time::from_hms(u8::try_from(market.half_day_close_minute() / 60)?, 0, 0)?
     } else {
         quote_api_call_with_retry(|| context.trading_session())
             .await
-            .context("failed to query the current US trading session from Longbridge")?
+            .with_context(|| {
+                format!("failed to query the current {market} trading session from Longbridge")
+            })?
             .into_iter()
-            .find(|session| session.market == Market::US)
+            .find(|session| session.market == sdk_market)
             .and_then(|session| {
                 session
                     .trade_sessions
                     .into_iter()
-                    .find(|session| session.trade_session == TradeSession::Intraday)
+                    .filter(|session| session.trade_session == TradeSession::Intraday)
+                    .max_by_key(|session| session.end_time)
             })
             .map(|session| session.end_time)
-            .context("Longbridge did not return a US regular trading session")?
+            .with_context(|| {
+                format!("Longbridge did not return a {market} regular trading session")
+            })?
     };
     let market_close_minute = u16::from(close_time.hour()) * 60 + u16::from(close_time.minute());
-    Ok((us_market_close_at(now, close_time)?, market_close_minute))
+    Ok((
+        market_close_at(now, close_time, market)?,
+        market_close_minute,
+    ))
 }
 
-/// 将时间戳转换成 America/New_York 时区下的美股市场日历日期
-fn us_market_date(now: Timestamp) -> anyhow::Result<Date> {
-    let timezone = get_timezone(US_TIMEZONE)?;
+/// 将时间戳转换成所选市场时区下的日历日期
+fn market_date(now: Timestamp, market: SlcMarket) -> anyhow::Result<Date> {
+    let timezone = get_timezone(market.timezone_name())?;
     let local_date = now.to_zoned(timezone).date();
     Ok(Date::from_calendar_date(
         i32::from(local_date.year()),
@@ -5510,9 +6809,13 @@ fn us_market_date(now: Timestamp) -> anyhow::Result<Date> {
     )?)
 }
 
-/// 在夏令时切换下解析美股本地收盘时间；遇到缺失或歧义时拒绝猜测
-fn us_market_close_at(now: Timestamp, close_time: Time) -> anyhow::Result<Timestamp> {
-    let timezone = get_timezone(US_TIMEZONE)?;
+/// 在市场时区下解析本地收盘时间；遇到缺失或歧义时拒绝猜测
+fn market_close_at(
+    now: Timestamp,
+    close_time: Time,
+    market: SlcMarket,
+) -> anyhow::Result<Timestamp> {
+    let timezone = get_timezone(market.timezone_name())?;
     let local_date = now.to_zoned(timezone.clone()).date();
     let civil_close_time = CivilTime::new(
         i8::try_from(close_time.hour())?,
@@ -5523,13 +6826,13 @@ fn us_market_close_at(now: Timestamp, close_time: Time) -> anyhow::Result<Timest
     timezone
         .to_ambiguous_timestamp(local_date.to_datetime(civil_close_time))
         .unambiguous()
-        .context("US market close must resolve to one timestamp")
+        .with_context(|| format!("{market} market close must resolve to one timestamp"))
 }
 
 /// 在策略已经经过收盘前退出窗口后，于权威 session close 定时停止节点
 fn schedule_market_close_stop(node: &LiveNode, market_close: Timestamp) -> anyhow::Result<()> {
     let delay = Duration::try_from(Timestamp::now().duration_until(market_close))
-        .context("US market close must be in the future")?;
+        .context("market close must be in the future")?;
     let handle = node.handle();
     log::info!("Longbridge SLC node will stop at market close {market_close}");
     get_runtime().spawn(async move {
@@ -5587,11 +6890,14 @@ impl Drop for TemporaryRiskState {
 }
 
 /// runner 停止后在同一把锁内复制所有 symbol 统计，获得一致的诊断快照
-fn run_statistics_lines(run_statistics: &Mutex<RunStatistics>) -> anyhow::Result<Vec<String>> {
+fn run_statistics_lines(
+    run_statistics: &Mutex<RunStatistics>,
+    timezone: &TimeZone,
+) -> anyhow::Result<Vec<String>> {
     Ok(run_statistics
         .lock()
         .map_err(|_| anyhow::anyhow!("SLC run statistics mutex was poisoned"))?
-        .lines())
+        .lines(timezone))
 }
 
 /// 仅把 5 分钟 Bar 送入撮合；4 小时 Bar 在策略内部按回放时钟推进结构
@@ -5605,6 +6911,7 @@ fn run_backtest_engine(
 ) -> anyhow::Result<BacktestRunResult> {
     let _cleanup = TemporaryRiskState(config.strategy.risk_state_path.clone());
     let account_risk = Arc::new(AccountRisk::load(config.strategy.risk_state_path.clone())?);
+    let signal_arbiter = Arc::new(SignalArbiter::default());
     let run_statistics = Arc::new(Mutex::new(RunStatistics::default()));
     let trading_days = prepared
         .iter()
@@ -5618,14 +6925,16 @@ fn run_backtest_engine(
         })
         .collect::<BTreeSet<_>>();
     println!(
-        "SLC backtest run: sample={sample}, direction={}, risk_reward={}, trading_days={}",
+        "SLC backtest run: sample={sample}, direction={}, level_selection={}, signal_batch_delay_ms={}, risk_reward={}, trading_days={}",
         config.strategy.trade_direction,
+        config.strategy.signal_level_selection,
+        config.strategy.signal_batch_delay_ms,
         config.strategy.risk_reward,
         trading_days.len(),
     );
     let flatten_minute = RTH_CLOSE_MINUTE
         .checked_sub(config.strategy.session.flatten_before_close_minutes)
-        .context("flatten buffer exceeds the regular US trading session")?;
+        .context("flatten buffer exceeds the regular trading session")?;
     anyhow::ensure!(
         config.strategy.session.entry_start_minute < flatten_minute,
         "entry window starts after the SLC backtest pre-close flatten time",
@@ -5669,16 +6978,17 @@ fn run_backtest_engine(
             SlcRunConfig {
                 flatten_minute,
                 backtest_four_hour_bars: Some(prepared.four_hour_bars),
-                round_trip_cost_per_share: config.round_trip_cost_per_share,
+                round_trip_cost_per_share: config.strategy.round_trip_cost_per_share,
                 log_bars: config.log_bars,
                 run_statistics: Arc::clone(&run_statistics),
+                signal_arbiter: Arc::clone(&signal_arbiter),
             },
         )?)?;
     }
     engine.add_data(data, None, true, true)?;
     engine.run(None, None, None, false)?;
 
-    for line in run_statistics_lines(&run_statistics)? {
+    for line in run_statistics_lines(&run_statistics, &config.strategy.timezone)? {
         println!("{line}");
     }
 
@@ -5754,7 +7064,7 @@ async fn selector_target_trading_date(
     context: &QuoteContext,
     now: Timestamp,
 ) -> anyhow::Result<Date> {
-    let today = us_market_date(now)?;
+    let today = market_date(now, SlcMarket::Us)?;
     let end = today
         .checked_add(time::Duration::days(14))
         .context("failed to build Longbridge trading-day query range")?;
@@ -5852,6 +7162,167 @@ async fn retain_supported_screener_candidates(
     Ok(())
 }
 
+/// 返回目標交易日前最近的完整交易日；半日市不納入固定午間窗口，避免分母失真
+async fn selector_liquidity_dates(
+    context: &QuoteContext,
+    trading_date: Date,
+    lookback_days: usize,
+) -> anyhow::Result<Vec<Date>> {
+    let start = trading_date
+        .checked_sub(time::Duration::days(TRADING_DAYS_CHUNK_DAYS))
+        .context("failed to build SLC liquidity lookback range")?;
+    let end = trading_date
+        .previous_day()
+        .context("failed to build SLC liquidity lookback end date")?;
+    let calendar = quote_api_call_with_retry(|| context.trading_days(Market::US, start, end))
+        .await
+        .context("failed to query SLC liquidity trading days from Longbridge")?;
+    let half_days = calendar
+        .half_trading_days
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut dates = calendar
+        .trading_days
+        .into_iter()
+        .filter(|date| *date < trading_date && !half_days.contains(date))
+        .collect::<Vec<_>>();
+    dates.sort_unstable();
+    if dates.len() > lookback_days {
+        dates.drain(..dates.len() - lookback_days);
+    }
+    anyhow::ensure!(
+        dates.len() == lookback_days,
+        "Longbridge returned only {} complete US trading days for the configured {}-day liquidity lookback",
+        dates.len(),
+        lookback_days,
+    );
+    Ok(dates)
+}
+
+/// 計算固定午間窗口的每分鐘均量和窒息率；缺失、零成交或 OHLC 四價相同均視為窒息 Bar
+fn summarize_liquidity_continuity(
+    dates: &[Date],
+    candlesticks: &[Candlestick],
+    window_start_minute: u16,
+    window_end_minute: u16,
+) -> anyhow::Result<LiquidityContinuity> {
+    anyhow::ensure!(!dates.is_empty(), "SLC liquidity dates must not be empty");
+    let window_minutes = window_end_minute
+        .checked_sub(window_start_minute)
+        .filter(|minutes| *minutes > 0 && minutes.is_multiple_of(FIVE_MINUTES))
+        .context("SLC liquidity window must contain complete 5-minute bars")?;
+    let unique_dates = dates.iter().copied().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        unique_dates.len() == dates.len(),
+        "SLC liquidity dates must be unique",
+    );
+    let expected_bars = unique_dates
+        .len()
+        .checked_mul(usize::from(window_minutes / FIVE_MINUTES))
+        .context("SLC liquidity expected bar count overflowed")?;
+    let timezone = get_timezone(US_TIMEZONE)?;
+    let mut observed = BTreeMap::new();
+    for candlestick in candlesticks {
+        let timestamp = Timestamp::from_nanosecond(candlestick.timestamp.unix_timestamp_nanos())?;
+        let local = timestamp.to_zoned(timezone.clone());
+        let date = market_date(timestamp, SlcMarket::Us)?;
+        let minute = u16::try_from(local.hour())? * 60 + u16::try_from(local.minute())?;
+        if unique_dates.contains(&date)
+            && (window_start_minute..window_end_minute).contains(&minute)
+            && (minute - window_start_minute).is_multiple_of(FIVE_MINUTES)
+        {
+            observed.insert((date, minute), candlestick);
+        }
+    }
+    let missing_bars = expected_bars.saturating_sub(observed.len());
+    let stale_observed_bars = observed
+        .values()
+        .filter(|candlestick| {
+            candlestick.volume <= 0
+                || (candlestick.open == candlestick.high
+                    && candlestick.high == candlestick.low
+                    && candlestick.low == candlestick.close)
+        })
+        .count();
+    let total_volume = observed.values().fold(Decimal::ZERO, |total, candlestick| {
+        total + Decimal::from(candlestick.volume.max(0))
+    });
+    let expected_minutes = expected_bars
+        .checked_mul(usize::from(FIVE_MINUTES))
+        .context("SLC liquidity expected minute count overflowed")?;
+    let average_volume_per_minute = total_volume / Decimal::from(expected_minutes);
+    let stale_bar_ratio =
+        Decimal::from(missing_bars + stale_observed_bars) / Decimal::from(expected_bars);
+    Ok(LiquidityContinuity {
+        average_volume_per_minute,
+        stale_bar_ratio,
+        observed_bars: observed.len(),
+        expected_bars,
+    })
+}
+
+/// 按原有多空排序逐一驗證歷史午間流動性，通過足量標的後立即停止額外行情請求
+async fn select_liquid_candidates(
+    context: &QuoteContext,
+    candidates: Vec<ScreenerCandidate>,
+    rules: &SelectorRules,
+    dates: &[Date],
+) -> anyhow::Result<Vec<(ScreenerCandidate, LiquidityContinuity)>> {
+    let start = *dates
+        .first()
+        .context("SLC liquidity dates must not be empty")?;
+    let end = *dates
+        .last()
+        .context("SLC liquidity dates must not be empty")?;
+    let candidate_count = candidates.len();
+    let mut selected = Vec::with_capacity(rules.max_symbols);
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        let candlesticks = quote_api_call_with_retry(|| {
+            context.history_candlesticks_by_date(
+                candidate.symbol.clone(),
+                Period::FiveMinute,
+                AdjustType::NoAdjust,
+                Some(start),
+                Some(end),
+                TradeSessions::Intraday,
+            )
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "failed to request historical FiveMinute liquidity bars for {} from {start} through {end}",
+                candidate.symbol,
+            )
+        })?;
+        let metrics = summarize_liquidity_continuity(
+            dates,
+            &candlesticks,
+            LIQUIDITY_WINDOW_START_MINUTE,
+            LIQUIDITY_WINDOW_END_MINUTE,
+        )?;
+        let accepted = metrics.average_volume_per_minute >= rules.minimum_average_volume_per_minute
+            && metrics.stale_bar_ratio <= rules.maximum_stale_bar_ratio;
+        println!(
+            "[{}/{}] SLC selector liquidity {}: result={}, average_volume_per_minute={}, stale_bar_ratio={}%, bars={}/{}, window=11:30-14:00 ET",
+            index + 1,
+            candidate_count,
+            candidate.symbol,
+            if accepted { "accepted" } else { "rejected" },
+            metrics.average_volume_per_minute.round_dp(2),
+            (metrics.stale_bar_ratio * Decimal::from(100)).round_dp(2),
+            metrics.observed_bars,
+            metrics.expected_bars,
+        );
+        if accepted {
+            selected.push((candidate, metrics));
+            if selected.len() == rules.max_symbols {
+                break;
+            }
+        }
+    }
+    Ok(selected)
+}
+
 /// 覆盖写入一份完整 TOML 快照并同步文件内容，交易节点只能在本程序成功退出后启动
 fn write_dynamic_universe_snapshot(
     path: &Path,
@@ -5879,6 +7350,10 @@ fn write_dynamic_universe_snapshot(
 async fn run_selector(config_path: &Path) -> anyhow::Result<()> {
     let file_config = load_config_file(config_path)?;
     let app_config = AppConfig::from_file_config(&file_config, config_path)?;
+    anyhow::ensure!(
+        app_config.market == SlcMarket::Us,
+        "the Longbridge SLC premarket selector currently supports only market=us; use a fixed HK universe",
+    );
     let rules = SelectorRules::from_settings(&file_config.universe, app_config.trade_direction)?;
     let sdk_config = app_config.data_config().sdk_config().await?;
     let screener_context = ScreenerContext::new(Arc::clone(&sdk_config));
@@ -5912,27 +7387,48 @@ async fn run_selector(config_path: &Path) -> anyhow::Result<()> {
         shorts.len(),
     );
     retain_supported_screener_candidates(&quote_context, &mut longs, &mut shorts).await?;
+    let candidate_count = longs.len() + shorts.len();
+    let candidates =
+        select_balanced_candidates(longs, shorts, app_config.trade_direction, candidate_count);
+    let liquidity_dates =
+        selector_liquidity_dates(&quote_context, trading_date, rules.liquidity_lookback_days)
+            .await?;
+    println!(
+        "SLC selector liquidity check: candidates={}, sessions={}..={} ({} complete days), minimum_average_volume_per_minute={}, maximum_stale_bar_ratio={}%, window=11:30-14:00 ET",
+        candidates.len(),
+        liquidity_dates
+            .first()
+            .expect("liquidity dates checked above"),
+        liquidity_dates
+            .last()
+            .expect("liquidity dates checked above"),
+        liquidity_dates.len(),
+        rules.minimum_average_volume_per_minute,
+        (rules.maximum_stale_bar_ratio * Decimal::from(100)).round_dp(2),
+    );
     let selected =
-        select_balanced_candidates(longs, shorts, app_config.trade_direction, rules.max_symbols);
+        select_liquid_candidates(&quote_context, candidates, &rules, &liquidity_dates).await?;
     anyhow::ensure!(
         !selected.is_empty(),
-        "Longbridge screener produced no supported SLC universe symbols",
+        "Longbridge screener produced no SLC symbols passing the historical 5-minute liquidity filter",
     );
     let symbols = selected
         .into_iter()
-        .map(|candidate| {
+        .map(|(candidate, liquidity)| {
             let side_bias = match candidate.side {
                 OrderSide::Buy => "long",
                 OrderSide::Sell => "short",
                 _ => unreachable!("SLC selector only supports buy or sell side bias"),
             };
             println!(
-                "SLC selector selected {}: side_bias={}, prevchg={}%, amplitude={}%, average_daily_turnover={}, market_cap={}",
+                "SLC selector selected {}: side_bias={}, prevchg={}%, amplitude={}%, average_daily_turnover={}, average_volume_per_minute={}, stale_bar_ratio={}%, market_cap={}",
                 candidate.symbol,
                 side_bias,
                 candidate.previous_change_pct,
                 candidate.daily_amplitude_pct,
                 candidate.average_daily_turnover,
+                liquidity.average_volume_per_minute.round_dp(2),
+                (liquidity.stale_bar_ratio * Decimal::from(100)).round_dp(2),
                 candidate.market_cap,
             );
             DynamicSymbolEntry {
@@ -5943,6 +7439,8 @@ async fn run_selector(config_path: &Path) -> anyhow::Result<()> {
                 previous_change_pct: candidate.previous_change_pct.to_string(),
                 daily_amplitude_pct: candidate.daily_amplitude_pct.to_string(),
                 average_daily_turnover: candidate.average_daily_turnover.to_string(),
+                average_volume_per_minute: liquidity.average_volume_per_minute.to_string(),
+                stale_bar_ratio: liquidity.stale_bar_ratio.to_string(),
                 market_cap: candidate.market_cap.to_string(),
             }
         })
@@ -5983,6 +7481,12 @@ pub(super) async fn run(backtest: bool, selector: bool) -> anyhow::Result<()> {
 async fn run_backtest(config_path: &Path) -> anyhow::Result<()> {
     let config = SlcBacktestConfig::load(config_path)?;
     println!("SLC configuration loaded from {}", config_path.display());
+    println!(
+        "SLC backtest universe loaded: market={}, source=fixed_config, symbols={}, configured_live_mode={:?}, dynamic_pool_ignored=true",
+        config.strategy.market,
+        config.strategy.instruments.len(),
+        config.strategy.universe_mode,
+    );
     let prepared = tokio::time::timeout(Duration::from_secs(config.timeout_secs), async {
         let sdk_config = config.strategy.data_config().sdk_config().await?;
         let (context, _receiver) = QuoteContext::new(sdk_config);
@@ -6116,7 +7620,8 @@ async fn run_live(config_path: &Path) -> anyhow::Result<()> {
     let config = AppConfig::load(config_path)?;
     log::info!("SLC configuration loaded from {}", config_path.display());
     log::info!(
-        "SLC universe loaded: mode={:?}, symbols={}, dynamic_pool_path={}",
+        "SLC universe loaded: market={}, mode={:?}, symbols={}, dynamic_pool_path={}",
+        config.market,
         config.universe_mode,
         config.instruments.len(),
         config.dynamic_pool_path.display(),
@@ -6129,6 +7634,7 @@ async fn run_live(config_path: &Path) -> anyhow::Result<()> {
         );
     }
     let account_risk = Arc::new(AccountRisk::load(config.risk_state_path.clone())?);
+    let signal_arbiter = Arc::new(SignalArbiter::default());
     let run_statistics = Arc::new(Mutex::new(RunStatistics::default()));
     log::info!(
         "SLC account risk state loaded from {}",
@@ -6149,7 +7655,7 @@ async fn run_live(config_path: &Path) -> anyhow::Result<()> {
         .market_close_minute;
     let flatten_minute = market_close_minute
         .checked_sub(config.session.flatten_before_close_minutes)
-        .context("flatten buffer exceeds the current US trading session")?;
+        .context("flatten buffer exceeds the current market trading session")?;
     anyhow::ensure!(
         config.session.entry_start_minute < flatten_minute,
         "entry window starts after today's pre-close flatten time",
@@ -6210,15 +7716,16 @@ async fn run_live(config_path: &Path) -> anyhow::Result<()> {
             SlcRunConfig {
                 flatten_minute,
                 backtest_four_hour_bars: None,
-                round_trip_cost_per_share: Decimal::ZERO,
+                round_trip_cost_per_share: config.round_trip_cost_per_share,
                 log_bars: true,
                 run_statistics: Arc::clone(&run_statistics),
+                signal_arbiter: Arc::clone(&signal_arbiter),
             },
         )?)?;
     }
     schedule_market_close_stop(&node, market_close)?;
     let result = node.run().await;
-    match run_statistics_lines(&run_statistics) {
+    match run_statistics_lines(&run_statistics, &config.timezone) {
         Ok(lines) => {
             for line in lines {
                 log::info!("{line}");
@@ -6245,13 +7752,24 @@ mod tests {
         close: &str,
         timestamp: &str,
     ) -> Candlestick {
+        sdk_candlestick_with_volume(open, high, low, close, 100, timestamp)
+    }
+
+    fn sdk_candlestick_with_volume(
+        open: &str,
+        high: &str,
+        low: &str,
+        close: &str,
+        volume: i64,
+        timestamp: &str,
+    ) -> Candlestick {
         toml::from_str(&format!(
             r#"
 open = "{open}"
 high = "{high}"
 low = "{low}"
 close = "{close}"
-volume = 100
+volume = {volume}
 turnover = "10000"
 timestamp = "{timestamp}"
 trade_session = "Intraday"
@@ -6259,6 +7777,40 @@ open_updated = true
 "#,
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn liquidity_continuity_counts_missing_and_one_price_bars() {
+        let date = time::macros::date!(2026 - 09 - 03);
+        let metrics = summarize_liquidity_continuity(
+            &[date],
+            &[
+                sdk_candlestick_with_volume(
+                    "100.00",
+                    "100.10",
+                    "99.90",
+                    "100.05",
+                    600,
+                    "2026-09-03T15:30:00Z",
+                ),
+                sdk_candlestick_with_volume(
+                    "100.05",
+                    "100.05",
+                    "100.05",
+                    "100.05",
+                    300,
+                    "2026-09-03T15:35:00Z",
+                ),
+            ],
+            11 * 60 + 30,
+            11 * 60 + 45,
+        )
+        .unwrap();
+
+        assert_eq!(metrics.average_volume_per_minute, Decimal::from(60));
+        assert_eq!(metrics.stale_bar_ratio.round_dp(4), Decimal::new(6_667, 4),);
+        assert_eq!(metrics.observed_bars, 2);
+        assert_eq!(metrics.expected_bars, 3);
     }
 
     fn bar(
@@ -6292,6 +7844,67 @@ open_updated = true
             close,
             timestamp,
         )
+    }
+
+    fn active_trade(side: OrderSide) -> ActiveTrade {
+        ActiveTrade {
+            side,
+            level: SignalLevel::Fresh,
+            level_age_bars: 1,
+            confirmation_bars: 1,
+            confirmation_close_location: 0.5,
+            distance_atr: 0.0,
+            zone_width_atr: 1.0,
+            displacement_strength_atr: 2.0,
+            risk_atr: 1.0,
+            recent_range: Some(Decimal::from(2)),
+            entry_minute: 600,
+            entry_limit: Price::from("100.00"),
+            stop: if side == OrderSide::Buy {
+                Price::from("99.00")
+            } else {
+                Price::from("101.00")
+            },
+            target: if side == OrderSide::Buy {
+                Price::from("102.00")
+            } else {
+                Price::from("98.00")
+            },
+            opposing_level: None,
+            remaining_daily_range: None,
+            first_fill_ts: UnixNanos::from(1),
+            filled_qty: Decimal::from(10),
+            protected_qty: Decimal::from(10),
+            fill_notional: Decimal::from(1_000),
+            initial_risk: Decimal::from(10),
+            maximum_favorable_excursion: Decimal::ZERO,
+            maximum_adverse_excursion: Decimal::ZERO,
+            bars_held: 0,
+            exit_reason: None,
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(OrderSide::Buy, "101.00", "100.26", "100.25")]
+    #[case(OrderSide::Sell, "99.00", "99.74", "99.75")]
+    fn profit_protection_arms_after_trigger_and_exits_at_floor(
+        #[case] side: OrderSide,
+        #[case] trigger_price: &str,
+        #[case] above_floor: &str,
+        #[case] floor: &str,
+    ) {
+        let mut trade = active_trade(side);
+        trade.observe_price(Price::from(trigger_price));
+
+        assert!(!trade.should_protect_profit(
+            Price::from(above_floor),
+            Decimal::ONE,
+            Decimal::new(25, 2),
+        ));
+        assert!(
+            trade.should_protect_profit(Price::from(floor), Decimal::ONE, Decimal::new(25, 2),)
+        );
+        assert!(!trade.should_protect_profit(Price::from(floor), Decimal::ZERO, Decimal::ZERO,));
     }
 
     #[test]
@@ -6352,6 +7965,28 @@ open_updated = true
         assert_eq!(bars[0].high, Price::from("101.00"));
         assert_eq!(bars[0].low, Price::from("99.00"));
         assert_eq!(bars[0].close, Price::from("100.50"));
+    }
+
+    #[test]
+    fn four_hour_warmup_accepts_all_available_history_for_a_new_listing() {
+        let bars = parse_warmup_bars(
+            "SKHY.US",
+            Period::FourHour,
+            BarType::from("SKHY.US.LONGBRIDGE-4-HOUR-LAST-EXTERNAL"),
+            vec![sdk_candlestick(
+                "100.00",
+                "101.00",
+                "99.00",
+                "100.50",
+                "2026-07-31T14:00:00Z",
+            )],
+            60,
+            time::macros::datetime!(2026-08-01 00:00 UTC),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(bars.len(), 1);
     }
 
     #[rstest::rstest]
@@ -6436,11 +8071,16 @@ open_updated = true
 
     fn signal_rules() -> SignalRules {
         SignalRules {
+            market: SlcMarket::Us,
             trade_direction: TradeDirection::Both,
+            level_selection: SignalLevelSelection::All,
+            stop_distance_model: StopDistanceModel::Atr,
+            recent_range_lookback_bars: 5,
             zone_ttl_bars: 234,
             minimum_fresh_level_age_bars: 1,
             max_zones_per_side: 8,
             confirmation_window_bars: 6,
+            maximum_confirmation_distance_atr: 1.0,
             displacement_atr_multiple: 1.0,
             displacement_close_fraction: 0.35,
             displacement_max_bars: 3,
@@ -6470,6 +8110,7 @@ open_updated = true
             previous_k: None,
             demand: VecDeque::new(),
             supply: VecDeque::new(),
+            daily_range: DailyRangeTracker::new(SlcMarket::Us, get_timezone(US_TIMEZONE).unwrap()),
             funnel: SignalFunnel::default(),
             rules: signal_rules(),
         }
@@ -6587,20 +8228,23 @@ open_updated = true
 
     #[rstest::rstest]
     fn test_parse_multiple_symbol_configs() {
-        let instruments = parse_instruments(&[
-            SymbolConfigEntry {
-                symbol: "QQQ.US".to_string(),
-                price_increment: "0.01".to_string(),
-            },
-            SymbolConfigEntry {
-                symbol: "AAPL.US".to_string(),
-                price_increment: "0.01".to_string(),
-            },
-            SymbolConfigEntry {
-                symbol: "MSFT.US".to_string(),
-                price_increment: "0.01".to_string(),
-            },
-        ])
+        let instruments = parse_instruments(
+            &[
+                SymbolConfigEntry {
+                    symbol: "QQQ.US".to_string(),
+                    price_increment: "0.01".to_string(),
+                },
+                SymbolConfigEntry {
+                    symbol: "AAPL.US".to_string(),
+                    price_increment: "0.01".to_string(),
+                },
+                SymbolConfigEntry {
+                    symbol: "MSFT.US".to_string(),
+                    price_increment: "0.01".to_string(),
+                },
+            ],
+            SlcMarket::Us,
+        )
         .unwrap();
 
         assert_eq!(instruments.len(), 3);
@@ -6613,27 +8257,33 @@ open_updated = true
     #[rstest::rstest]
     fn test_parse_symbol_config_rejects_duplicates() {
         assert!(
-            parse_instruments(&[
-                SymbolConfigEntry {
-                    symbol: "QQQ.US".to_string(),
-                    price_increment: "0.01".to_string(),
-                },
-                SymbolConfigEntry {
-                    symbol: "QQQ.US".to_string(),
-                    price_increment: "0.01".to_string(),
-                },
-            ])
+            parse_instruments(
+                &[
+                    SymbolConfigEntry {
+                        symbol: "QQQ.US".to_string(),
+                        price_increment: "0.01".to_string(),
+                    },
+                    SymbolConfigEntry {
+                        symbol: "QQQ.US".to_string(),
+                        price_increment: "0.01".to_string(),
+                    },
+                ],
+                SlcMarket::Us
+            )
             .is_err()
         );
     }
 
     #[rstest::rstest]
-    fn test_parse_symbol_config_rejects_non_us_equities() {
+    fn test_parse_symbol_config_rejects_market_suffix_mismatch() {
         assert!(
-            parse_instruments(&[SymbolConfigEntry {
-                symbol: "0700.HK".to_string(),
-                price_increment: "0.001".to_string(),
-            }])
+            parse_instruments(
+                &[SymbolConfigEntry {
+                    symbol: "0700.HK".to_string(),
+                    price_increment: "0.001".to_string(),
+                }],
+                SlcMarket::Us
+            )
             .is_err()
         );
     }
@@ -6642,7 +8292,7 @@ open_updated = true
     fn dynamic_pool_snapshot_is_dated_directional_and_bounded() {
         let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
         let now = Timestamp::now();
-        let trading_date = us_market_date(now).unwrap().to_string();
+        let trading_date = market_date(now, SlcMarket::Us).unwrap().to_string();
         let path = env::temp_dir().join(format!(
             "nautilus-slc-dynamic-universe-{}-{}.toml",
             std::process::id(),
@@ -6662,6 +8312,8 @@ open_updated = true
                 previous_change_pct: "1.2".to_string(),
                 daily_amplitude_pct: "2.1".to_string(),
                 average_daily_turnover: "1000000".to_string(),
+                average_volume_per_minute: "2000".to_string(),
+                stale_bar_ratio: "0.01".to_string(),
                 market_cap: "1000000000".to_string(),
             }],
         };
@@ -6750,19 +8402,60 @@ open_updated = true
 
         assert_eq!(config.instruments.len(), file.symbols.len());
         assert!(!config.instruments.is_empty());
-        assert_eq!(config.risk_amount, Decimal::from(100));
-        assert_eq!(config.max_account_notional, Decimal::from(60_000));
+        assert_eq!(
+            config.risk_amount,
+            file.risk.risk_amount.parse::<Decimal>().unwrap(),
+        );
+        assert_eq!(config.max_account_notional, Decimal::from(100_000));
         assert_eq!(config.max_order_quantity, Quantity::from(1_000));
         assert_eq!(config.max_order_notional, Decimal::from(20_000));
         assert_eq!(config.per_position_notional_limit(), Decimal::from(20_000));
-        assert_eq!(config.trade_direction, TradeDirection::Both);
-        assert_eq!(config.universe_mode, UniverseMode::Fixed);
+        assert_eq!(
+            config.trade_direction,
+            file.signal.trade_direction.parse().unwrap(),
+        );
+        assert_eq!(
+            config.signal_level_selection,
+            file.signal.level_selection.parse().unwrap(),
+        );
+        assert_eq!(config.signal_batch_delay_ms, file.signal.batch_delay_ms);
+        assert_eq!(config.universe_mode, UniverseMode::Dynamic);
+        assert_eq!(config.profit_protection_trigger_r, Decimal::ONE);
+        assert_eq!(config.profit_protection_floor_r, Decimal::new(25, 2));
+        assert_eq!(
+            config.stop_distance_model,
+            file.signal.stop_distance_model.parse().unwrap(),
+        );
+        assert_eq!(config.stop_distance_model, StopDistanceModel::Hybrid);
+        assert_eq!(config.recent_range_lookback_bars, 5);
+        assert_eq!(
+            config.confirmation_window_bars,
+            file.signal.confirmation_window_bars,
+        );
+        assert_eq!(
+            config.maximum_confirmation_distance_atr,
+            file.signal.maximum_confirmation_distance_atr,
+        );
+        assert_eq!(
+            config.recent_range_multiple,
+            file.signal.recent_range_multiple.parse().unwrap(),
+        );
         assert!(config.papertrading);
 
         let backtest = SlcBacktestConfig::load(Path::new(DEFAULT_CONFIG_PATH)).unwrap();
         assert!(backtest.start < backtest.end);
         assert_eq!(backtest.risk_rewards, vec![Decimal::from(2)],);
         assert!(backtest.walk_forward.is_none());
+    }
+
+    #[rstest::rstest]
+    fn confirmation_distance_must_be_positive() {
+        let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
+        file.signal.maximum_confirmation_distance_atr = 0.0;
+
+        let e = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap_err();
+
+        assert!(e.to_string().contains("maximum confirmation distance ATR"));
     }
 
     #[rstest::rstest]
@@ -6794,11 +8487,89 @@ open_updated = true
         assert!(!has_five_minute_gap(
             first,
             UnixNanos::from(first.as_u64() + FIVE_MINUTE_NANOS),
+            SlcMarket::Us,
         ));
         assert!(has_five_minute_gap(
             first,
             UnixNanos::from(first.as_u64() + FIVE_MINUTE_NANOS * 2),
+            SlcMarket::Us,
         ));
+    }
+
+    #[test]
+    fn hong_kong_market_profile_accepts_lunch_break_and_board_lots() {
+        let config_path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/slc_hk_symbols.toml"
+        ));
+        let file: SlcFileConfig = toml::from_str(include_str!("../slc_hk_symbols.toml")).unwrap();
+        let config = AppConfig::from_file_config(&file, config_path).unwrap();
+        assert_eq!(config.market, SlcMarket::Hk);
+        assert_eq!(config.trade_direction, TradeDirection::Long);
+        assert_eq!(config.instruments.len(), 10);
+        assert_eq!(
+            SlcBacktestConfig::load(config_path)
+                .unwrap()
+                .starting_balance
+                .currency,
+            Currency::HKD(),
+        );
+        assert!(SlcMarket::Hk.is_regular_bar_start(11 * 60 + 55));
+        assert!(!SlcMarket::Hk.is_regular_bar_start(HK_LUNCH_START_MINUTE));
+        assert!(SlcMarket::Hk.is_regular_bar_start(HK_LUNCH_END_MINUTE));
+
+        let instruments = parse_instruments(
+            &[SymbolConfigEntry {
+                symbol: "700.HK".to_string(),
+                price_increment: "0.5".to_string(),
+            }],
+            SlcMarket::Hk,
+        )
+        .unwrap();
+        assert_eq!(
+            instruments[0].instrument_id,
+            InstrumentId::from("700.HK.LONGBRIDGE"),
+        );
+
+        let morning_last = UnixNanos::from("2026-09-04T03:55:00Z".parse::<Timestamp>().unwrap());
+        let afternoon_first = UnixNanos::from("2026-09-04T05:00:00Z".parse::<Timestamp>().unwrap());
+        assert!(!has_five_minute_gap(
+            morning_last,
+            afternoon_first,
+            SlcMarket::Hk,
+        ));
+        assert!(has_five_minute_gap(
+            morning_last,
+            afternoon_first,
+            SlcMarket::Us,
+        ));
+
+        assert_eq!(
+            risk_sized_quantity(
+                Price::from("600"),
+                Price::from("598"),
+                Decimal::from(1_000),
+                Quantity::from(10_000),
+                Decimal::from(1_000_000),
+                Quantity::from(100),
+            )
+            .unwrap(),
+            Some(Quantity::from(500)),
+        );
+    }
+
+    #[test]
+    fn recent_bar_range_uses_only_the_configured_latest_bars() {
+        let bars = VecDeque::from([
+            five_minute_bar("100", "120", "80", "100", 1),
+            five_minute_bar("100", "101", "99", "100", 2),
+            five_minute_bar("100", "103", "98", "100", 3),
+            five_minute_bar("100", "102", "97", "100", 4),
+            five_minute_bar("100", "104", "100", "101", 5),
+        ]);
+        let current = five_minute_bar("101", "102", "96", "100", 6);
+
+        assert_eq!(recent_bar_range(&bars, current, 5), Some(Decimal::from(8)));
     }
 
     #[rstest::rstest]
@@ -6907,6 +8678,7 @@ open_updated = true
                 no_confirmation,
                 true,
                 OrderSide::Buy,
+                2.0,
                 rules,
             ),
             None,
@@ -6919,6 +8691,7 @@ open_updated = true
                 no_confirmation,
                 true,
                 OrderSide::Buy,
+                2.0,
                 rules,
             ),
             None,
@@ -6943,11 +8716,82 @@ open_updated = true
                 },
                 true,
                 OrderSide::Buy,
+                2.0,
                 rules,
             ),
             None,
         );
         assert_eq!(zones[0].state, ZoneState::AwaitingConfirmation);
+    }
+
+    #[rstest::rstest]
+    fn reclaimed_only_keeps_fresh_level_but_allows_reclaimed_signal() {
+        let rules = SignalRules {
+            level_selection: SignalLevelSelection::ReclaimedOnly,
+            ..signal_rules()
+        };
+        let source = five_minute_bar("100", "101", "99", "100", 1);
+        let touch = five_minute_bar("102", "102", "100", "101.2", 2);
+        let confirmation = Confirmation {
+            extreme: true,
+            reentry: true,
+        };
+        let mut zone = Zone::from_bar(ZoneKind::Demand, source);
+
+        assert_eq!(
+            zone.observe(touch, confirmation, true, OrderSide::Buy, 2.0, rules),
+            ZoneObservation::Keep,
+        );
+        assert_eq!(zone.state, ZoneState::Fresh);
+
+        zone.state = ZoneState::Reclaimed;
+        zone.break_count = 1;
+        assert!(matches!(
+            zone.observe(touch, confirmation, true, OrderSide::Buy, 2.0, rules),
+            ZoneObservation::Signal(Signal {
+                level: SignalLevel::Reclaimed,
+                ..
+            }),
+        ));
+    }
+
+    #[rstest::rstest]
+    fn signal_arbiter_prioritizes_reclaimed_before_fresh() {
+        let arbiter = SignalArbiter::default();
+        let signal_ts = UnixNanos::from(50);
+        let now = UnixNanos::from(100);
+        for (symbol, level) in [
+            ("A.US", SignalLevel::Fresh),
+            ("B.US", SignalLevel::Reclaimed),
+            ("C.US", SignalLevel::Fresh),
+            ("D.US", SignalLevel::Reclaimed),
+        ] {
+            assert!(
+                arbiter
+                    .queue(symbol, level, signal_ts, now, 1)
+                    .unwrap()
+                    .is_some(),
+            );
+        }
+
+        assert_eq!(
+            arbiter.decide("A.US", signal_ts, 3).unwrap(),
+            SignalArbitrationDecision {
+                selected: true,
+                rank: 3,
+                candidates: 4,
+                capacity: 3,
+            },
+        );
+        assert!(arbiter.decide("B.US", signal_ts, 2).unwrap().selected);
+        assert!(!arbiter.decide("C.US", signal_ts, 1).unwrap().selected);
+        assert!(arbiter.decide("D.US", signal_ts, 0).unwrap().selected);
+        assert!(
+            arbiter
+                .queue("LATE.US", SignalLevel::Reclaimed, signal_ts, now, 1)
+                .unwrap()
+                .is_none(),
+        );
     }
 
     #[test]
@@ -6968,6 +8812,7 @@ open_updated = true
                 },
                 true,
                 OrderSide::Buy,
+                2.0,
                 rules,
             ),
             ZoneObservation::Remove,
@@ -6995,6 +8840,7 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
         assert_eq!(fresh, None);
@@ -7009,6 +8855,7 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
         let _ = observe_zones(
@@ -7020,6 +8867,7 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
         let _ = observe_zones(
@@ -7031,6 +8879,7 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
         let reclaimed = observe_zones(
@@ -7042,6 +8891,7 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
 
@@ -7071,6 +8921,7 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
         let signal = observe_zones(
@@ -7082,10 +8933,65 @@ open_updated = true
             },
             true,
             OrderSide::Buy,
+            2.0,
             rules,
         );
 
         assert!(signal.is_some());
+        assert!(zones.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case("102.50", 2.0, true)]
+    #[case("103.50", 2.0, false)]
+    #[case("104.50", 4.0, true)]
+    fn zone_requires_confirmation_close_near_level(
+        #[case] confirmation_close: &str,
+        #[case] current_atr: f64,
+        #[case] accepted: bool,
+    ) {
+        let rules = SignalRules {
+            maximum_confirmation_distance_atr: 1.0,
+            ..signal_rules()
+        };
+        let source = five_minute_bar("100", "101", "99", "100", 1);
+        let touch = five_minute_bar("101", "101", "100", "100.5", 2);
+        let confirmation =
+            five_minute_bar("101.5", confirmation_close, "101.5", confirmation_close, 3);
+        let mut zones = VecDeque::from([Zone::from_displacement(
+            ZoneKind::Demand,
+            source,
+            2.0,
+            1.5,
+            true,
+        )]);
+
+        let _ = observe_zones(
+            &mut zones,
+            touch,
+            Confirmation {
+                extreme: true,
+                reentry: false,
+            },
+            true,
+            OrderSide::Buy,
+            current_atr,
+            rules,
+        );
+        let signal = observe_zones(
+            &mut zones,
+            confirmation,
+            Confirmation {
+                extreme: false,
+                reentry: true,
+            },
+            true,
+            OrderSide::Buy,
+            current_atr,
+            rules,
+        );
+
+        assert_eq!(signal.is_some(), accepted);
         assert!(zones.is_empty());
     }
 
@@ -7105,16 +9011,32 @@ open_updated = true
         };
 
         assert_eq!(
-            observe_zones(&mut zones, broken, idle, true, OrderSide::Sell, rules),
+            observe_zones(&mut zones, broken, idle, true, OrderSide::Sell, 2.0, rules),
             None,
         );
         assert_eq!(zones[0].state, ZoneState::BrokenOnce);
         assert_eq!(
-            observe_zones(&mut zones, still_above, idle, true, OrderSide::Sell, rules,),
+            observe_zones(
+                &mut zones,
+                still_above,
+                idle,
+                true,
+                OrderSide::Sell,
+                2.0,
+                rules,
+            ),
             None,
         );
         assert_eq!(
-            observe_zones(&mut zones, reclaimed, idle, true, OrderSide::Sell, rules,),
+            observe_zones(
+                &mut zones,
+                reclaimed,
+                idle,
+                true,
+                OrderSide::Sell,
+                2.0,
+                rules,
+            ),
             None,
         );
         assert_eq!(zones[0].state, ZoneState::Reclaimed);
@@ -7128,6 +9050,7 @@ open_updated = true
                 },
                 true,
                 OrderSide::Sell,
+                2.0,
                 rules,
             ),
             None,
@@ -7141,6 +9064,7 @@ open_updated = true
             },
             true,
             OrderSide::Sell,
+            2.0,
             rules,
         );
 
@@ -7161,9 +9085,25 @@ open_updated = true
             reentry: false,
         };
 
-        let _ = observe_zones(&mut zones, broken, idle, true, OrderSide::Sell, rules);
-        let _ = observe_zones(&mut zones, reclaimed, idle, true, OrderSide::Sell, rules);
-        let _ = observe_zones(&mut zones, second_break, idle, true, OrderSide::Sell, rules);
+        let _ = observe_zones(&mut zones, broken, idle, true, OrderSide::Sell, 2.0, rules);
+        let _ = observe_zones(
+            &mut zones,
+            reclaimed,
+            idle,
+            true,
+            OrderSide::Sell,
+            2.0,
+            rules,
+        );
+        let _ = observe_zones(
+            &mut zones,
+            second_break,
+            idle,
+            true,
+            OrderSide::Sell,
+            2.0,
+            rules,
+        );
 
         assert!(zones.is_empty());
     }
@@ -7176,6 +9116,8 @@ open_updated = true
             entry: Price::from("100.00"),
             zone_low: Price::from("98.00"),
             zone_high: Price::from("99.00"),
+            risk_atr: 2.0,
+            recent_range: Some(Decimal::from(2)),
             level_age_bars: 1,
             confirmation_bars: 0,
             confirmation_close_location: 0.75,
@@ -7184,7 +9126,17 @@ open_updated = true
             displacement_strength_atr: 1.0,
             ts_event: UnixNanos::from(1),
         };
-        let (stop, entry_limit) = entry_prices(signal, Price::from("0.01"), 2, 1, 5).unwrap();
+        let (stop, entry_limit) = entry_prices(
+            signal,
+            Price::from("0.01"),
+            2,
+            1,
+            StopDistanceModel::Atr,
+            0.5,
+            Decimal::new(5, 1),
+            5,
+        )
+        .unwrap();
         let quantity = risk_sized_quantity(
             entry_limit,
             stop,
@@ -7208,6 +9160,133 @@ open_updated = true
         assert_eq!(entry_limit, Price::from("100.05"));
         assert_eq!(target, Price::from("104.11"));
         assert_eq!(quantity, Some(Quantity::from(12)));
+    }
+
+    #[rstest::rstest]
+    #[case(OrderSide::Buy, "99.95", "100.05", "99.05")]
+    #[case(OrderSide::Sell, "99.95", "100.05", "100.95")]
+    fn test_entry_stop_keeps_at_least_half_atr_from_worst_entry(
+        #[case] side: OrderSide,
+        #[case] zone_low: &str,
+        #[case] zone_high: &str,
+        #[case] expected_stop: &str,
+    ) {
+        let signal = Signal {
+            side,
+            level: SignalLevel::Fresh,
+            entry: Price::from("100.00"),
+            zone_low: Price::from(zone_low),
+            zone_high: Price::from(zone_high),
+            risk_atr: 2.0,
+            recent_range: Some(Decimal::from(2)),
+            level_age_bars: 1,
+            confirmation_bars: 0,
+            confirmation_close_location: 0.75,
+            distance_atr: 0.0,
+            zone_width_atr: 0.05,
+            displacement_strength_atr: 1.0,
+            ts_event: UnixNanos::from(1),
+        };
+
+        let (stop, _) = entry_prices(
+            signal,
+            Price::from("0.01"),
+            2,
+            1,
+            StopDistanceModel::Atr,
+            0.5,
+            Decimal::new(5, 1),
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(stop, Price::from(expected_stop));
+    }
+
+    #[rstest::rstest]
+    #[case(OrderSide::Buy, "99.05")]
+    #[case(OrderSide::Sell, "100.95")]
+    fn recent_range_stop_is_symmetric_around_the_worst_entry(
+        #[case] side: OrderSide,
+        #[case] expected_stop: &str,
+    ) {
+        let signal = Signal {
+            side,
+            level: SignalLevel::Fresh,
+            entry: Price::from("100.00"),
+            zone_low: Price::from("99.50"),
+            zone_high: Price::from("100.50"),
+            risk_atr: 2.0,
+            recent_range: Some(Decimal::from(2)),
+            level_age_bars: 1,
+            confirmation_bars: 0,
+            confirmation_close_location: 0.75,
+            distance_atr: 0.0,
+            zone_width_atr: 0.5,
+            displacement_strength_atr: 1.0,
+            ts_event: UnixNanos::from(1),
+        };
+
+        let (stop, _) = entry_prices(
+            signal,
+            Price::from("0.01"),
+            2,
+            1,
+            StopDistanceModel::RecentRange,
+            3.0,
+            Decimal::new(5, 1),
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(stop, Price::from(expected_stop));
+    }
+
+    #[rstest::rstest]
+    #[case(OrderSide::Buy, "97.00", "100.50", 0.5, "2", "96.99")]
+    #[case(OrderSide::Sell, "99.50", "103.00", 0.5, "2", "103.01")]
+    #[case(OrderSide::Buy, "99.50", "100.50", 0.75, "2", "98.55")]
+    #[case(OrderSide::Sell, "99.50", "100.50", 0.75, "2", "101.45")]
+    #[case(OrderSide::Buy, "99.50", "100.50", 0.25, "3", "98.55")]
+    #[case(OrderSide::Sell, "99.50", "100.50", 0.25, "3", "101.45")]
+    fn hybrid_stop_uses_farthest_structure_atr_or_recent_range(
+        #[case] side: OrderSide,
+        #[case] zone_low: &str,
+        #[case] zone_high: &str,
+        #[case] atr_multiple: f64,
+        #[case] recent_range: &str,
+        #[case] expected_stop: &str,
+    ) {
+        let signal = Signal {
+            side,
+            level: SignalLevel::Fresh,
+            entry: Price::from("100.00"),
+            zone_low: Price::from(zone_low),
+            zone_high: Price::from(zone_high),
+            risk_atr: 2.0,
+            recent_range: Some(recent_range.parse().unwrap()),
+            level_age_bars: 1,
+            confirmation_bars: 0,
+            confirmation_close_location: 0.75,
+            distance_atr: 0.0,
+            zone_width_atr: 0.5,
+            displacement_strength_atr: 1.0,
+            ts_event: UnixNanos::from(1),
+        };
+
+        let (stop, _) = entry_prices(
+            signal,
+            Price::from("0.01"),
+            2,
+            1,
+            StopDistanceModel::Hybrid,
+            atr_multiple,
+            Decimal::new(5, 1),
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(stop, Price::from(expected_stop));
     }
 
     #[rstest::rstest]
@@ -7240,6 +9319,25 @@ open_updated = true
             directional_close_location(strong_short, OrderSide::Sell),
             0.75
         );
+    }
+
+    #[rstest::rstest]
+    #[case(100.0, Some(102.0), Some(2.0))]
+    #[case(100.0, Some(98.0), Some(-2.0))]
+    #[case(0.0, Some(98.0), None)]
+    #[case(100.0, None, None)]
+    fn test_market_price_change_reports_underlying_direction(
+        #[case] average_entry: f64,
+        #[case] average_exit: Option<f64>,
+        #[case] expected: Option<f64>,
+    ) {
+        let actual = market_price_change_pct(average_entry, average_exit);
+        match expected {
+            Some(expected) => {
+                assert!(actual.is_some_and(|actual| (actual - expected).abs() < 1e-9));
+            }
+            None => assert!(actual.is_none()),
+        }
     }
 
     #[rstest::rstest]
@@ -7570,6 +9668,36 @@ open_updated = true
 
     #[rstest::rstest]
     fn test_run_statistics_report_exit_and_signal_cohorts() {
+        let mut daily_range =
+            DailyRangeTracker::new(SlcMarket::Us, get_timezone(US_TIMEZONE).unwrap());
+        let first_day = "2026-08-03T14:00:00Z".parse::<Timestamp>().unwrap();
+        let second_day = "2026-08-04T14:00:00Z".parse::<Timestamp>().unwrap();
+        daily_range.update(five_minute_bar(
+            "101",
+            "104",
+            "100",
+            "103",
+            UnixNanos::from(first_day).as_u64(),
+        ));
+        daily_range.update(five_minute_bar(
+            "102",
+            "103",
+            "101",
+            "102",
+            UnixNanos::from(second_day).as_u64(),
+        ));
+        assert_eq!(daily_range.remaining_range(), Some(Decimal::from(2)));
+        let mut signals = signal_state();
+        signals.structure.highs.push_back(Price::from("105.00"));
+        signals.supply.push_back(Zone::from_bar(
+            ZoneKind::Supply,
+            five_minute_bar("103", "104", "103", "104", 1),
+        ));
+        assert_eq!(
+            signals.opposing_level(OrderSide::Buy, Price::from("100.00")),
+            Some(Price::from("103.00")),
+        );
+
         let instrument_id = InstrumentId::from("QQQ.US.LONGBRIDGE");
         let trade = ClosedTradeStatistics {
             side: OrderSide::Buy,
@@ -7585,13 +9713,26 @@ open_updated = true
             mfe_r: Decimal::from(2),
             mae_r: Decimal::new(5, 1),
             exit_reason: TradeExitReason::Target,
+            average_entry_price: Decimal::from(100),
+            entry_quantity: Decimal::from(10),
+            entry_notional: Decimal::from(1_000),
+            risk_atr: 2.0,
+            recent_range: Some(Decimal::from(3)),
+            stop_distance_model: StopDistanceModel::Atr,
+            minimum_stop_atr_multiple: 0.5,
+            recent_range_multiple: Decimal::new(5, 1),
+            stop_price: Price::from("99.00"),
+            target_price: Price::from("104.00"),
+            opposing_level: Some(Price::from("106.00")),
+            remaining_daily_range: Some(Decimal::new(15, 1)),
+            market_price_change_pct: Some(2.5),
             realized_pnl: Some(Decimal::from(40)),
             estimated_cost: Decimal::from(1),
             entry_slippage_stress: Decimal::from(2),
             initial_risk: Decimal::from(20),
             risk_utilization: Decimal::new(8, 1),
             r_multiple: Some(Decimal::from(2)),
-            close_ts: UnixNanos::from(1),
+            close_ts: UnixNanos::from("2026-08-03T20:00:00Z".parse::<Timestamp>().unwrap()),
             ambiguous_exit_bar: false,
         };
         let mut ambiguous = trade;
@@ -7612,7 +9753,8 @@ open_updated = true
                 },
             )]),
         };
-        let output = statistics.lines().join("\n");
+        let timezone = get_timezone(US_TIMEZONE).unwrap();
+        let output = statistics.lines(&timezone).join("\n");
 
         assert!(output.contains("exit_reason=target"));
         assert!(output.contains("side=BUY, level=reclaimed"));
@@ -7622,9 +9764,20 @@ open_updated = true
         assert!(output.contains("conservative_pnl=37"));
         assert!(output.contains("average_r=2"));
         assert!(output.contains("average_conservative_r=1.85"));
+        assert!(output.contains("planned_target_pct=4"));
+        assert!(output.contains("entry_atr_pct=2"));
+        assert!(output.contains("mfe_pct=4"));
+        assert!(output.contains("mfe_to_target_ratio=1"));
+        assert!(output.contains("estimated_round_trip_cost_bps=10"));
+        assert!(output.contains("net_edge_bps=390"));
+        assert!(output.contains("room_to_opposing_level_r=3"));
+        assert!(output.contains("remaining_daily_range_pct=1.5"));
         assert!(output.contains("average_confirmation_close_location=0.7500"));
         assert!(output.contains("average_mfe_r=2"));
         assert!(output.contains("bucket=10:00"));
+        assert!(output.contains(
+            "[QQQ.US.LONGBRIDGE] SLC trade result: date=2026-08-03, trade=1/1, side=BUY, exit_reason=target, entry_price=100, quantity=10, entry_notional=1000, stop_distance_model=atr, risk_atr=2.000000, minimum_stop_atr_multiple=0.5, atr_stop_distance=1.000000, recent_range=3, recent_range_multiple=0.5, recent_range_stop_distance=1.5, stop_price=99.00, risk_utilization=0.8, planned_target_pct=4.00, entry_atr_pct=2.00, mfe_pct=4.00, mfe_to_target_ratio=1, estimated_round_trip_cost_bps=10.000, net_edge_bps=390.000, room_to_opposing_level_r=3.00, remaining_daily_range_pct=1.500, market_price_change_pct=2.5000, realized_pnl=40, conservative_pnl=37",
+        ), "{output}");
     }
 
     #[rstest::rstest]
@@ -7777,7 +9930,7 @@ open_updated = true
         let close_time = Time::from_hms(close_hour, 0, 0).unwrap();
 
         assert_eq!(
-            us_market_close_at(now, close_time).unwrap(),
+            market_close_at(now, close_time, SlcMarket::Us).unwrap(),
             expected.parse::<Timestamp>().unwrap(),
         );
     }

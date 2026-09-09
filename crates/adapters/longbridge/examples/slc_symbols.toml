@@ -14,6 +14,8 @@ paper_risk_state_path = "../../../../target/longbridge-slc-paper-risk-state.toml
 live_risk_state_path = "../../../../target/longbridge-slc-live-risk-state.toml"
 
 [universe]
+# 交易市场：us 使用纽约时区；hk 使用香港时区、午休和港币/整手校验。
+market = "us"
 # 实盘标的池模式：fixed 使用本文件底部的 [[symbols]]；dynamic 读取盘前选择器生成的当日快照。
 # 回测始终使用固定 [[symbols]]，避免把某一天的动态池错误套用到历史区间。
 mode = "dynamic"
@@ -21,9 +23,9 @@ mode = "dynamic"
 # 都会阻止交易节点启动，不会静默回退到固定池。
 dynamic_pool_path = "../../../../target/longbridge-slc-dynamic-pool.toml"
 # 最终动态池最多保留的标的数；所有标的仍共享 [risk] 下的仓位和风险额度。
-max_symbols = 50
+max_symbols = 200
 # Longbridge 每个方向先返回的候选数。both 会分别请求多头和空头并交替选取，最多共请求两倍数量。
-candidate_count_per_side = 60
+candidate_count_per_side = 120
 # Longbridge 静态信息不提供美股逐标的 tick；此处为动态池统一使用的保守报价格点。默认 0.01
 # 对当前 minimum_price > 1 的主板池不会生成亚分价格；若券商规则变化，应先人工核对再修改。
 price_increment = "0.01"
@@ -34,6 +36,13 @@ maximum_price = "500"
 minimum_market_cap = "50"
 # 近一个月日均成交额下限，Longbridge 筛选单位为“万”；500 即约 500 万 USD。
 minimum_average_daily_turnover = "500"
+# 午間流動性回看最近幾個完整交易日；半日市自動排除。允許 1 至 10，5 日兼顧近期性與穩定性。
+liquidity_lookback_days = 5
+# 11:30-14:00（紐約時間）歷史 5 分鐘 K 線的每分鐘平均成交股數下限。缺失 K 線按零成交計算；
+# 1000 股/分鐘用於排除成交集中在開收盤、午間實際流動性不足的標的，可依實盤滑點上調。
+minimum_average_volume_per_minute = "1000"
+# 午間「窒息 K 線」比例上限，0.05 表示 5%。缺失、零成交或 OHLC 四價完全相同均計入。
+maximum_stale_bar_ratio = "0.05"
 # 最近交易日振幅下限，单位百分比；保证候选有足够日内活动，但不直接构成 SLC 入场信号。
 minimum_daily_amplitude_pct = "1.5"
 # 多头候选要求最近涨幅位于该绝对值区间，空头候选使用对称负区间；用于构造方向均衡的活跃池。
@@ -42,15 +51,15 @@ maximum_daily_change_pct = "12"
 
 [risk]
 # 单笔交易计划承担的最大初始风险，单位 USD；100 USD 为 100,000 USD 初始资金的 0.10%。
-risk_amount = "100"
+risk_amount = "200"
 # 当日累计已实现亏损达到该值后，全部标的停止新开仓，单位 USD；当前相当于 2 笔计划风险。
-daily_loss_limit = "200"
+daily_loss_limit = "400"
 # 全账户所有挂单和持仓允许同时占用的初始风险上限，单位 USD；当前覆盖 3 个满风险仓位。
-max_open_risk = "300"
+max_open_risk = "600"
 # 全账户全部 SLC 仓位和入场挂单的总名义金额上限，单位 USD；不超过初始资金的 60%。
-max_account_notional = "60000"
+max_account_notional = "100000"
 # 同时允许存在的入场预留或持仓数量；所有 symbol 共享该额度。
-max_open_positions = 3
+max_open_positions = 5
 # 任意单笔入场订单的最大股数；为低价、窄止损标的保留足够风险容量。
 max_order_quantity = "1000"
 # 任意单个标的入场订单的最大名义金额，单位 USD；三个并发仓位各不超过 20,000。
@@ -63,11 +72,29 @@ max_entry_slippage_ticks = 5
 [signal]
 # 允许的入场方向：both、long 或 short；只影响新信号，不改变退出逻辑。
 trade_direction = "both"
+# 可交易的 Level：all 同时交易 Fresh/Reclaimed；reclaimed_only 仅交易一次破位收复后的 Level。
+level_selection = "all"
+# 同一根 5 分钟 K 线信号的归集等待时间，单位毫秒；归集后 Reclaimed 优先占用三个共享仓位。
+batch_delay_ms = 2000
 # 固定止盈倍数，以初始风险 R 为单位；文档要求至少 2R。
 risk_reward = "2"
+# 价格曾达到该浮盈 R 后启用利润保护；与下方保护线同时设为 0 可关闭。
+profit_protection_trigger_r = "1"
+# 启用后，可成交价回落到该 R 时撤销保护单并市价离场；0.25R 预留成本缓冲。
+profit_protection_floor_r = "0.25"
 # 止损在 zone 远端之外额外留出的最小价格跳动数。
-stop_buffer_ticks = 1
-# 5 分钟 Wilder ATR 周期；只用于把“强势离开”量化为跨标的可比较的位移。
+stop_buffer_ticks = 2
+# 初始止损波动距离模型：atr 仅使用 ATR 倍数，recent_range 仅使用最近 K 线区间，
+# hybrid 取 ATR 距离、最近 K 线区间距离和 level 结构距离中的最大值。
+stop_distance_model = "hybrid"
+# 初始止损距最坏允许入场价至少为 level 创建/入场时较大 5 分钟 ATR 的多少倍。最终止损取
+# zone 远端与该波动下限中更远者；在 atr 和 hybrid 模式下参与止损计算。
+minimum_stop_atr_multiple = 2.0
+# recent_range 模型读取最近多少根已完成 5 分钟 K 线；5 表示当前确认 K 线及其前 4 根。
+recent_range_lookback_bars = 5
+# recent_range 和 hybrid 模式的区间倍数：止损距离=(Max High-Min Low)*该倍数。
+recent_range_multiple = "0.7"
+# 5 分钟 Wilder ATR 周期；用于量化 displacement，并在 atr/hybrid 止损中衡量市场噪声。
 atr_period = 14
 # 创建 level 所需的最小位移强度，单位 ATR；1.5 用来排除普通波动形成的伪 level。
 displacement_atr_multiple = 1.5
@@ -85,8 +112,11 @@ zone_ttl_bars = 78
 minimum_fresh_level_age_bars = 6
 # demand 和 supply 各自最多保留的 level 数，防止状态和扫描成本无界增长。
 max_zones_per_side = 8
-# 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数。
-confirmation_window_bars = 3
+# 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数；2 表示最多等待 10 分钟。
+confirmation_window_bars = 5
+# 确认收盘价到 level 最近边界的最大距离，使用 level 创建/确认时较大 ATR 归一化。
+# 超过该距离说明反转行情已经离开 level，放弃追价入场。
+maximum_confirmation_distance_atr = 2.5
 # Stochastics %K 原始周期。
 stochastic_k_period = 5
 # Stochastics %K 平滑周期。
@@ -102,7 +132,7 @@ minimum_target_time_minutes = 60
 
 [warmup]
 # 启动前加载的已完成 5 分钟 Bar 数，用于初始化 ATR、随机指标和近期位移窗口。
-five_minute_bars = 500
+five_minute_bars = 100
 # 启动前加载的已完成 4 小时 Bar 数，用于确认 pivot 和初始结构。
 four_hour_bars = 60
 
@@ -118,9 +148,9 @@ max_trades_per_day = 20
 
 [backtest]
 # 回测样本起点和终点，必须使用 UTC 时间戳且 start < end；当前回归 2026 年 8 月。
-start = "2026-08-03T00:00:00Z"
-end = "2026-08-31T23:59:59Z"
-# 要比较的止盈 R 倍数；当前固定为原始 2R，保证与之前 8 月结果可比。
+start = "2026-05-01T00:00:00Z"
+end = "2026-05-31T23:59:59Z"
+# 同一数据和止损规则下比较文档原始 2R 与扩展 3R，避免只看单一目标误判退出质量。
 risk_rewards = ["2"]
 # 回测组合初始资金；用于收益率、Sharpe、回撤和 Calmar 计算。
 starting_balance = "100_000 USD"
@@ -128,20 +158,132 @@ starting_balance = "100_000 USD"
 timeout_secs = 3600
 # true 输出每根 Bar 的详细诊断；多标的会产生大量日志。
 log_bars = false
-# 保守统计按成交股数扣除的估算往返成本，单位 USD/股。
+# 回测及模拟/实盘诊断按成交股数扣除的估算往返成本，单位 USD/股。
 round_trip_cost_per_share = "0.01"
 
 # SLC 交易池。每个美股标的一个 [[symbols]] 表；price_increment 必须是准确最小跳动。
 [[symbols]]
-symbol = "AAPL.US"
+symbol = "ALAB.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "MSFT.US"
+symbol = "NFLX.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "NVDA.US"
+symbol = "PLTR.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "NBIS.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "HPE.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "BE.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "TMUS.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "KLAC.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "ACN.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "MRVL.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "NOW.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "COHR.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "AU.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "GLW.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "MRNA.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "TER.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "B.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "LRCX.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "HOOD.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "CEG.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "IMO.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "UMC.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "NU.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "INTC.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "PM.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "VRT.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "T.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "ARM.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "PBR.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "BMY.US"
+price_increment = "0.01"
+
+[[symbols]]
+symbol = "U.US"
 price_increment = "0.01"
 
 [[symbols]]
@@ -149,55 +291,37 @@ symbol = "AMD.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "BABA.US"
+symbol = "APP.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "TTWO.US"
+symbol = "SAP.US"
 price_increment = "0.01"
 
+
 [[symbols]]
-symbol = "TME.US"
+symbol = "GTLB.US"
 price_increment = "0.01"
 
 [[symbols]]
 symbol = "BA.US"
 price_increment = "0.01"
 
+
 [[symbols]]
-symbol = "CRCL.US"
+symbol = "TME.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "TSLA.US"
+symbol = "NTES.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "SPY.US"
+symbol = "MCHP.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "QQQ.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "IWM.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "DIA.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "GLD.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "GOOGL.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "AMZN.US"
+symbol = "SNOW.US"
 price_increment = "0.01"
 
 [[symbols]]
@@ -205,49 +329,9 @@ symbol = "META.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "JPM.US"
+symbol = "AMZN.US"
 price_increment = "0.01"
 
 [[symbols]]
-symbol = "BAC.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "XOM.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "CVX.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "PFE.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "MRK.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "WMT.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "KO.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "CAT.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "GE.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "DIS.US"
-price_increment = "0.01"
-
-[[symbols]]
-symbol = "UBER.US"
+symbol = "TTWO.US"
 price_increment = "0.01"

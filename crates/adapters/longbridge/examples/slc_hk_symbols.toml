@@ -1,0 +1,140 @@
+# SLC 港股示例配置。首版只支持固定主板股票池和只做多；金额单位均为 HKD。
+# 港股最小价位随股价区间变化，下面的 price_increment 按 2026-09-09 价格档位填写；
+# 上线前必须重新核对，跨越价位区间后也必须更新，否则券商可能拒绝订单。
+
+[longbridge]
+oauth_client_id = "2bcd116c-41bc-4ad5-8d73-280f0d53b1e4"
+oauth_callback_port = 60355
+# true 为 Longbridge 模拟盘，false 为真实账户。
+papertrading = true
+paper_risk_state_path = "../../../../target/longbridge-slc-hk-paper-risk-state.toml"
+live_risk_state_path = "../../../../target/longbridge-slc-hk-live-risk-state.toml"
+
+[universe]
+# hk 启用香港时区、09:30-12:00/13:00-16:00 时段、HKD 与港股整手校验。
+market = "hk"
+# 港股盘前动态筛选尚未适配，必须使用 fixed。
+mode = "fixed"
+dynamic_pool_path = "../../../../target/longbridge-slc-hk-dynamic-pool.toml"
+max_symbols = 50
+# 以下字段仅供美股 selector 使用；fixed 港股模式不会读取这些筛选条件。
+candidate_count_per_side = 60
+price_increment = "0.01"
+minimum_price = "10"
+maximum_price = "1000"
+minimum_market_cap = "50"
+minimum_average_daily_turnover = "500"
+liquidity_lookback_days = 5
+minimum_average_volume_per_minute = "1000"
+maximum_stale_bar_ratio = "0.05"
+minimum_daily_amplitude_pct = "1.5"
+minimum_daily_change_pct = "0.5"
+maximum_daily_change_pct = "12"
+
+[risk]
+# 单笔计划风险为 2,000 HKD；以下额度以 1,000,000 HKD 示例账户为基准。
+risk_amount = "2000"
+daily_loss_limit = "4000"
+max_open_risk = "6000"
+max_account_notional = "600000"
+max_open_positions = 3
+max_order_quantity = "100000"
+# 必须覆盖至少一整手高价股；实际每单还受总名义金额和风险上限约束。
+max_order_notional = "200000"
+minimum_risk_utilization = "0.20"
+max_entry_slippage_ticks = 2
+
+[signal]
+# 港股首版不假设借券资格，只允许做多。
+trade_direction = "long"
+risk_reward = "2"
+level_selection = "reclaimed_only"
+batch_delay_ms = 2000
+profit_protection_trigger_r = "1"
+profit_protection_floor_r = "0.25"
+stop_buffer_ticks = 1
+stop_distance_model = "hybrid"
+minimum_stop_atr_multiple = 2.0
+recent_range_lookback_bars = 5
+recent_range_multiple = "0.7"
+atr_period = 14
+displacement_atr_multiple = 1.5
+displacement_close_fraction = 0.35
+displacement_max_bars = 3
+level_extreme_lookback_bars = 3
+pivot_span = 2
+zone_ttl_bars = 78
+minimum_fresh_level_age_bars = 6
+max_zones_per_side = 8
+confirmation_window_bars = 4
+maximum_confirmation_distance_atr = 2.0
+stochastic_k_period = 5
+stochastic_k_smoothing = 3
+stochastic_d_period = 3
+oversold = 20.0
+overbought = 80.0
+# 港股单段交易时间较短，给目标至少预留 30 分钟。
+minimum_target_time_minutes = 30
+
+[warmup]
+five_minute_bars = 500
+four_hour_bars = 60
+
+[session]
+# 时间均为香港时间。策略自动排除午休，并在午休前使用同一平仓缓冲。
+entry_start = "09:35"
+entry_end = "15:15"
+flatten_before_close_minutes = 15
+max_trades_per_day = 10
+
+[backtest]
+# 2026-08-03 00:00 至 2026-08-31 16:00 香港时间。
+start = "2026-08-02T16:00:00Z"
+end = "2026-08-31T08:00:00Z"
+risk_rewards = ["2"]
+starting_balance = "1_000_000 HKD"
+timeout_secs = 3600
+log_bars = false
+# 回测及模拟/实盘统计仅支持每股固定成本；0.50 HKD/股不能替代港股从价税费模型。
+round_trip_cost_per_share = "0.50"
+
+# 固定池选用成交活跃的港股主板普通股票；lot_size 启动时由 Longbridge 静态信息加载。
+[[symbols]]
+symbol = "700.HK"
+price_increment = "0.2"
+
+[[symbols]]
+symbol = "9988.HK"
+price_increment = "0.1"
+
+[[symbols]]
+symbol = "3690.HK"
+price_increment = "0.05"
+
+[[symbols]]
+symbol = "1810.HK"
+price_increment = "0.02"
+
+[[symbols]]
+symbol = "1299.HK"
+price_increment = "0.05"
+
+[[symbols]]
+symbol = "2318.HK"
+price_increment = "0.05"
+
+[[symbols]]
+symbol = "388.HK"
+price_increment = "0.2"
+
+[[symbols]]
+symbol = "5.HK"
+price_increment = "0.1"
+
+[[symbols]]
+symbol = "941.HK"
+price_increment = "0.05"
+
+[[symbols]]
+symbol = "1211.HK"
+price_increment = "0.05"

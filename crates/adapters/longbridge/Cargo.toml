@@ -111,6 +111,12 @@ required-features = ["examples"]
 doc = false
 
 [[example]]
+name = "longbridge-wyckoff-research"
+path = "examples/node_wyckoff_research.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
 name = "longbridge-slc-trader"
 path = "examples/node_slc_trader.rs"
 required-features = ["examples"]
