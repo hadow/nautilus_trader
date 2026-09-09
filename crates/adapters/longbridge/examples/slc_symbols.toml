@@ -76,8 +76,8 @@ max_entry_slippage_ticks = 5
 [signal]
 # 允许的入场方向：both、long 或 short；只影响新信号，不改变退出逻辑。
 trade_direction = "both"
-# 可交易的 Level：all 同时交易 Fresh/Reclaimed；reclaimed_only 仅交易一次破位收复后的 Level。
-level_selection = "reclaimed_only"
+# 原策略允许首次回测和一次破位收复后的回测；reclaimed_only 仅用于对照实验。
+level_selection = "all"
 # 同一根 5 分钟 K 线信号的归集等待时间，单位毫秒；归集后按无权重质量字段依次排序。
 batch_delay_ms = 2000
 # 固定止盈倍数，以初始风险 R 为单位；文档要求至少 2R。
@@ -114,10 +114,6 @@ displacement_atr_multiple = 1.5
 displacement_close_fraction = 0.3
 # 一次有效 displacement 最多允许由多少根 5 分钟 Bar 完成，范围 1 至 12。默认 3
 displacement_max_bars = 3
-# Fresh demand/supply 的源 K 必须是近期窗口最低/最高点；其他 Level 仅在一次破位收复后可交易。
-level_extreme_lookback_bars = 3
-# 4 小时 pivot 左右各需多少根已完成 Bar 确认；越大越稳定但趋势识别越慢。
-pivot_span = 2
 # “recent level”最多保留一个美股常规交易时段（78 根 5 分钟 Bar），超时后删除。
 zone_ttl_bars = 78
 # 可首次交易的 Level 必须至少保持该数量 Bar 未触达；提前回访说明离开不充分，直接作废。
@@ -126,9 +122,6 @@ minimum_fresh_level_age_bars = 6
 max_zones_per_side = 8
 # 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数；2 表示最多等待 10 分钟。 默认 2
 confirmation_window_bars = 5
-# 确认收盘价到 level 最近边界的最大距离，使用 level 创建/确认时较大 ATR 归一化。
-# 超过该距离说明反转行情已经离开 level，放弃追价入场。 默认 1.0
-maximum_confirmation_distance_atr = 2.5
 # Stochastics %K 原始周期。
 stochastic_k_period = 5
 # Stochastics %K 平滑周期。
@@ -145,8 +138,8 @@ minimum_target_time_minutes = 60
 [warmup]
 # 启动前加载的已完成 5 分钟 Bar 数，用于初始化 ATR、随机指标和近期位移窗口。
 five_minute_bars = 50
-# 启动前加载的已完成 4 小时 Bar 数，用于确认 pivot 和初始结构。
-four_hour_bars = 60
+# 启动前加载的已完成 1 小时 Bar 数；结构判断始终只消费最近四根。
+one_hour_bars = 60
 
 [session]
 # 允许提交新入场的最早纽约时间，格式 HH:MM，不能早于 09:30。

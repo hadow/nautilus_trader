@@ -24,20 +24,18 @@
 //!
 //! SLC 将一次入场拆成三个必须依次成立的层次：
 //!
-//! 1. **Structure（结构）**：只使用已经完成并经过右侧 K 线确认的 4 小时 pivot；连续更高的
-//!    pivot high 与 pivot low 定义上涨结构，连续更低的二者定义下跌结构，其余状态均为中性。
-//! 2. **Level（位置）**：只在当前 4 小时方向同侧寻找 5 分钟强位移。近期底部的 Demand 与
-//!    近期顶部的 Supply 保持最小离开时间后可首次回测；过早回访直接失效。其他强位移区域必须
-//!    先完成一次破位收复。区域取位移前最后一根反向 K 线完整高低区间，趋势改变时丢弃旧 level。
+//! 1. **Structure（结构）**：使用最近四根已经完成的 1 小时 K 线组成滚动 4 小时窗口；后两根
+//!    K 线的高低区间同时高于前两根时定义上涨结构，同时低于前两根时定义下跌结构，其余为中性。
+//! 2. **Level（位置）**：只在当前滚动 4 小时方向同侧寻找 5 分钟强位移。Demand/Supply 区域取
+//!    强位移前最后一根反向 K 线完整高低区间；首次回测或一次破位收复后的回测均可参与确认，
+//!    趋势改变时丢弃旧 level。
 //! 3. **Confirmation（确认）**：价格进入有效区域后开启有限确认窗口，要求 Stochastics %K
-//!    曾进入 20/80 极值区并重新穿越阈值，且确认收盘价仍位于 level 的配置 ATR 距离内。
-//!    上涨结构只允许 demand 做多，下跌结构只允许 supply 做空；超过空间限制的回穿会作废，
-//!    防止把离开 level 后的滞后指标信号误当成有效确认。
+//!    曾进入 20/80 极值区并重新穿越阈值。上涨结构只允许 demand 做多，下跌结构只允许 supply
+//!    做空；确认必须在配置窗口内完成，避免把很久之后的指标信号关联到旧 level。
 //!
 //! 这种分层设计把“方向、位置、触发”分开，避免仅因指标超买超卖就逆势入场。所有判断只消费
 //! 已完成 Bar；实时订阅收到同一时间戳的多次更新时，必须等下一根 Bar 出现才确认上一根，防止
-//! 使用尚未收盘的数据。代价是信号必然比视觉回看更晚，尤其对称 4 小时 pivot 需要等待右侧
-//! Bar，不能把这种确认延迟误认为数据故障。
+//! 使用尚未收盘的数据。滚动结构只比较窗口内已完成的 1 小时 Bar，不使用未来 Bar 确认 pivot。
 //!
 //! # 订单与风险模型
 //!
@@ -170,7 +168,9 @@ const HK_LUNCH_END_MINUTE: u16 = 13 * 60;
 const FIVE_MINUTES: u16 = 5;
 const FIVE_MINUTE_NANOS: u64 = 5 * 60 * 1_000_000_000;
 const NANOSECONDS_PER_MILLISECOND: u64 = 1_000_000;
-const FOUR_HOUR_NANOS: u64 = 4 * 60 * 60 * 1_000_000_000;
+const ONE_HOUR_NANOS: u64 = 60 * 60 * 1_000_000_000;
+const STRUCTURE_WINDOW_HOURS: usize = 4;
+const STRUCTURE_SWING_HOURS: usize = STRUCTURE_WINDOW_HOURS / 2;
 const HISTORY_CHUNK_DAYS: i64 = 7;
 const TRADING_DAYS_CHUNK_DAYS: i64 = 28;
 const LIQUIDITY_WINDOW_START_MINUTE: u16 = 11 * 60 + 30;
@@ -430,20 +430,17 @@ struct AppConfig {
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
-    level_extreme_lookback_bars: usize,
-    pivot_span: usize,
     zone_ttl_bars: usize,
     minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
-    maximum_confirmation_distance_atr: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
     oversold: f64,
     overbought: f64,
     five_minute_warmup: usize,
-    four_hour_warmup: usize,
+    one_hour_warmup: usize,
     minimum_target_time_minutes: u16,
     round_trip_cost_per_share: Decimal,
     risk_state_path: PathBuf,
@@ -548,13 +545,10 @@ struct SignalSettings {
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
-    level_extreme_lookback_bars: usize,
-    pivot_span: usize,
     zone_ttl_bars: usize,
     minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
-    maximum_confirmation_distance_atr: f64,
     stochastic_k_period: usize,
     stochastic_k_smoothing: usize,
     stochastic_d_period: usize,
@@ -567,7 +561,7 @@ struct SignalSettings {
 #[serde(deny_unknown_fields)]
 struct WarmupSettings {
     five_minute_bars: usize,
-    four_hour_bars: usize,
+    one_hour_bars: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -641,7 +635,7 @@ struct DynamicUniverseSnapshot {
     symbols: Vec<DynamicSymbolEntry>,
 }
 
-/// Longbridge 筛选响应转换后的内部候选；`side` 仅表示盘前偏向，不替代 SLC 4 小时方向
+/// Longbridge 筛选响应转换后的内部候选；`side` 仅表示盘前偏向，不替代 SLC 滚动 4 小时方向
 #[derive(Clone, Debug)]
 struct ScreenerCandidate {
     symbol: String,
@@ -850,13 +844,10 @@ impl AppConfig {
         let displacement_atr_multiple = signal.displacement_atr_multiple;
         let displacement_close_fraction = signal.displacement_close_fraction;
         let displacement_max_bars = signal.displacement_max_bars;
-        let level_extreme_lookback_bars = signal.level_extreme_lookback_bars;
-        let pivot_span = signal.pivot_span;
         let zone_ttl_bars = signal.zone_ttl_bars;
         let minimum_fresh_level_age_bars = signal.minimum_fresh_level_age_bars;
         let max_zones_per_side = signal.max_zones_per_side;
         let confirmation_window_bars = signal.confirmation_window_bars;
-        let maximum_confirmation_distance_atr = signal.maximum_confirmation_distance_atr;
         let stochastic_k_period = signal.stochastic_k_period;
         let stochastic_k_smoothing = signal.stochastic_k_smoothing;
         let stochastic_d_period = signal.stochastic_d_period;
@@ -875,14 +866,6 @@ impl AppConfig {
             (1..=12).contains(&displacement_max_bars),
             "displacement maximum bars must be between 1 and 12",
         );
-        anyhow::ensure!(
-            (1..=24).contains(&level_extreme_lookback_bars),
-            "level extreme lookback bars must be between 1 and 24",
-        );
-        anyhow::ensure!(
-            pivot_span > 0 && pivot_span <= (MAX_WARMUP_BARS - 1) / 2,
-            "pivot span must fit inside the maximum warmup window",
-        );
         anyhow::ensure!(zone_ttl_bars > 0, "zone TTL must be positive");
         anyhow::ensure!(
             minimum_fresh_level_age_bars > 0 && minimum_fresh_level_age_bars < zone_ttl_bars,
@@ -897,12 +880,6 @@ impl AppConfig {
             "confirmation window must be positive and not exceed zone TTL",
         );
         anyhow::ensure!(
-            maximum_confirmation_distance_atr.is_finite()
-                && maximum_confirmation_distance_atr > 0.0
-                && maximum_confirmation_distance_atr <= 8.0,
-            "maximum confirmation distance ATR must be finite, positive and no more than 8",
-        );
-        anyhow::ensure!(
             stochastic_k_period > 0 && stochastic_k_smoothing > 0 && stochastic_d_period > 0,
             "stochastic periods must be positive",
         );
@@ -912,7 +889,7 @@ impl AppConfig {
         );
 
         let five_minute_warmup = config.warmup.five_minute_bars;
-        let four_hour_warmup = config.warmup.four_hour_bars;
+        let one_hour_warmup = config.warmup.one_hour_bars;
         let minimum_five_minute_warmup = atr_period
             .max(
                 stochastic_k_period
@@ -925,8 +902,8 @@ impl AppConfig {
             "5-minute warmup must initialize ATR and stochastic periods and be less than {MAX_WARMUP_BARS}",
         );
         anyhow::ensure!(
-            four_hour_warmup > pivot_span * 2 + 1 && four_hour_warmup < MAX_WARMUP_BARS,
-            "4-hour warmup must exceed the pivot window and be less than {MAX_WARMUP_BARS}",
+            (STRUCTURE_WINDOW_HOURS..MAX_WARMUP_BARS).contains(&one_hour_warmup),
+            "1-hour warmup must contain at least {STRUCTURE_WINDOW_HOURS} bars and be less than {MAX_WARMUP_BARS}",
         );
 
         let session = SessionRules {
@@ -992,20 +969,17 @@ impl AppConfig {
             displacement_atr_multiple,
             displacement_close_fraction,
             displacement_max_bars,
-            level_extreme_lookback_bars,
-            pivot_span,
             zone_ttl_bars,
             minimum_fresh_level_age_bars,
             max_zones_per_side,
             confirmation_window_bars,
-            maximum_confirmation_distance_atr,
             stochastic_k_period,
             stochastic_k_smoothing,
             stochastic_d_period,
             oversold,
             overbought,
             five_minute_warmup,
-            four_hour_warmup,
+            one_hour_warmup,
             minimum_target_time_minutes,
             round_trip_cost_per_share,
             risk_state_path,
@@ -1019,9 +993,9 @@ impl AppConfig {
         BarType::from(format!("{instrument_id}-5-MINUTE-LAST-EXTERNAL").as_str())
     }
 
-    /// 构造用于高周期市场结构识别的外部 4 小时 LAST BarType
-    fn four_hour_bar_type(instrument_id: InstrumentId) -> BarType {
-        BarType::from(format!("{instrument_id}-4-HOUR-LAST-EXTERNAL").as_str())
+    /// 构造滚动 4 小时结构所消费的外部 1 小时 LAST BarType
+    fn one_hour_bar_type(instrument_id: InstrumentId) -> BarType {
+        BarType::from(format!("{instrument_id}-1-HOUR-LAST-EXTERNAL").as_str())
     }
 
     /// 为每个可用持仓槽位均分账户名义额度，并返回单次入场可使用的上限
@@ -1648,7 +1622,7 @@ fn resolve_config_path(config_path: &Path, configured_path: &Path) -> PathBuf {
     }
 }
 
-/// 4 小时确认 pivot 推导出的方向许可，不直接代表 5 分钟入场信号
+/// 最近四根已完成 1 小时 K 线推导出的方向许可，不直接代表 5 分钟入场信号
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Trend {
     Up,
@@ -1657,109 +1631,95 @@ enum Trend {
     Neutral,
 }
 
-/// 保存确认 pivot 所需的最小滑动窗口，以及最近两个高点和低点
+/// 保存最近四根已完成 1 小时 Bar，并比较相邻两个两小时区间的高低点
 ///
-/// pivot 只有在右侧 `span` 根 Bar 全部完成后才被确认，因此该结构天然避免使用未来数据，
-/// 代价是趋势切换会比价格拐点晚 `span` 根 4 小时 Bar。
-#[derive(Debug)]
-struct PivotStructure {
-    span: usize,
-    window: VecDeque<Bar>,
-    highs: VecDeque<Price>,
-    lows: VecDeque<Price>,
+/// 后两根的最高价和最低价都高于前两根时形成 HH/HL；二者都低于前两根时形成 LH/LL。
+/// 只使用已经完成的 Bar，因此不会为了确认 pivot 偷看未来数据。
+#[derive(Debug, Default)]
+struct RollingFourHourStructure {
+    bars: VecDeque<Bar>,
 }
 
-impl PivotStructure {
-    /// 创建对称 pivot 检测器，候选点左右两侧都必须拥有指定数量的已完成 Bar
-    fn new(span: usize) -> Self {
-        Self {
-            span,
-            window: VecDeque::with_capacity(span * 2 + 1),
-            highs: VecDeque::with_capacity(2),
-            lows: VecDeque::with_capacity(2),
-        }
-    }
-
-    /// 加入一根已完成 4 小时 Bar，仅在完整窗口形成后确认正中央的严格 pivot high/low
+impl RollingFourHourStructure {
+    /// 加入一根已完成 1 小时 Bar，并始终只保留滚动 4 小时窗口
     fn update(&mut self, bar: Bar) {
-        let window_size = self.span * 2 + 1;
-        if self.window.len() == window_size {
-            self.window.pop_front();
+        if self.bars.len() == STRUCTURE_WINDOW_HOURS {
+            self.bars.pop_front();
         }
-        self.window.push_back(bar);
-        if self.window.len() != window_size {
-            return;
-        }
-
-        let center = self.window[self.span];
-        let pivot_high = self
-            .window
-            .iter()
-            .enumerate()
-            .all(|(index, candidate)| index == self.span || center.high > candidate.high);
-        let pivot_low = self
-            .window
-            .iter()
-            .enumerate()
-            .all(|(index, candidate)| index == self.span || center.low < candidate.low);
-        if pivot_high {
-            push_last_two(&mut self.highs, center.high);
-        }
-        if pivot_low {
-            push_last_two(&mut self.lows, center.low);
-        }
+        self.bars.push_back(bar);
     }
 
-    /// 判断是否已经各有两个确认的 pivot high 和 pivot low，可用于结构分类
+    /// 四根已完成 1 小时 Bar 到齐后才允许结构授权交易
     fn initialized(&self) -> bool {
-        self.highs.len() == 2 && self.lows.len() == 2
+        self.bars.len() == STRUCTURE_WINDOW_HOURS
     }
 
-    /// 用最近两个确认高点和低点分类结构；二者必须同向变化，否则保持 Neutral
+    /// 比较前后两个两小时区间；高低点必须同向移动，否则保持 Neutral
     fn trend(&self) -> Trend {
         if !self.initialized() {
             return Trend::Neutral;
         }
-        let high_rising = self.highs[1] > self.highs[0];
-        let high_falling = self.highs[1] < self.highs[0];
-        let low_rising = self.lows[1] > self.lows[0];
-        let low_falling = self.lows[1] < self.lows[0];
+        let previous_high = self
+            .bars
+            .iter()
+            .take(STRUCTURE_SWING_HOURS)
+            .map(|bar| bar.high)
+            .max()
+            .expect("initialized structure has previous bars");
+        let previous_low = self
+            .bars
+            .iter()
+            .take(STRUCTURE_SWING_HOURS)
+            .map(|bar| bar.low)
+            .min()
+            .expect("initialized structure has previous bars");
+        let current_high = self
+            .bars
+            .iter()
+            .skip(STRUCTURE_SWING_HOURS)
+            .map(|bar| bar.high)
+            .max()
+            .expect("initialized structure has current bars");
+        let current_low = self
+            .bars
+            .iter()
+            .skip(STRUCTURE_SWING_HOURS)
+            .map(|bar| bar.low)
+            .min()
+            .expect("initialized structure has current bars");
 
-        if high_rising && low_rising {
+        if current_high > previous_high && current_low > previous_low {
             Trend::Up
-        } else if high_falling && low_falling {
+        } else if current_high < previous_high && current_low < previous_low {
             Trend::Down
         } else {
             Trend::Neutral
         }
     }
 
-    /// 返回交易方向前方最近的已确认 4 小时 pivot，供经济空间统计使用
+    /// 返回交易方向前方最近的窗口高低点，供经济空间统计使用
     fn opposing_level(&self, side: OrderSide, entry: Price) -> Option<Price> {
         match side {
             OrderSide::Buy => self
-                .highs
+                .bars
                 .iter()
-                .copied()
+                .map(|bar| bar.high)
                 .filter(|price| *price > entry)
                 .min(),
             OrderSide::Sell => self
-                .lows
+                .bars
                 .iter()
-                .copied()
+                .map(|bar| bar.low)
                 .filter(|price| *price < entry)
                 .max(),
             OrderSide::NoOrderSide => None,
         }
     }
-}
 
-/// 仅保留结构分类所需的最近两个确认 pivot，避免历史状态无界增长
-fn push_last_two(values: &mut VecDeque<Price>, value: Price) {
-    if values.len() == 2 {
-        values.pop_front();
+    /// 返回当前滚动结构窗口内的已完成 1 小时 Bar 数
+    fn len(&self) -> usize {
+        self.bars.len()
     }
-    values.push_back(value);
 }
 
 /// 由向上或向下 displacement 生成的需求区、供给区方向
@@ -1783,14 +1743,13 @@ enum ZoneState {
 
 /// 一个有界生命周期的 supply/demand 价格区域及其确认状态
 ///
-/// 区域边界取 displacement 源 K 线的完整高低点；只有近期极值允许 fresh 入场，其他强位移
-/// 区域必须先完成一次破位收复。ATR 和位移强度固定记录在创建时刻，不被后续波动率重新解释。
+/// 区域边界取 displacement 源 K 线的完整高低点；ATR 和位移强度固定记录在创建时刻，
+/// 不被后续波动率重新解释。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Zone {
     kind: ZoneKind,
     low: Price,
     high: Price,
-    fresh_entry_eligible: bool,
     age: usize,
     state: ZoneState,
     break_count: u8,
@@ -1807,7 +1766,6 @@ impl Zone {
             kind,
             low: bar.low,
             high: bar.high,
-            fresh_entry_eligible: true,
             age: 0,
             state: ZoneState::Fresh,
             break_count: 0,
@@ -1818,18 +1776,11 @@ impl Zone {
         }
     }
 
-    /// 创建 zone，并固定记录是否允许首次回测、生成时 ATR 及位移强度
-    fn from_displacement(
-        kind: ZoneKind,
-        bar: Bar,
-        atr: f64,
-        strength_atr: f64,
-        fresh_entry_eligible: bool,
-    ) -> Self {
+    /// 创建 zone，并固定记录生成时 ATR 及位移强度
+    fn from_displacement(kind: ZoneKind, bar: Bar, atr: f64, strength_atr: f64) -> Self {
         Self {
             atr_at_creation: atr,
             displacement_strength_atr: strength_atr,
-            fresh_entry_eligible,
             ..Self::from_bar(kind, bar)
         }
     }
@@ -1865,10 +1816,9 @@ impl Zone {
     /// 用一根已完成 Bar 推进 fresh、待确认、一次破位和收复四态 level 状态机
     ///
     /// 状态转换遵循以下约束：首次有效破位只把区域标记为 `BrokenOnce`，待价格从反方向完整
-    /// 收复后才允许作为 `Reclaimed` 再次回测；非近期极值只跳过 Fresh 入场，仍可等待一次破位
-    /// 收复。可 Fresh 入场的 Level 若过早回访则直接失效，表示价格没有真正离开。收复后的再次
-    /// 破位、确认超时或超过 TTL 都会删除区域。只有趋势、方向、随机指标回穿和确认收盘价到
-    /// level 的 ATR 归一化距离同时成立才返回信号。
+    /// 收复后才允许作为 `Reclaimed` 再次回测。Fresh Level 若过早回访则直接失效，表示价格
+    /// 没有真正离开。收复后的再次破位、确认超时或超过 TTL 都会删除区域。只有趋势、方向和
+    /// 随机指标在确认窗口内完成回穿时才返回信号。
     fn observe(
         &mut self,
         bar: Bar,
@@ -1900,7 +1850,6 @@ impl Zone {
         }
 
         if self.state == ZoneState::Fresh
-            && self.fresh_entry_eligible
             && self.age < rules.minimum_fresh_level_age_bars
             && self.intersects(bar)
         {
@@ -1909,9 +1858,7 @@ impl Zone {
 
         match self.state {
             ZoneState::Fresh
-                if self.fresh_entry_eligible
-                    && rules.level_selection == SignalLevelSelection::All
-                    && self.intersects(bar) =>
+                if rules.level_selection == SignalLevelSelection::All && self.intersects(bar) =>
             {
                 self.begin_confirmation(confirmation, rules.confirmation_window_bars);
             }
@@ -1933,10 +1880,6 @@ impl Zone {
         let distance_atr = zone_distance_atr(*self, bar.close, risk_atr);
         let close_location = directional_close_location(bar, side);
         if allow_entry && self.confirmation_armed && confirmation.reentry {
-            if distance_atr > rules.maximum_confirmation_distance_atr {
-                return ZoneObservation::Remove;
-            }
-
             return ZoneObservation::Signal(Signal {
                 side,
                 level: if self.break_count == 0 {
@@ -2262,11 +2205,9 @@ struct SignalRules {
     minimum_fresh_level_age_bars: usize,
     max_zones_per_side: usize,
     confirmation_window_bars: usize,
-    maximum_confirmation_distance_atr: f64,
     displacement_atr_multiple: f64,
     displacement_close_fraction: f64,
     displacement_max_bars: usize,
-    level_extreme_lookback_bars: usize,
     oversold: f64,
     overbought: f64,
 }
@@ -2294,8 +2235,7 @@ impl SignalFunnel {
         confirmation: Confirmation,
     ) {
         let touched = zones.iter().any(|zone| {
-            (zone.state == ZoneState::Reclaimed
-                || (zone.state == ZoneState::Fresh && zone.fresh_entry_eligible))
+            (zone.state == ZoneState::Reclaimed || zone.state == ZoneState::Fresh)
                 && !zone.broken(bar)
                 && zone.intersects(bar)
         });
@@ -2384,8 +2324,8 @@ impl DailyRangeTracker {
 /// 共享同一条执行路径，并与跨标的账户风险控制解耦。
 struct SlcSignalState {
     five_minute_bars: FinalBarBuffer,
-    four_hour_bars: FinalBarBuffer,
-    structure: PivotStructure,
+    one_hour_bars: FinalBarBuffer,
+    structure: RollingFourHourStructure,
     atr: AverageTrueRange,
     stochastics: Stochastics,
     recent_five_minute_bars: VecDeque<Bar>,
@@ -2405,8 +2345,8 @@ impl SlcSignalState {
     fn new(config: &AppConfig) -> Self {
         Self {
             five_minute_bars: FinalBarBuffer::default(),
-            four_hour_bars: FinalBarBuffer::default(),
-            structure: PivotStructure::new(config.pivot_span),
+            one_hour_bars: FinalBarBuffer::default(),
+            structure: RollingFourHourStructure::default(),
             atr: AverageTrueRange::new(
                 config.atr_period,
                 Some(MovingAverageType::Wilder),
@@ -2421,8 +2361,7 @@ impl SlcSignalState {
                 StochasticsDMethod::MovingAverage,
             ),
             recent_five_minute_bars: VecDeque::with_capacity(
-                (config.displacement_max_bars + config.level_extreme_lookback_bars + 1)
-                    .max(config.recent_range_lookback_bars),
+                (config.displacement_max_bars + 1).max(config.recent_range_lookback_bars),
             ),
             level_trend: Trend::Neutral,
             last_demand_source: None,
@@ -2442,11 +2381,9 @@ impl SlcSignalState {
                 minimum_fresh_level_age_bars: config.minimum_fresh_level_age_bars,
                 max_zones_per_side: config.max_zones_per_side,
                 confirmation_window_bars: config.confirmation_window_bars,
-                maximum_confirmation_distance_atr: config.maximum_confirmation_distance_atr,
                 displacement_atr_multiple: config.displacement_atr_multiple,
                 displacement_close_fraction: config.displacement_close_fraction,
                 displacement_max_bars: config.displacement_max_bars,
-                level_extreme_lookback_bars: config.level_extreme_lookback_bars,
                 oversold: config.oversold,
                 overbought: config.overbought,
             },
@@ -2457,11 +2394,11 @@ impl SlcSignalState {
     fn warm_up(
         &mut self,
         five_minute_bars: Vec<Bar>,
-        four_hour_bars: Vec<Bar>,
+        one_hour_bars: Vec<Bar>,
         finalize_last: bool,
     ) {
-        for bar in four_hour_bars {
-            if let Some(finalized) = self.four_hour_bars.update(bar) {
+        for bar in one_hour_bars {
+            if let Some(finalized) = self.one_hour_bars.update(bar) {
                 self.structure.update(finalized);
             }
         }
@@ -2471,7 +2408,7 @@ impl SlcSignalState {
             }
         }
         if finalize_last {
-            if let Some(finalized) = self.four_hour_bars.take() {
+            if let Some(finalized) = self.one_hour_bars.take() {
                 self.structure.update(finalized);
             }
             if let Some(finalized) = self.five_minute_bars.take() {
@@ -2485,13 +2422,13 @@ impl SlcSignalState {
         self.atr.initialized() && self.stochastics.initialized()
     }
 
-    /// 接收 4 小时 Bar 更新，仅在出现更新的时间戳后返回上一根最终 Bar
-    fn finalize_four_hour(&mut self, bar: Bar) -> Option<Bar> {
-        self.four_hour_bars.update(bar)
+    /// 接收 1 小时 Bar 更新，仅在出现更新的时间戳后返回上一根最终 Bar
+    fn finalize_one_hour(&mut self, bar: Bar) -> Option<Bar> {
+        self.one_hour_bars.update(bar)
     }
 
-    /// 将一根已完成 4 小时 Bar 写入确认 pivot 结构，不接触任何订单状态
-    fn process_four_hour(&mut self, bar: Bar) {
+    /// 将一根已完成 1 小时 Bar 写入滚动 4 小时结构，不接触任何订单状态
+    fn process_one_hour(&mut self, bar: Bar) {
         self.structure.update(bar);
     }
 
@@ -2500,7 +2437,7 @@ impl SlcSignalState {
         self.five_minute_bars.update(bar)
     }
 
-    /// 推进指标与全部 level，并至多返回一个和 4 小时结构一致的确认信号
+    /// 推进指标与全部 level，并至多返回一个和滚动 4 小时结构一致的确认信号
     ///
     /// 处理顺序刻意固定：先用当前 Bar 更新随机指标并观察已有区域，再用更新前 ATR 检测当前
     /// displacement 并创建新区域，最后才更新 ATR。这样新区域不能在创建它的同一根 Bar 上被
@@ -2585,13 +2522,12 @@ impl SlcSignalState {
         }
         self.recent_five_minute_bars.push_back(bar);
         while self.recent_five_minute_bars.len()
-            > (self.rules.displacement_max_bars + self.rules.level_extreme_lookback_bars + 1)
-                .max(self.rules.recent_range_lookback_bars)
+            > (self.rules.displacement_max_bars + 1).max(self.rules.recent_range_lookback_bars)
         {
             self.recent_five_minute_bars.pop_front();
         }
         if atr_initialized
-            && let Some((kind, source, displacement_strength_atr, fresh_entry_eligible)) =
+            && let Some((kind, source, displacement_strength_atr)) =
                 displacement_zone(&self.recent_five_minute_bars, atr_before, self.rules)
             && matches!(
                 (trend, kind),
@@ -2609,13 +2545,7 @@ impl SlcSignalState {
                 };
                 push_zone(
                     zones,
-                    Zone::from_displacement(
-                        kind,
-                        source,
-                        atr_before,
-                        displacement_strength_atr,
-                        fresh_entry_eligible,
-                    ),
+                    Zone::from_displacement(kind, source, atr_before, displacement_strength_atr),
                     self.rules.max_zones_per_side,
                 );
                 *last_source = Some(source.ts_event);
@@ -2633,7 +2563,7 @@ impl SlcSignalState {
         signal
     }
 
-    /// 返回入场方向前方最近的 5 分钟反向区域或已确认 4 小时 pivot
+    /// 返回入场方向前方最近的 5 分钟反向区域或滚动 4 小时窗口高低点
     fn opposing_level(&self, side: OrderSide, entry: Price) -> Option<Price> {
         let zone_level = match side {
             OrderSide::Buy => self
@@ -2657,7 +2587,7 @@ impl SlcSignalState {
         }
     }
 
-    /// 4 小时方向变化时丢弃旧结构下生成的 level，后续只接受新方向同侧的 level
+    /// 滚动 4 小时方向变化时丢弃旧结构下生成的 level，后续只接受新方向同侧的 level
     fn align_levels_with_trend(&mut self, trend: Trend) {
         if trend == self.level_trend {
             return;
@@ -2715,13 +2645,12 @@ fn push_zone(zones: &mut VecDeque<Zone>, zone: Zone, max_zones: usize) {
 /// 在近期顶部/底部寻找最后一根反向源 K 线，并验证随后 1 至 N 根 Bar 达到 ATR 位移阈值
 ///
 /// Demand 要求源 K 线收跌、当前收盘突破源高点且靠近位移区间上沿；Supply 条件完全镜像。
-/// 返回值同时标记源 K 是否处于近期极值：极值区可首次回测，非极值区只能等待破位收复；强度
-/// 使用生成前 ATR 归一化，便于在价格和波动率不同的标的之间比较。
+/// 强度使用生成前 ATR 归一化，便于在价格和波动率不同的标的之间比较。
 fn displacement_zone(
     bars: &VecDeque<Bar>,
     atr: f64,
     rules: SignalRules,
-) -> Option<(ZoneKind, Bar, f64, bool)> {
+) -> Option<(ZoneKind, Bar, f64)> {
     if atr <= 0.0 {
         return None;
     }
@@ -2729,15 +2658,6 @@ fn displacement_zone(
     let first_source = bars.len().saturating_sub(rules.displacement_max_bars + 1);
     for source_index in (first_source..bars.len().saturating_sub(1)).rev() {
         let source = bars[source_index];
-        let context_start = source_index.saturating_sub(rules.level_extreme_lookback_bars);
-        let at_recent_bottom = bars
-            .iter()
-            .skip(context_start)
-            .all(|candidate| source.low <= candidate.low);
-        let at_recent_top = bars
-            .iter()
-            .skip(context_start)
-            .all(|candidate| source.high >= candidate.high);
         let mut impulse_high = f64::NEG_INFINITY;
         let mut impulse_low = f64::INFINITY;
         for impulse in bars.iter().skip(source_index + 1) {
@@ -2757,12 +2677,7 @@ fn displacement_zone(
             && (impulse_high - current.close.as_f64()) / impulse_range
                 <= rules.displacement_close_fraction
         {
-            return Some((
-                ZoneKind::Demand,
-                source,
-                upward_move / atr,
-                at_recent_bottom,
-            ));
+            return Some((ZoneKind::Demand, source, upward_move / atr));
         }
         if source.close > source.open
             && current.close < source.low
@@ -2770,7 +2685,7 @@ fn displacement_zone(
             && (current.close.as_f64() - impulse_low) / impulse_range
                 <= rules.displacement_close_fraction
         {
-            return Some((ZoneKind::Supply, source, downward_move / atr, at_recent_top));
+            return Some((ZoneKind::Supply, source, downward_move / atr));
         }
     }
     None
@@ -3663,7 +3578,7 @@ impl RunStatistics {
         for (instrument_id, statistics) in symbols {
             let rejected = statistics.risk_rejections.values().sum::<u64>();
             lines.push(format!(
-                "[{instrument_id}] SLC diagnostics: 5m_bars={}, directional_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, entries_submitted={}, risk_rejections={}, {}",
+                "[{instrument_id}] SLC diagnostics: 5m_bars={}, directional_rolling_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, entries_submitted={}, risk_rejections={}, {}",
                 statistics.funnel.five_minute_bars,
                 statistics.funnel.directional_bars,
                 statistics.funnel.zones_created,
@@ -4016,7 +3931,7 @@ fn bar_reaches_stop_and_target(stop: Price, target: Price, bar: Bar) -> bool {
 struct SlcStrategyConfig {
     instrument_id: InstrumentId,
     five_minute_bar_type: BarType,
-    four_hour_bar_type: BarType,
+    one_hour_bar_type: BarType,
     market: SlcMarket,
     timezone: TimeZone,
     entry_start_minute: u16,
@@ -4237,7 +4152,7 @@ struct SlcStrategy {
     config: SlcStrategyConfig,
     instrument: InstrumentAny,
     signals: SlcSignalState,
-    backtest_four_hour_bars: Option<VecDeque<Bar>>,
+    backtest_one_hour_bars: Option<VecDeque<Bar>>,
     account_risk: Arc<AccountRisk>,
     signal_arbiter: Arc<SignalArbiter>,
     run_statistics: Arc<Mutex<RunStatistics>>,
@@ -4260,7 +4175,7 @@ struct SlcStrategy {
 /// 构造单个策略实例时由回测或实盘 runner 注入的运行环境差异
 struct SlcRunConfig {
     flatten_minute: u16,
-    backtest_four_hour_bars: Option<Vec<Bar>>,
+    backtest_one_hour_bars: Option<Vec<Bar>>,
     round_trip_cost_per_share: Decimal,
     log_bars: bool,
     run_statistics: Arc<Mutex<RunStatistics>>,
@@ -4285,19 +4200,19 @@ fn slc_strategy_config(instrument_id: InstrumentId) -> StrategyConfig {
 impl SlcStrategy {
     /// 创建一个信号与订单状态隔离的单标的实例，仅共享风险账本、信号归集器和运行统计
     ///
-    /// 构造阶段先回放 warmup，并强制 5 分钟指标初始化成功。4 小时 pivot 未满足时允许节点启动，
-    /// 但趋势保持 Neutral 且不能入场；这是数据尚不足的可恢复状态，而不是启动失败。
+    /// 构造阶段先回放 warmup，并强制 5 分钟指标初始化成功。四根 1 小时 Bar 未到齐时允许节点
+    /// 启动，但趋势保持 Neutral 且不能入场；这是数据尚不足的可恢复状态，而不是启动失败。
     fn new(
         app_config: &AppConfig,
         instrument_id: InstrumentId,
         instrument: InstrumentAny,
         five_minute_bars: Vec<Bar>,
-        four_hour_bars: Vec<Bar>,
+        one_hour_bars: Vec<Bar>,
         account_risk: Arc<AccountRisk>,
         run_config: SlcRunConfig,
     ) -> anyhow::Result<Self> {
         let five_minute_bar_type = AppConfig::five_minute_bar_type(instrument_id);
-        let four_hour_bar_type = AppConfig::four_hour_bar_type(instrument_id);
+        let one_hour_bar_type = AppConfig::one_hour_bar_type(instrument_id);
         let latest_entry_minute = run_config
             .flatten_minute
             .checked_sub(app_config.minimum_target_time_minutes)
@@ -4322,12 +4237,12 @@ impl SlcStrategy {
             })
             .transpose()?;
         let five_minute_warmup_count = five_minute_bars.len();
-        let four_hour_warmup_count = four_hour_bars.len();
+        let one_hour_warmup_count = one_hour_bars.len();
         let mut signals = SlcSignalState::new(app_config);
         signals.warm_up(
             five_minute_bars,
-            four_hour_bars,
-            run_config.backtest_four_hour_bars.is_some(),
+            one_hour_bars,
+            run_config.backtest_one_hour_bars.is_some(),
         );
         anyhow::ensure!(
             signals.indicators_initialized(),
@@ -4337,17 +4252,13 @@ impl SlcStrategy {
         );
         if !signals.structure.initialized() {
             log::warn!(
-                "[{instrument_id}] SLC 4h structure is not initialized: bar_type={four_hour_bar_type}, received_bars={four_hour_warmup_count}, confirmed_pivot_highs={}, confirmed_pivot_lows={}; the 4h trend remains Neutral and cannot authorize entries",
-                signals.structure.highs.len(),
-                signals.structure.lows.len(),
+                "[{instrument_id}] SLC rolling 4h structure is not initialized: bar_type={one_hour_bar_type}, received_bars={one_hour_warmup_count}, required_bars={STRUCTURE_WINDOW_HOURS}; trend remains Neutral and cannot authorize entries",
             );
         }
         log::info!(
-            "[{instrument_id}] SLC warmup complete: 5m_bar_type={five_minute_bar_type}, 5m_bars={five_minute_warmup_count}, indicators_initialized={}, 4h_bar_type={four_hour_bar_type}, 4h_bars={four_hour_warmup_count}, structure_initialized={}, confirmed_pivot_highs={}, confirmed_pivot_lows={}, initial_4h_trend={:?}",
+            "[{instrument_id}] SLC warmup complete: 5m_bar_type={five_minute_bar_type}, 5m_bars={five_minute_warmup_count}, indicators_initialized={}, 1h_bar_type={one_hour_bar_type}, 1h_bars={one_hour_warmup_count}, structure_window_bars={STRUCTURE_WINDOW_HOURS}, structure_initialized={}, initial_rolling_4h_trend={:?}",
             signals.indicators_initialized(),
             signals.structure.initialized(),
-            signals.structure.highs.len(),
-            signals.structure.lows.len(),
             signals.structure.trend(),
         );
         signals.funnel = SignalFunnel::default();
@@ -4363,7 +4274,7 @@ impl SlcStrategy {
             config: SlcStrategyConfig {
                 instrument_id,
                 five_minute_bar_type,
-                four_hour_bar_type,
+                one_hour_bar_type,
                 market: app_config.market,
                 timezone: app_config.timezone.clone(),
                 entry_start_minute: app_config.session.entry_start_minute,
@@ -4400,7 +4311,7 @@ impl SlcStrategy {
             },
             instrument,
             signals,
-            backtest_four_hour_bars: run_config.backtest_four_hour_bars.map(VecDeque::from),
+            backtest_one_hour_bars: run_config.backtest_one_hour_bars.map(VecDeque::from),
             account_risk,
             signal_arbiter: run_config.signal_arbiter,
             run_statistics: Arc::clone(&run_config.run_statistics),
@@ -4535,27 +4446,26 @@ impl SlcStrategy {
         );
     }
 
-    /// 把一根确认的 4 小时 Bar 应用于结构判断，不让高周期数据进入订单撮合
-    fn process_finalized_four_hour_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
+    /// 把一根确认的 1 小时 Bar 应用于滚动结构判断，不让高周期数据进入订单撮合
+    fn process_finalized_one_hour_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
         let local = bar
             .ts_event
             .to_datetime_utc()
             .to_zoned(self.config.timezone.clone());
         let minute = u16::try_from(local.hour())? * 60 + u16::try_from(local.minute())?;
         if self.config.market.is_regular_bar_start(minute) {
-            self.signals.process_four_hour(bar);
+            self.signals.process_one_hour(bar);
             if self.config.log_bars {
                 log::info!(
-                    "[{}] 4h structure updated: start={}, open={}, high={}, low={}, close={}, structure_initialized={}, confirmed_pivot_highs={}, confirmed_pivot_lows={}, trend={:?}",
+                    "[{}] 1h structure input: start={}, open={}, high={}, low={}, close={}, rolling_window_bars={}, structure_initialized={}, rolling_4h_trend={:?}",
                     self.config.instrument_id,
                     local,
                     bar.open,
                     bar.high,
                     bar.low,
                     bar.close,
+                    self.signals.structure.len(),
                     self.signals.structure.initialized(),
-                    self.signals.structure.highs.len(),
-                    self.signals.structure.lows.len(),
                     self.signals.structure.trend(),
                 );
             }
@@ -4563,23 +4473,23 @@ impl SlcStrategy {
         Ok(())
     }
 
-    /// 仅当回放时钟已进入下一周期时推进历史 4 小时 Bar，防止回测提前看到完整高周期数据
-    fn advance_backtest_four_hour_bars(&mut self, timestamp: UnixNanos) -> anyhow::Result<()> {
+    /// 仅当回放时钟已进入下一周期时推进历史 1 小时 Bar，防止回测提前看到完整高周期数据
+    fn advance_backtest_one_hour_bars(&mut self, timestamp: UnixNanos) -> anyhow::Result<()> {
         loop {
             let Some(next) = self
-                .backtest_four_hour_bars
+                .backtest_one_hour_bars
                 .as_ref()
                 .and_then(|bars| bars.front().copied())
                 .filter(|bar| bar.ts_event <= timestamp)
             else {
                 return Ok(());
             };
-            self.backtest_four_hour_bars
+            self.backtest_one_hour_bars
                 .as_mut()
                 .expect("backtest bars checked above")
                 .pop_front();
-            if let Some(finalized) = self.signals.finalize_four_hour(next) {
-                self.process_finalized_four_hour_bar(finalized)?;
+            if let Some(finalized) = self.signals.finalize_one_hour(next) {
+                self.process_finalized_one_hour_bar(finalized)?;
             }
         }
     }
@@ -5065,7 +4975,7 @@ impl SlcStrategy {
             self.instrument.price_precision(),
             self.config.risk_reward,
         )?;
-        let is_backtest = self.backtest_four_hour_bars.is_some();
+        let is_backtest = self.backtest_one_hour_bars.is_some();
         let protective_target = if is_backtest {
             target_price(
                 pending.side,
@@ -5630,7 +5540,7 @@ nautilus_strategy!(SlcStrategy, {
             let trade_mfe_r = active.mfe_r();
             let trade_mae_r = active.mae_r();
             let trade_estimated_cost = active.filled_qty * self.config.round_trip_cost_per_share;
-            let trade_entry_slippage_stress = if self.backtest_four_hour_bars.is_some() {
+            let trade_entry_slippage_stress = if self.backtest_one_hour_bars.is_some() {
                 (active.entry_limit.as_decimal() - active.average_fill()).abs() * active.filled_qty
             } else {
                 Decimal::ZERO
@@ -5682,7 +5592,7 @@ nautilus_strategy!(SlcStrategy, {
                 statistics.trades.push(closed_trade);
             });
             trade_statistics = Some(closed_trade);
-            if self.backtest_four_hour_bars.is_some()
+            if self.backtest_one_hour_bars.is_some()
                 && matches!(exit_reason, TradeExitReason::Target | TradeExitReason::Stop)
             {
                 let probe = AmbiguityProbe {
@@ -5737,12 +5647,12 @@ nautilus_strategy!(SlcStrategy, {
 impl DataActor for SlcStrategy {
     /// 启动时校验 Bar 合约和 instrument，恢复共享风险状态并建立行情订阅
     ///
-    /// 回测只订阅 5 分钟数据，4 小时历史由回放时钟显式推进。实盘同时订阅 5 分钟、4 小时和
+    /// 回测只订阅 5 分钟数据，1 小时历史由回放时钟显式推进。实盘同时订阅 5 分钟、1 小时和
     /// Quote；若 reconciliation 发现已有敞口，则先禁止新信号并执行平仓，而不是猜测丢失的
     /// active trade、止损和目标状态。
     fn on_start(&mut self) -> anyhow::Result<()> {
         validate_bar_type(self.config.five_minute_bar_type, 5, BarAggregation::Minute)?;
-        validate_bar_type(self.config.four_hour_bar_type, 4, BarAggregation::Hour)?;
+        validate_bar_type(self.config.one_hour_bar_type, 1, BarAggregation::Hour)?;
         anyhow::ensure!(
             self.config.entry_start_minute < self.config.entry_end_minute,
             "effective entry window ends before it starts on this trading day",
@@ -5756,19 +5666,19 @@ impl DataActor for SlcStrategy {
             self.config.no_progress_max_mfe_r,
             self.config.no_progress_max_current_r,
         );
-        if self.backtest_four_hour_bars.is_some() {
+        if self.backtest_one_hour_bars.is_some() {
             log::info!(
-                "[{}] SLC backtest active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R step={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
+                "[{}] SLC backtest active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, 5m={}, historical_1h_bars={}, structure_window={}x1h, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R step={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
                 self.config.instrument_id,
                 self.signals.rules.trade_direction,
                 self.signals.rules.level_selection,
                 self.config.signal_batch_delay_ms,
                 self.signals.rules.confirmation_window_bars,
-                self.signals.rules.maximum_confirmation_distance_atr,
                 self.config.five_minute_bar_type,
-                self.backtest_four_hour_bars
+                self.backtest_one_hour_bars
                     .as_ref()
                     .map_or(0, VecDeque::len),
+                STRUCTURE_WINDOW_HOURS,
                 self.config.entry_start_minute / 60,
                 self.config.entry_start_minute % 60,
                 self.config.entry_end_minute / 60,
@@ -5799,18 +5709,18 @@ impl DataActor for SlcStrategy {
         )?;
         self.current_date = Some(local_date);
         self.session_disabled = snapshot.halted;
-        self.subscribe_bars(self.config.four_hour_bar_type, None, None);
+        self.subscribe_bars(self.config.one_hour_bar_type, None, None);
         self.subscribe_quotes(self.config.instrument_id, None, None);
         log::info!(
-            "[{}] SLC subscriptions active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R step={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
+            "[{}] SLC subscriptions active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, quotes=true, 5m={}, 1h={}, structure_window={}x1h, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R step={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
             self.config.instrument_id,
             self.signals.rules.trade_direction,
             self.signals.rules.level_selection,
             self.config.signal_batch_delay_ms,
             self.signals.rules.confirmation_window_bars,
-            self.signals.rules.maximum_confirmation_distance_atr,
             self.config.five_minute_bar_type,
-            self.config.four_hour_bar_type,
+            self.config.one_hour_bar_type,
+            STRUCTURE_WINDOW_HOURS,
             self.config.entry_start_minute / 60,
             self.config.entry_start_minute % 60,
             self.config.entry_end_minute / 60,
@@ -5854,7 +5764,7 @@ impl DataActor for SlcStrategy {
             )?;
         }
         log::info!(
-            "[{}] SLC signal funnel: 5m_bars={}, directional_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, risk_rejections={}, entries_submitted={}",
+            "[{}] SLC signal funnel: 5m_bars={}, directional_rolling_4h_bars={}, zones_created={}, level_touches={}, stochastic_extremes={}, stochastic_reentries={}, signals={}, risk_rejections={}, entries_submitted={}",
             self.config.instrument_id,
             self.signals.funnel.five_minute_bars,
             self.signals.funnel.directional_bars,
@@ -5867,8 +5777,8 @@ impl DataActor for SlcStrategy {
             self.entries_submitted,
         );
         self.unsubscribe_bars(self.config.five_minute_bar_type, None, None);
-        if self.backtest_four_hour_bars.is_none() {
-            self.unsubscribe_bars(self.config.four_hour_bar_type, None, None);
+        if self.backtest_one_hour_bars.is_none() {
+            self.unsubscribe_bars(self.config.one_hour_bar_type, None, None);
             self.unsubscribe_quotes(self.config.instrument_id, None, None);
         }
         Ok(())
@@ -5928,22 +5838,22 @@ impl DataActor for SlcStrategy {
 
     /// 按结构、数据完整性、时段、风险和执行顺序处理已完成 Bar
     ///
-    /// 4 小时 Bar 只更新结构。5 分钟 Bar 先检查跨日与断档，再更新持仓 MFE/MAE、计算信号、
+    /// 1 小时 Bar 只更新滚动结构。5 分钟 Bar 先检查跨日与断档，再更新持仓 MFE/MAE、计算信号、
     /// 执行收盘前退出、取消过期入场、检查实盘目标兜底、阶梯保护和无进展退出，最后才允许
     /// 新订单进入风险预留流程。任一故障、会话禁用、已有敞口或退出未完成都会阻断新入场。
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
-        if bar.bar_type == self.config.four_hour_bar_type {
-            let Some(finalized) = self.signals.finalize_four_hour(*bar) else {
+        if bar.bar_type == self.config.one_hour_bar_type {
+            let Some(finalized) = self.signals.finalize_one_hour(*bar) else {
                 return Ok(());
             };
-            self.process_finalized_four_hour_bar(finalized)?;
+            self.process_finalized_one_hour_bar(finalized)?;
             return Ok(());
         }
         if bar.bar_type != self.config.five_minute_bar_type {
             return Ok(());
         }
-        let finalized = if self.backtest_four_hour_bars.is_some() {
-            self.advance_backtest_four_hour_bars(bar.ts_init)?;
+        let finalized = if self.backtest_one_hour_bars.is_some() {
+            self.advance_backtest_one_hour_bars(bar.ts_init)?;
             *bar
         } else {
             let Some(finalized) = self.signals.finalize_five_minute(*bar) else {
@@ -6019,7 +5929,7 @@ impl DataActor for SlcStrategy {
         self.update_run_statistics(|statistics| statistics.funnel = funnel);
         if self.config.log_bars {
             log::info!(
-                "[{}] 5m bar collected: start={}, open={}, high={}, low={}, close={}, volume={}, 4h_trend={:?}, atr={:.6}, stochastic_k={:.2}, demand_zones={}, supply_zones={}, indicators_initialized={}, structure_initialized={}, session_disabled={}",
+                "[{}] 5m bar collected: start={}, open={}, high={}, low={}, close={}, volume={}, rolling_4h_trend={:?}, atr={:.6}, stochastic_k={:.2}, demand_zones={}, supply_zones={}, indicators_initialized={}, structure_initialized={}, session_disabled={}",
                 self.config.instrument_id,
                 local,
                 finalized.open,
@@ -6071,7 +5981,7 @@ impl DataActor for SlcStrategy {
             return Ok(());
         }
         self.cancel_stale_entry(finalized)?;
-        if self.backtest_four_hour_bars.is_none() && self.target_reached(finalized) {
+        if self.backtest_one_hour_bars.is_none() && self.target_reached(finalized) {
             self.request_exit(
                 TradeExitReason::Target,
                 "five-minute bar traded through the actual-fill-based SLC target",
@@ -6339,7 +6249,7 @@ struct PreparedInputs {
     instrument_id: InstrumentId,
     instrument: InstrumentAny,
     five_minute_bars: Vec<Bar>,
-    four_hour_bars: Vec<Bar>,
+    one_hour_bars: Vec<Bar>,
     market_close: Timestamp,
     market_close_minute: u16,
 }
@@ -6405,7 +6315,7 @@ async fn load_instruments(
     Ok(instruments)
 }
 
-/// 实盘节点启动前加载全部 instrument、完整 5 分钟/4 小时 warmup 及当日收盘时间
+/// 实盘节点启动前加载全部 instrument、完整 5 分钟/1 小时 warmup 及当日收盘时间
 async fn prepare_inputs(
     config: &AppConfig,
     context: &QuoteContext,
@@ -6424,12 +6334,12 @@ async fn prepare_inputs(
             instrument.price_precision(),
         )
         .await?;
-        let four_hour_bars = load_warmup_bars(
+        let one_hour_bars = load_warmup_bars(
             context,
             symbol,
-            Period::FourHour,
-            AppConfig::four_hour_bar_type(instrument_id),
-            config.four_hour_warmup,
+            Period::SixtyMinute,
+            AppConfig::one_hour_bar_type(instrument_id),
+            config.one_hour_warmup,
             instrument.price_precision(),
         )
         .await?;
@@ -6438,7 +6348,7 @@ async fn prepare_inputs(
             instrument_id,
             instrument,
             five_minute_bars,
-            four_hour_bars,
+            one_hour_bars,
             market_close,
             market_close_minute,
         });
@@ -6494,8 +6404,8 @@ async fn load_warmup_bars(
 
 /// 从 warmup 响应删除未完成 K 线，再解析、排序和去重
 ///
-/// 5 分钟指标必须取得完整请求数量；4 小时结构允许使用新上市标的的全部可用历史，不足时保持
-/// Neutral，直到后续已完成 Bar 足以确认 pivot，避免一个历史较短的标的中断整个多标的节点。
+/// 5 分钟指标必须取得完整请求数量；1 小时结构允许使用新上市标的的全部可用历史，不足四根时
+/// 保持 Neutral，避免一个历史较短的标的中断整个多标的节点。
 fn parse_warmup_bars(
     symbol: &str,
     period: Period,
@@ -6507,7 +6417,7 @@ fn parse_warmup_bars(
 ) -> anyhow::Result<Vec<Bar>> {
     let bar_duration = match period {
         Period::FiveMinute => time::Duration::minutes(5),
-        Period::FourHour => time::Duration::hours(4),
+        Period::SixtyMinute => time::Duration::hours(1),
         _ => anyhow::bail!("unsupported SLC warmup period: {period:?}"),
     };
     let mut bars = candlesticks
@@ -6535,7 +6445,7 @@ fn parse_warmup_bars(
             "Longbridge returned {} of {count} required {period:?} warmup bars for {symbol}",
             bars.len(),
         ),
-        Period::FourHour => anyhow::ensure!(
+        Period::SixtyMinute => anyhow::ensure!(
             !bars.is_empty(),
             "Longbridge returned no completed {period:?} warmup bars for {symbol}",
         ),
@@ -6553,9 +6463,9 @@ struct PreparedBacktestInputs {
     instrument_id: InstrumentId,
     instrument: InstrumentAny,
     five_minute_warmup: Vec<Bar>,
-    four_hour_warmup: Vec<Bar>,
+    one_hour_warmup: Vec<Bar>,
     five_minute_bars: Vec<Bar>,
-    four_hour_bars: Vec<Bar>,
+    one_hour_bars: Vec<Bar>,
 }
 
 /// 一个参数候选在指定样本上的保守评估结果
@@ -6777,13 +6687,13 @@ fn slice_backtest_inputs(
                 input.instrument_id,
                 AppConfig::five_minute_bar_type(input.instrument_id),
             )?,
-            four_hour_warmup: split_warmup_bars(
-                &input.four_hour_warmup,
-                &input.four_hour_bars,
+            one_hour_warmup: split_warmup_bars(
+                &input.one_hour_warmup,
+                &input.one_hour_bars,
                 start,
-                config.four_hour_warmup,
+                config.one_hour_warmup,
                 input.instrument_id,
-                AppConfig::four_hour_bar_type(input.instrument_id),
+                AppConfig::one_hour_bar_type(input.instrument_id),
             )?,
             five_minute_bars: input
                 .five_minute_bars
@@ -6791,8 +6701,8 @@ fn slice_backtest_inputs(
                 .copied()
                 .filter(|bar| bar.ts_event >= start && bar.ts_event < end)
                 .collect(),
-            four_hour_bars: input
-                .four_hour_bars
+            one_hour_bars: input
+                .one_hour_bars
                 .iter()
                 .copied()
                 .filter(|bar| bar.ts_event >= start && bar.ts_event < end)
@@ -6853,7 +6763,7 @@ async fn prepare_backtest_inputs(
     for (index, (instrument_id, instrument)) in instruments.into_iter().enumerate() {
         let symbol = instrument_id.symbol.as_str();
         let five_minute_bar_type = AppConfig::five_minute_bar_type(instrument_id);
-        let four_hour_bar_type = AppConfig::four_hour_bar_type(instrument_id);
+        let one_hour_bar_type = AppConfig::one_hour_bar_type(instrument_id);
         let started = Instant::now();
         println!(
             "[{}/{}] [{instrument_id}] SLC data download: requesting 5m warmup",
@@ -6877,22 +6787,22 @@ async fn prepare_backtest_inputs(
             symbol_count,
             five_minute_warmup.len(),
         );
-        let four_hour_warmup = load_backtest_warmup_bars(
+        let one_hour_warmup = load_backtest_warmup_bars(
             context,
             symbol,
-            Period::FourHour,
-            four_hour_bar_type,
-            config.strategy.four_hour_warmup,
+            Period::SixtyMinute,
+            one_hour_bar_type,
+            config.strategy.one_hour_warmup,
             config.start,
             market,
             instrument.price_precision(),
         )
         .await?;
         println!(
-            "[{}/{}] [{instrument_id}] SLC data download: 4h warmup ready, bars={}",
+            "[{}/{}] [{instrument_id}] SLC data download: 1h warmup ready, bars={}",
             index + 1,
             symbol_count,
-            four_hour_warmup.len(),
+            one_hour_warmup.len(),
         );
         println!(
             "[{}/{}] [{instrument_id}] SLC data download: requesting 5m replay {start_date}..={end_date}",
@@ -6929,11 +6839,11 @@ async fn prepare_backtest_inputs(
             symbol_count,
             five_minute_bars.len(),
         );
-        let four_hour_bars = load_backtest_bars(
+        let one_hour_bars = load_backtest_bars(
             context,
             symbol,
-            Period::FourHour,
-            four_hour_bar_type,
+            Period::SixtyMinute,
+            one_hour_bar_type,
             config.start,
             config.end,
             market,
@@ -6941,13 +6851,13 @@ async fn prepare_backtest_inputs(
         )
         .await?;
         println!(
-            "[{}/{}] [{instrument_id}] SLC data ready: 5m_warmup={}, 4h_warmup={}, 5m_bars={}, 4h_bars={}, skipped_half_days={}, elapsed={:.1}s",
+            "[{}/{}] [{instrument_id}] SLC data ready: 5m_warmup={}, 1h_warmup={}, 5m_bars={}, 1h_bars={}, skipped_half_days={}, elapsed={:.1}s",
             index + 1,
             symbol_count,
             five_minute_warmup.len(),
-            four_hour_warmup.len(),
+            one_hour_warmup.len(),
             five_minute_bars.len(),
-            four_hour_bars.len(),
+            one_hour_bars.len(),
             half_days.len(),
             started.elapsed().as_secs_f64(),
         );
@@ -6955,9 +6865,9 @@ async fn prepare_backtest_inputs(
             instrument_id,
             instrument,
             five_minute_warmup,
-            four_hour_warmup,
+            one_hour_warmup,
             five_minute_bars,
-            four_hour_bars,
+            one_hour_bars,
         });
     }
     Ok(prepared)
@@ -7078,7 +6988,7 @@ fn parse_backtest_bars(
 ) -> anyhow::Result<Vec<Bar>> {
     let duration = match period {
         Period::FiveMinute => FIVE_MINUTE_NANOS,
-        Period::FourHour => FOUR_HOUR_NANOS,
+        Period::SixtyMinute => ONE_HOUR_NANOS,
         _ => anyhow::bail!("unsupported SLC backtest period: {period:?}"),
     };
     let start = UnixNanos::from(start);
@@ -7280,7 +7190,7 @@ fn run_statistics_lines(
         .lines(timezone))
 }
 
-/// 仅把 5 分钟 Bar 送入撮合；4 小时 Bar 在策略内部按回放时钟推进结构
+/// 仅把 5 分钟 Bar 送入撮合；1 小时 Bar 在策略内部按回放时钟推进滚动结构
 ///
 /// 这种隔离防止高周期 OHLC 被误当成可成交行情，同时保证实盘和回测的结构确认时刻一致。
 /// 每次运行使用临时风险状态文件，避免参数候选之间共享 reservation 或日内 PnL。
@@ -7353,11 +7263,11 @@ fn run_backtest_engine(
             prepared.instrument_id,
             prepared.instrument,
             prepared.five_minute_warmup,
-            prepared.four_hour_warmup,
+            prepared.one_hour_warmup,
             Arc::clone(&account_risk),
             SlcRunConfig {
                 flatten_minute,
-                backtest_four_hour_bars: Some(prepared.four_hour_bars),
+                backtest_one_hour_bars: Some(prepared.one_hour_bars),
                 round_trip_cost_per_share: config.strategy.round_trip_cost_per_share,
                 log_bars: config.log_bars,
                 run_statistics: Arc::clone(&run_statistics),
@@ -8091,11 +8001,11 @@ async fn run_live(config_path: &Path) -> anyhow::Result<()> {
             prepared.instrument_id,
             prepared.instrument,
             prepared.five_minute_bars,
-            prepared.four_hour_bars,
+            prepared.one_hour_bars,
             Arc::clone(&account_risk),
             SlcRunConfig {
                 flatten_minute,
-                backtest_four_hour_bars: None,
+                backtest_one_hour_bars: None,
                 round_trip_cost_per_share: config.round_trip_cost_per_share,
                 log_bars: true,
                 run_statistics: Arc::clone(&run_statistics),
@@ -8224,6 +8134,47 @@ open_updated = true
             close,
             timestamp,
         )
+    }
+
+    fn one_hour_bar(open: &str, high: &str, low: &str, close: &str, timestamp: u64) -> Bar {
+        bar(
+            BarType::from("QQQ.US.LONGBRIDGE-1-HOUR-LAST-EXTERNAL"),
+            open,
+            high,
+            low,
+            close,
+            timestamp,
+        )
+    }
+
+    #[test]
+    fn structure_uses_four_completed_one_hour_bars() {
+        let mut up = RollingFourHourStructure::default();
+        for bar in [
+            one_hour_bar("100", "101", "99", "100", 1),
+            one_hour_bar("100", "102", "100", "101", 2),
+            one_hour_bar("101", "103", "101", "102", 3),
+        ] {
+            up.update(bar);
+        }
+        assert_eq!(up.trend(), Trend::Neutral);
+        up.update(one_hour_bar("102", "104", "102", "103", 4));
+        assert_eq!(up.trend(), Trend::Up);
+
+        let mut down = RollingFourHourStructure::default();
+        for bar in [
+            one_hour_bar("103", "104", "102", "103", 1),
+            one_hour_bar("102", "103", "101", "102", 2),
+            one_hour_bar("101", "102", "100", "101", 3),
+            one_hour_bar("100", "101", "99", "100", 4),
+        ] {
+            down.update(bar);
+        }
+        assert_eq!(down.trend(), Trend::Down);
+        assert_eq!(
+            AppConfig::one_hour_bar_type(InstrumentId::from("QQQ.US.LONGBRIDGE")),
+            BarType::from("QQQ.US.LONGBRIDGE-1-HOUR-LAST-EXTERNAL"),
+        );
     }
 
     fn active_trade(side: OrderSide) -> ActiveTrade {
@@ -8406,11 +8357,11 @@ open_updated = true
     }
 
     #[test]
-    fn four_hour_warmup_accepts_all_available_history_for_a_new_listing() {
+    fn one_hour_warmup_accepts_all_available_history_for_a_new_listing() {
         let bars = parse_warmup_bars(
             "SKHY.US",
-            Period::FourHour,
-            BarType::from("SKHY.US.LONGBRIDGE-4-HOUR-LAST-EXTERNAL"),
+            Period::SixtyMinute,
+            BarType::from("SKHY.US.LONGBRIDGE-1-HOUR-LAST-EXTERNAL"),
             vec![sdk_candlestick(
                 "100.00",
                 "101.00",
@@ -8518,11 +8469,9 @@ open_updated = true
             minimum_fresh_level_age_bars: 1,
             max_zones_per_side: 8,
             confirmation_window_bars: 6,
-            maximum_confirmation_distance_atr: 1.0,
             displacement_atr_multiple: 1.0,
             displacement_close_fraction: 0.35,
             displacement_max_bars: 3,
-            level_extreme_lookback_bars: 3,
             oversold: 20.0,
             overbought: 80.0,
         }
@@ -8531,8 +8480,8 @@ open_updated = true
     fn signal_state() -> SlcSignalState {
         SlcSignalState {
             five_minute_bars: FinalBarBuffer::default(),
-            four_hour_bars: FinalBarBuffer::default(),
-            structure: PivotStructure::new(2),
+            one_hour_bars: FinalBarBuffer::default(),
+            structure: RollingFourHourStructure::default(),
             atr: AverageTrueRange::new(1, Some(MovingAverageType::Wilder), Some(true), None),
             stochastics: Stochastics::new_with_params(
                 1,
@@ -8555,7 +8504,7 @@ open_updated = true
     }
 
     #[test]
-    fn five_minute_indicators_initialize_without_four_hour_structure() {
+    fn five_minute_indicators_initialize_without_one_hour_structure() {
         let mut signals = signal_state();
 
         let _ = signals.process_five_minute(five_minute_bar("100", "101", "99", "100", 1), false);
@@ -8875,10 +8824,6 @@ open_updated = true
             file.signal.confirmation_window_bars,
         );
         assert_eq!(
-            config.maximum_confirmation_distance_atr,
-            file.signal.maximum_confirmation_distance_atr,
-        );
-        assert_eq!(
             config.recent_range_multiple,
             file.signal.recent_range_multiple.parse().unwrap(),
         );
@@ -8888,16 +8833,6 @@ open_updated = true
         assert!(backtest.start < backtest.end);
         assert_eq!(backtest.risk_rewards, vec![Decimal::from(2)],);
         assert!(backtest.walk_forward.is_none());
-    }
-
-    #[rstest::rstest]
-    fn confirmation_distance_must_be_positive() {
-        let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
-        file.signal.maximum_confirmation_distance_atr = 0.0;
-
-        let e = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap_err();
-
-        assert!(e.to_string().contains("maximum confirmation distance ATR"));
     }
 
     #[rstest::rstest]
@@ -9065,7 +9000,7 @@ open_updated = true
                 2.0,
                 rules,
             )
-            .map(|(kind, source, _, _)| (kind, source)),
+            .map(|(kind, source, _)| (kind, source)),
             Some((ZoneKind::Demand, bearish_base)),
         );
         assert_eq!(
@@ -9074,7 +9009,7 @@ open_updated = true
                 2.0,
                 rules,
             )
-            .map(|(kind, source, _, _)| (kind, source)),
+            .map(|(kind, source, _)| (kind, source)),
             Some((ZoneKind::Supply, bullish_base)),
         );
     }
@@ -9089,32 +9024,13 @@ open_updated = true
 
         assert_eq!(
             displacement_zone(&VecDeque::from([source, first, second]), 2.0, rules)
-                .map(|(kind, source, _, _)| (kind, source)),
+                .map(|(kind, source, _)| (kind, source)),
             None,
         );
         assert_eq!(
             displacement_zone(&VecDeque::from([source, first, second, third]), 2.0, rules,)
-                .map(|(kind, source, _, _)| (kind, source)),
+                .map(|(kind, source, _)| (kind, source)),
             Some((ZoneKind::Demand, source)),
-        );
-    }
-
-    #[test]
-    fn non_extreme_displacement_cannot_enter_fresh() {
-        let prior_low = five_minute_bar("98.0", "100.0", "97.0", "99.0", 1);
-        let source = five_minute_bar("100.0", "101.0", "98.0", "99.0", 2);
-        let displacement = five_minute_bar("99.0", "104.0", "99.0", "103.5", 3);
-
-        assert_eq!(
-            displacement_zone(
-                &VecDeque::from([prior_low, source, displacement]),
-                2.0,
-                signal_rules(),
-            )
-            .map(|(kind, candidate, _, fresh_entry_eligible)| {
-                (kind, candidate, fresh_entry_eligible)
-            }),
-            Some((ZoneKind::Demand, source, false)),
         );
     }
 
@@ -9301,98 +9217,14 @@ open_updated = true
         );
     }
 
-    #[test]
-    fn non_extreme_level_requires_break_and_reclaim() {
-        let rules = signal_rules();
-        let source = five_minute_bar("100", "101", "99", "100", 1);
-        let mut zones = VecDeque::from([Zone::from_displacement(
-            ZoneKind::Demand,
-            source,
-            2.0,
-            1.5,
-            false,
-        )]);
-
-        let fresh = observe_zones(
-            &mut zones,
-            five_minute_bar("102", "102", "100", "101.2", 2),
-            Confirmation {
-                extreme: false,
-                reentry: true,
-            },
-            true,
-            OrderSide::Buy,
-            2.0,
-            rules,
-        );
-        assert_eq!(fresh, None);
-        assert_eq!(zones[0].state, ZoneState::Fresh);
-
-        let _ = observe_zones(
-            &mut zones,
-            five_minute_bar("100", "100", "98", "98.5", 3),
-            Confirmation {
-                extreme: false,
-                reentry: false,
-            },
-            true,
-            OrderSide::Buy,
-            2.0,
-            rules,
-        );
-        let _ = observe_zones(
-            &mut zones,
-            five_minute_bar("99", "102", "99", "101.5", 4),
-            Confirmation {
-                extreme: false,
-                reentry: false,
-            },
-            true,
-            OrderSide::Buy,
-            2.0,
-            rules,
-        );
-        let _ = observe_zones(
-            &mut zones,
-            five_minute_bar("101", "101.5", "100", "101.2", 5),
-            Confirmation {
-                extreme: true,
-                reentry: false,
-            },
-            true,
-            OrderSide::Buy,
-            2.0,
-            rules,
-        );
-        let reclaimed = observe_zones(
-            &mut zones,
-            five_minute_bar("101.2", "102", "101", "101.8", 6),
-            Confirmation {
-                extreme: false,
-                reentry: true,
-            },
-            true,
-            OrderSide::Buy,
-            2.0,
-            rules,
-        );
-
-        assert!(reclaimed.is_some_and(|signal| signal.level == SignalLevel::Reclaimed));
-    }
-
     #[rstest::rstest]
     fn test_zone_accepts_stochastic_reentry_within_confirmation_window() {
         let rules = signal_rules();
         let source = five_minute_bar("100", "101", "99", "100", 1);
         let touch = five_minute_bar("101", "101", "100", "100.5", 2);
         let confirmation = five_minute_bar("101.5", "102.5", "101.5", "102", 3);
-        let mut zones = VecDeque::from([Zone::from_displacement(
-            ZoneKind::Demand,
-            source,
-            2.0,
-            1.5,
-            true,
-        )]);
+        let mut zones =
+            VecDeque::from([Zone::from_displacement(ZoneKind::Demand, source, 2.0, 1.5)]);
 
         let _ = observe_zones(
             &mut zones,
@@ -9420,60 +9252,6 @@ open_updated = true
         );
 
         assert!(signal.is_some());
-        assert!(zones.is_empty());
-    }
-
-    #[rstest::rstest]
-    #[case("102.50", 2.0, true)]
-    #[case("103.50", 2.0, false)]
-    #[case("104.50", 4.0, true)]
-    fn zone_requires_confirmation_close_near_level(
-        #[case] confirmation_close: &str,
-        #[case] current_atr: f64,
-        #[case] accepted: bool,
-    ) {
-        let rules = SignalRules {
-            maximum_confirmation_distance_atr: 1.0,
-            ..signal_rules()
-        };
-        let source = five_minute_bar("100", "101", "99", "100", 1);
-        let touch = five_minute_bar("101", "101", "100", "100.5", 2);
-        let confirmation =
-            five_minute_bar("101.5", confirmation_close, "101.5", confirmation_close, 3);
-        let mut zones = VecDeque::from([Zone::from_displacement(
-            ZoneKind::Demand,
-            source,
-            2.0,
-            1.5,
-            true,
-        )]);
-
-        let _ = observe_zones(
-            &mut zones,
-            touch,
-            Confirmation {
-                extreme: true,
-                reentry: false,
-            },
-            true,
-            OrderSide::Buy,
-            current_atr,
-            rules,
-        );
-        let signal = observe_zones(
-            &mut zones,
-            confirmation,
-            Confirmation {
-                extreme: false,
-                reentry: true,
-            },
-            true,
-            OrderSide::Buy,
-            current_atr,
-            rules,
-        );
-
-        assert_eq!(signal.is_some(), accepted);
         assert!(zones.is_empty());
     }
 
@@ -10170,7 +9948,9 @@ open_updated = true
         ));
         assert_eq!(daily_range.remaining_range(), Some(Decimal::from(2)));
         let mut signals = signal_state();
-        signals.structure.highs.push_back(Price::from("105.00"));
+        signals
+            .structure
+            .update(one_hour_bar("100", "105", "99", "104", 1));
         signals.supply.push_back(Zone::from_bar(
             ZoneKind::Supply,
             five_minute_bar("103", "104", "103", "104", 1),

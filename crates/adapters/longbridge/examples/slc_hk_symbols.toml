@@ -48,7 +48,8 @@ max_entry_slippage_ticks = 2
 # 港股首版不假设借券资格，只允许做多。
 trade_direction = "long"
 risk_reward = "2"
-level_selection = "reclaimed_only"
+# 原策略允许首次回测和一次破位收复后的回测；reclaimed_only 仅用于对照实验。
+level_selection = "all"
 batch_delay_ms = 2000
 profit_protection_trigger_r = "1"
 profit_protection_floor_r = "0.5"
@@ -66,13 +67,10 @@ atr_period = 14
 displacement_atr_multiple = 1.5
 displacement_close_fraction = 0.35
 displacement_max_bars = 3
-level_extreme_lookback_bars = 3
-pivot_span = 2
 zone_ttl_bars = 78
 minimum_fresh_level_age_bars = 6
 max_zones_per_side = 8
 confirmation_window_bars = 4
-maximum_confirmation_distance_atr = 2.0
 stochastic_k_period = 5
 stochastic_k_smoothing = 3
 stochastic_d_period = 3
@@ -83,7 +81,8 @@ minimum_target_time_minutes = 30
 
 [warmup]
 five_minute_bars = 500
-four_hour_bars = 60
+# 加载已完成的 1 小时 Bar；结构判断始终只消费最近四根。
+one_hour_bars = 60
 
 [session]
 # 时间均为香港时间。策略自动排除午休，并在午休前使用同一平仓缓冲。
