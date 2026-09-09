@@ -3,7 +3,11 @@
 
 [longbridge]
 # OAuth 2.0 公共客户端 ID；不是 access token，也不是客户端密钥。
+#mac
 oauth_client_id = "2bcd116c-41bc-4ad5-8d73-280f0d53b1e4"
+#wsl
+#oauth_client_id = "158c3901-18c6-4caa-9fc6-043775e0ea07"
+
 # OAuth 浏览器授权完成后，本机接收回调的 TCP 端口；必须大于 0。
 oauth_callback_port = 60355
 # true 路由到 Longbridge 模拟盘；false 路由到真实账户。
@@ -23,9 +27,9 @@ mode = "dynamic"
 # 都会阻止交易节点启动，不会静默回退到固定池。
 dynamic_pool_path = "../../../../target/longbridge-slc-dynamic-pool.toml"
 # 最终动态池最多保留的标的数；所有标的仍共享 [risk] 下的仓位和风险额度。
-max_symbols = 200
+max_symbols = 300
 # Longbridge 每个方向先返回的候选数。both 会分别请求多头和空头并交替选取，最多共请求两倍数量。
-candidate_count_per_side = 120
+candidate_count_per_side = 150
 # Longbridge 静态信息不提供美股逐标的 tick；此处为动态池统一使用的保守报价格点。默认 0.01
 # 对当前 minimum_price > 1 的主板池不会生成亚分价格；若券商规则变化，应先人工核对再修改。
 price_increment = "0.01"
@@ -35,7 +39,7 @@ maximum_price = "500"
 # Longbridge 市值筛选输入值；美股筛选值 50 约对应 50 亿 USD，快照保存 API 返回的原始市值供审计。
 minimum_market_cap = "50"
 # 近一个月日均成交额下限，Longbridge 筛选单位为“万”；500 即约 500 万 USD。
-minimum_average_daily_turnover = "500"
+minimum_average_daily_turnover = "800"
 # 午間流動性回看最近幾個完整交易日；半日市自動排除。允許 1 至 10，5 日兼顧近期性與穩定性。
 liquidity_lookback_days = 5
 # 11:30-14:00（紐約時間）歷史 5 分鐘 K 線的每分鐘平均成交股數下限。缺失 K 線按零成交計算；
@@ -73,15 +77,23 @@ max_entry_slippage_ticks = 5
 # 允许的入场方向：both、long 或 short；只影响新信号，不改变退出逻辑。
 trade_direction = "both"
 # 可交易的 Level：all 同时交易 Fresh/Reclaimed；reclaimed_only 仅交易一次破位收复后的 Level。
-level_selection = "all"
-# 同一根 5 分钟 K 线信号的归集等待时间，单位毫秒；归集后 Reclaimed 优先占用三个共享仓位。
+level_selection = "reclaimed_only"
+# 同一根 5 分钟 K 线信号的归集等待时间，单位毫秒；归集后按无权重质量字段依次排序。
 batch_delay_ms = 2000
 # 固定止盈倍数，以初始风险 R 为单位；文档要求至少 2R。
 risk_reward = "2"
 # 价格曾达到该浮盈 R 后启用利润保护；与下方保护线同时设为 0 可关闭。
 profit_protection_trigger_r = "1"
-# 启用后，可成交价回落到该 R 时撤销保护单并市价离场；0.25R 预留成本缓冲。
-profit_protection_floor_r = "0.25"
+# 价格达到首个触发档后，把券商端止损抬到的首个盈利 R；0.5R 保留回调空间。
+profit_protection_floor_r = "0.5"
+# MFE 每继续增加该 R，再把利润保护线同幅抬高；当前形成 1R→0.5R、1.5R→1R 两档。
+profit_protection_step_r = "0.5"
+# 持仓达到该数量的已完成 5 分钟 Bar 后，开始判断交易是否始终没有启动；0 与下方阈值全为 0 时关闭。
+no_progress_exit_after_bars = 12
+# 无进展退出要求持仓以来的最大有利波动严格小于该 R；0.5R 表示从未形成足够跟随。
+no_progress_max_mfe_r = "0.5"
+# 无进展退出同时要求当前完成 Bar 的收盘收益不高于该 R；0 表示只退出未盈利交易。
+no_progress_max_current_r = "0"
 # 止损在 zone 远端之外额外留出的最小价格跳动数。
 stop_buffer_ticks = 2
 # 初始止损波动距离模型：atr 仅使用 ATR 倍数，recent_range 仅使用最近 K 线区间，
@@ -95,12 +107,12 @@ recent_range_lookback_bars = 5
 # recent_range 和 hybrid 模式的区间倍数：止损距离=(Max High-Min Low)*该倍数。
 recent_range_multiple = "0.7"
 # 5 分钟 Wilder ATR 周期；用于量化 displacement，并在 atr/hybrid 止损中衡量市场噪声。
-atr_period = 14
+atr_period = 10
 # 创建 level 所需的最小位移强度，单位 ATR；1.5 用来排除普通波动形成的伪 level。
 displacement_atr_multiple = 1.5
-# 位移结束收盘价允许偏离位移极端的最大比例，范围 0 至 0.5，越小越严格。
-displacement_close_fraction = 0.35
-# 一次有效 displacement 最多允许由多少根 5 分钟 Bar 完成，范围 1 至 12。
+# 位移结束收盘价允许偏离位移极端的最大比例，范围 0 至 0.5，越小越严格。 默认 0.35
+displacement_close_fraction = 0.3
+# 一次有效 displacement 最多允许由多少根 5 分钟 Bar 完成，范围 1 至 12。默认 3
 displacement_max_bars = 3
 # Fresh demand/supply 的源 K 必须是近期窗口最低/最高点；其他 Level 仅在一次破位收复后可交易。
 level_extreme_lookback_bars = 3
@@ -112,10 +124,10 @@ zone_ttl_bars = 78
 minimum_fresh_level_age_bars = 6
 # demand 和 supply 各自最多保留的 level 数，防止状态和扫描成本无界增长。
 max_zones_per_side = 8
-# 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数；2 表示最多等待 10 分钟。
+# 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数；2 表示最多等待 10 分钟。 默认 2
 confirmation_window_bars = 5
 # 确认收盘价到 level 最近边界的最大距离，使用 level 创建/确认时较大 ATR 归一化。
-# 超过该距离说明反转行情已经离开 level，放弃追价入场。
+# 超过该距离说明反转行情已经离开 level，放弃追价入场。 默认 1.0
 maximum_confirmation_distance_atr = 2.5
 # Stochastics %K 原始周期。
 stochastic_k_period = 5
@@ -132,7 +144,7 @@ minimum_target_time_minutes = 60
 
 [warmup]
 # 启动前加载的已完成 5 分钟 Bar 数，用于初始化 ATR、随机指标和近期位移窗口。
-five_minute_bars = 100
+five_minute_bars = 50
 # 启动前加载的已完成 4 小时 Bar 数，用于确认 pivot 和初始结构。
 four_hour_bars = 60
 
@@ -144,12 +156,12 @@ entry_end = "15:30"
 # 距 Longbridge 当日常规收盘多少分钟开始撤单并强制平仓。
 flatten_before_close_minutes = 10
 # 每个 symbol 每个纽约交易日最多允许的入场次数。
-max_trades_per_day = 20
+max_trades_per_day = 10
 
 [backtest]
 # 回测样本起点和终点，必须使用 UTC 时间戳且 start < end；当前回归 2026 年 8 月。
-start = "2026-05-01T00:00:00Z"
-end = "2026-05-31T23:59:59Z"
+start = "2025-11-01T00:00:00Z"
+end = "2025-11-30T23:59:59Z"
 # 同一数据和止损规则下比较文档原始 2R 与扩展 3R，避免只看单一目标误判退出质量。
 risk_rewards = ["2"]
 # 回测组合初始资金；用于收益率、Sharpe、回撤和 Calmar 计算。

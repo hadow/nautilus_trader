@@ -51,7 +51,12 @@ risk_reward = "2"
 level_selection = "reclaimed_only"
 batch_delay_ms = 2000
 profit_protection_trigger_r = "1"
-profit_protection_floor_r = "0.25"
+profit_protection_floor_r = "0.5"
+profit_protection_step_r = "0.5"
+# 持仓至少 12 根已完成 5 分钟 Bar、MFE 仍低于 0.5R 且当前收盘不盈利时退出。
+no_progress_exit_after_bars = 12
+no_progress_max_mfe_r = "0.5"
+no_progress_max_current_r = "0"
 stop_buffer_ticks = 1
 stop_distance_model = "hybrid"
 minimum_stop_atr_multiple = 2.0

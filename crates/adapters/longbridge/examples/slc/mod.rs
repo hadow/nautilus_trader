@@ -42,8 +42,9 @@
 //! # 订单与风险模型
 //!
 //! 每个 symbol 创建独立策略实例和信号状态，多个实例共享账户风险账本与短时信号归集器。同一根
-//! 5 分钟 K 线的候选先按 Reclaimed、Fresh、symbol 排序，再占用共享仓位；选中的入场单仅保留
-//! 一根 5 分钟 Bar。初始止损可选择 level 创建/入场时较大 ATR 的波动下限、
+//! 5 分钟 K 线的候选依次按 displacement 强度降序、确认距离升序、确认耗时升序、剩余日内空间
+//! 降序和 symbol 兜底排序，再占用共享仓位；选中的入场单仅保留一根 5 分钟 Bar。初始止损可选择
+//! level 创建/入场时较大 ATR 的波动下限、
 //! 最近若干根已完成 5 分钟 K 线完整高低区间的配置倍数，或同时使用两者的
 //! 混合模型；最终仍取区域远端与波动下限中更远者，避免止损落回结构失效位之内。
 //! 数量按照最坏允许入场价到该止损的每股风险计算，
@@ -51,8 +52,10 @@
 //!
 //! 实盘每一次部分成交都会立即创建券商托管的 Longbridge Market-If-Touched 止损。2R 目标按
 //! 实际平均成交价重新计算，由可立即成交的一档 bid/ask 触发撤单后市价平仓；已完成 5 分钟 Bar
-//! 仅作遗漏报价时的补偿。为避免显著浮盈在尾盘全部回吐，价格曾到达配置的 R 触发线后，
-//! 回落到保护线会执行管理式平仓。回测为每次成交提交 OUO 保护组合。
+//! 仅作遗漏报价时的补偿。为避免显著浮盈在尾盘全部回吐，价格跨过配置的 R 触发档后，
+//! 策略按固定 R 步长只向盈利方向抬高券商端止损；新保护价尚未可修改且已被穿越时，
+//! 才退化为管理式平仓。持仓达到配置 Bar 数后，只在 MFE 仍不足且当前收盘不盈利时退出
+//! 没有启动的交易。回测为每次成交提交 OUO 保护组合。
 //! 实盘目标依赖本地进程和行情连接，因此当前实现不能等同于券商原子 bracket order。
 //!
 //! # 回测解释边界
@@ -134,8 +137,8 @@ use nautilus_model::{
         OrderSide, OrderType, PriceType, TimeInForce, TriggerType,
     },
     events::{
-        OrderCancelRejected, OrderCanceled, OrderDenied, OrderExpired, OrderFilled, OrderRejected,
-        PositionClosed,
+        OrderCancelRejected, OrderCanceled, OrderDenied, OrderExpired, OrderFilled,
+        OrderModifyRejected, OrderRejected, OrderUpdated, PositionClosed,
     },
     identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TraderId},
     instruments::{Instrument, InstrumentAny},
@@ -414,6 +417,10 @@ struct AppConfig {
     signal_batch_delay_ms: u64,
     profit_protection_trigger_r: Decimal,
     profit_protection_floor_r: Decimal,
+    profit_protection_step_r: Decimal,
+    no_progress_exit_after_bars: u64,
+    no_progress_max_mfe_r: Decimal,
+    no_progress_max_current_r: Decimal,
     stop_buffer_ticks: u64,
     stop_distance_model: StopDistanceModel,
     minimum_stop_atr_multiple: f64,
@@ -528,6 +535,10 @@ struct SignalSettings {
     batch_delay_ms: u64,
     profit_protection_trigger_r: String,
     profit_protection_floor_r: String,
+    profit_protection_step_r: String,
+    no_progress_exit_after_bars: u64,
+    no_progress_max_mfe_r: String,
+    no_progress_max_current_r: String,
     stop_buffer_ticks: u64,
     stop_distance_model: String,
     minimum_stop_atr_multiple: f64,
@@ -733,6 +744,19 @@ impl AppConfig {
             "signal.profit_protection_floor_r",
             &signal.profit_protection_floor_r,
         )?;
+        let profit_protection_step_r = parse_config_value(
+            "signal.profit_protection_step_r",
+            &signal.profit_protection_step_r,
+        )?;
+        let no_progress_exit_after_bars = signal.no_progress_exit_after_bars;
+        let no_progress_max_mfe_r = parse_config_value(
+            "signal.no_progress_max_mfe_r",
+            &signal.no_progress_max_mfe_r,
+        )?;
+        let no_progress_max_current_r = parse_config_value(
+            "signal.no_progress_max_current_r",
+            &signal.no_progress_max_current_r,
+        )?;
         let stop_distance_model =
             parse_config_value("signal.stop_distance_model", &signal.stop_distance_model)?;
         let minimum_stop_atr_multiple = signal.minimum_stop_atr_multiple;
@@ -788,12 +812,25 @@ impl AppConfig {
         );
         anyhow::ensure!(
             (profit_protection_trigger_r == Decimal::ZERO
-                && profit_protection_floor_r == Decimal::ZERO)
+                && profit_protection_floor_r == Decimal::ZERO
+                && profit_protection_step_r == Decimal::ZERO)
                 || (profit_protection_trigger_r > Decimal::ZERO
                     && profit_protection_floor_r >= Decimal::ZERO
                     && profit_protection_floor_r < profit_protection_trigger_r
+                    && profit_protection_step_r > Decimal::ZERO
+                    && profit_protection_step_r <= risk_reward - profit_protection_trigger_r
                     && profit_protection_trigger_r < risk_reward),
-            "SLC profit protection must be disabled with 0/0 or satisfy 0 <= floor < trigger < target",
+            "SLC profit protection must be disabled with 0/0/0 or satisfy 0 <= floor < trigger < target and 0 < step <= target - trigger",
+        );
+        anyhow::ensure!(
+            (no_progress_exit_after_bars == 0
+                && no_progress_max_mfe_r == Decimal::ZERO
+                && no_progress_max_current_r == Decimal::ZERO)
+                || ((1..=78).contains(&no_progress_exit_after_bars)
+                    && no_progress_max_mfe_r > Decimal::ZERO
+                    && no_progress_max_current_r <= Decimal::ZERO
+                    && no_progress_max_current_r < no_progress_max_mfe_r),
+            "SLC no-progress exit must be disabled with 0/0/0 or satisfy 1 <= bars <= 78, maximum MFE R > 0 and maximum current R <= 0",
         );
         anyhow::ensure!(
             minimum_stop_atr_multiple.is_finite()
@@ -942,6 +979,10 @@ impl AppConfig {
             signal_batch_delay_ms,
             profit_protection_trigger_r,
             profit_protection_floor_r,
+            profit_protection_step_r,
+            no_progress_exit_after_bars,
+            no_progress_max_mfe_r,
+            no_progress_max_current_r,
             stop_buffer_ticks: signal.stop_buffer_ticks,
             stop_distance_model,
             minimum_stop_atr_multiple,
@@ -1932,7 +1973,7 @@ impl Zone {
 
 /// level 完成 SLC 三步检查后交给订单层的不可变信号快照
 ///
-/// 除方向、入场参考价和区域边界外，同时携带只读诊断特征；这些特征不参与准入或排序。
+/// 除方向、入场参考价和区域边界外，同时携带用于跨标的排序和交易诊断的质量特征。
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Signal {
     side: OrderSide,
@@ -1949,6 +1990,30 @@ struct Signal {
     zone_width_atr: f64,
     displacement_strength_atr: f64,
     ts_event: UnixNanos,
+}
+
+/// 跨标的仲裁使用的无权重质量快照，剩余日内空间按价格百分比归一化
+#[derive(Clone, Copy, Debug)]
+struct SignalRanking {
+    displacement_strength_atr: f64,
+    confirmation_distance_atr: f64,
+    confirmation_bars: u64,
+    remaining_daily_range_pct: Option<Decimal>,
+}
+
+impl SignalRanking {
+    /// 从信号和入场时剩余日振幅构造可跨不同股价比较的排序字段
+    fn new(signal: Signal, remaining_daily_range: Option<Decimal>) -> Self {
+        let entry = signal.entry.as_decimal();
+        Self {
+            displacement_strength_atr: signal.displacement_strength_atr,
+            confirmation_distance_atr: signal.distance_atr,
+            confirmation_bars: signal.confirmation_bars,
+            remaining_daily_range_pct: remaining_daily_range
+                .filter(|_| entry > Decimal::ZERO)
+                .map(|remaining| remaining / entry * Decimal::from(100)),
+        }
+    }
 }
 
 /// 区分首次回测与破位收复后的 setup，便于独立衡量两类 level 的期望值
@@ -1971,7 +2036,7 @@ impl Display for SignalLevel {
 #[derive(Debug)]
 struct SignalBatch {
     deadline: UnixNanos,
-    candidates: BTreeMap<String, SignalLevel>,
+    candidates: BTreeMap<String, SignalRanking>,
     winners: Option<BTreeSet<String>>,
     capacity: usize,
     decided: BTreeSet<String>,
@@ -1984,7 +2049,7 @@ struct SignalArbiterState {
     last_decided_signal_ts: Option<UnixNanos>,
 }
 
-/// 多标的共享的短时信号归集器，保证 Reclaimed 在 Fresh 之前竞争可用仓位
+/// 多标的共享的短时信号归集器，按无权重质量字段确定竞争可用仓位的顺序
 #[derive(Debug, Default)]
 struct SignalArbiter {
     state: Mutex<SignalArbiterState>,
@@ -2004,7 +2069,7 @@ impl SignalArbiter {
     fn queue(
         &self,
         symbol: &str,
-        level: SignalLevel,
+        ranking: SignalRanking,
         signal_ts: UnixNanos,
         now: UnixNanos,
         delay_ms: u64,
@@ -2039,13 +2104,16 @@ impl SignalArbiter {
             return Ok(None);
         }
         anyhow::ensure!(
-            batch.candidates.insert(symbol.to_string(), level).is_none(),
+            batch
+                .candidates
+                .insert(symbol.to_string(), ranking)
+                .is_none(),
             "SLC signal arbiter received a duplicate candidate for {symbol} at {signal_ts}",
         );
         Ok(Some(batch.deadline))
     }
 
-    /// 首次决策时按 Reclaimed、Fresh、symbol 排序并冻结赢家，后续回调只读取同一结果
+    /// 首次决策时按强度、距离、耗时、剩余空间和 symbol 依次排序并冻结赢家
     fn decide(
         &self,
         symbol: &str,
@@ -2062,9 +2130,20 @@ impl SignalArbiter {
                 .get_mut(&signal_ts)
                 .context("SLC signal arbitration batch is missing")?;
             let mut ranked = batch.candidates.iter().collect::<Vec<_>>();
-            ranked.sort_by(|(left_symbol, left_level), (right_symbol, right_level)| {
-                right_level
-                    .cmp(left_level)
+            ranked.sort_by(|(left_symbol, left), (right_symbol, right)| {
+                right
+                    .displacement_strength_atr
+                    .total_cmp(&left.displacement_strength_atr)
+                    .then_with(|| {
+                        left.confirmation_distance_atr
+                            .total_cmp(&right.confirmation_distance_atr)
+                    })
+                    .then_with(|| left.confirmation_bars.cmp(&right.confirmation_bars))
+                    .then_with(|| {
+                        right
+                            .remaining_daily_range_pct
+                            .cmp(&left.remaining_daily_range_pct)
+                    })
                     .then_with(|| left_symbol.cmp(right_symbol))
             });
             if batch.winners.is_none() {
@@ -3233,6 +3312,7 @@ enum TradeExitReason {
     Target,
     Stop,
     ProfitProtection,
+    NoProgress,
     PreClose,
     RiskExit,
     Mixed,
@@ -3256,6 +3336,7 @@ impl Display for TradeExitReason {
             Self::Target => write!(f, "target"),
             Self::Stop => write!(f, "stop"),
             Self::ProfitProtection => write!(f, "profit_protection"),
+            Self::NoProgress => write!(f, "no_progress"),
             Self::PreClose => write!(f, "pre_close"),
             Self::RiskExit => write!(f, "risk_exit"),
             Self::Mixed => write!(f, "mixed"),
@@ -3954,6 +4035,10 @@ struct SlcStrategyConfig {
     signal_batch_delay_ms: u64,
     profit_protection_trigger_r: Decimal,
     profit_protection_floor_r: Decimal,
+    profit_protection_step_r: Decimal,
+    no_progress_exit_after_bars: u64,
+    no_progress_max_mfe_r: Decimal,
+    no_progress_max_current_r: Decimal,
     stop_buffer_ticks: u64,
     stop_distance_model: StopDistanceModel,
     minimum_stop_atr_multiple: f64,
@@ -3990,6 +4075,7 @@ struct PendingEntry {
 #[derive(Clone, Copy, Debug)]
 struct DeferredSignal {
     signal: Signal,
+    ranking: SignalRanking,
     local_date: jiff::civil::Date,
 }
 
@@ -4018,10 +4104,13 @@ struct ActiveTrade {
     first_fill_ts: UnixNanos,
     filled_qty: Decimal,
     protected_qty: Decimal,
+    protective_stop_order_ids: Vec<ClientOrderId>,
     fill_notional: Decimal,
     initial_risk: Decimal,
     maximum_favorable_excursion: Decimal,
     maximum_adverse_excursion: Decimal,
+    profit_protection_floor_r: Option<Decimal>,
+    pending_profit_stop: Option<(Decimal, Price)>,
     bars_held: u64,
     exit_reason: Option<TradeExitReason>,
 }
@@ -4080,9 +4169,44 @@ impl ActiveTrade {
         favorable_move / (self.initial_risk / self.filled_qty)
     }
 
-    /// 判断交易是否曾越过浮盈触发线，且当前可成交价已回落到保护线
-    fn should_protect_profit(&self, price: Price, trigger_r: Decimal, floor_r: Decimal) -> bool {
-        trigger_r > Decimal::ZERO && self.mfe_r() >= trigger_r && self.price_r(price) <= floor_r
+    /// 判断完成 Bar 是否同时满足持仓时间、未达最低 MFE 和当前未盈利三个退出条件
+    fn should_exit_no_progress(
+        &self,
+        price: Price,
+        exit_after_bars: u64,
+        max_mfe_r: Decimal,
+        max_current_r: Decimal,
+    ) -> bool {
+        exit_after_bars > 0
+            && self.bars_held >= exit_after_bars
+            && self.mfe_r() < max_mfe_r
+            && self.price_r(price) <= max_current_r
+    }
+
+    /// 返回指定盈利 R 对应的止损价，并向锁定更多利润的方向取整到合法 tick
+    fn profit_stop_price(
+        &self,
+        floor_r: Decimal,
+        increment: Price,
+        precision: u8,
+    ) -> anyhow::Result<Price> {
+        anyhow::ensure!(
+            self.initial_risk > Decimal::ZERO && self.filled_qty > Decimal::ZERO,
+            "SLC profit stop requires positive initial risk and filled quantity",
+        );
+        let entry = self.average_fill();
+        let risk_per_share = self.initial_risk / self.filled_qty;
+        let increment = increment.as_decimal();
+        let price = match self.side {
+            OrderSide::Buy => ((entry + risk_per_share * floor_r) / increment).ceil() * increment,
+            OrderSide::Sell => ((entry - risk_per_share * floor_r) / increment).floor() * increment,
+            OrderSide::NoOrderSide => anyhow::bail!("entry side is unspecified"),
+        };
+        anyhow::ensure!(
+            price > Decimal::ZERO,
+            "SLC profit stop price must be positive"
+        );
+        Ok(Price::from_decimal_dp(price, precision)?)
     }
 
     /// 将每股波动转换为 R 倍数，并防止异常成交状态导致除零
@@ -4263,6 +4387,10 @@ impl SlcStrategy {
                 signal_batch_delay_ms: app_config.signal_batch_delay_ms,
                 profit_protection_trigger_r: app_config.profit_protection_trigger_r,
                 profit_protection_floor_r: app_config.profit_protection_floor_r,
+                profit_protection_step_r: app_config.profit_protection_step_r,
+                no_progress_exit_after_bars: app_config.no_progress_exit_after_bars,
+                no_progress_max_mfe_r: app_config.no_progress_max_mfe_r,
+                no_progress_max_current_r: app_config.no_progress_max_current_r,
                 stop_buffer_ticks: app_config.stop_buffer_ticks,
                 stop_distance_model: app_config.stop_distance_model,
                 minimum_stop_atr_multiple: app_config.minimum_stop_atr_multiple,
@@ -4326,6 +4454,13 @@ impl SlcStrategy {
 
     /// 根据策略自有订单 tag 把成交归类为止损、目标或管理式风险退出
     fn record_exit_fill(&mut self, event: &OrderFilled) {
+        let (profit_stop_confirmed, pending_profit_stop) =
+            self.active_trade.as_ref().map_or((false, None), |active| {
+                (
+                    active.profit_protection_floor_r.is_some(),
+                    active.pending_profit_stop.map(|(_, stop)| stop),
+                )
+            });
         let reason = self
             .cache()
             .order(&event.client_order_id)
@@ -4334,7 +4469,15 @@ impl SlcStrategy {
                 if tags.iter().any(|tag| tag.as_str() == "SLC_TARGET") {
                     Some(TradeExitReason::Target)
                 } else if tags.iter().any(|tag| tag.as_str() == "SLC_STOP") {
-                    Some(TradeExitReason::Stop)
+                    let modified_to_pending_profit_stop =
+                        pending_profit_stop.is_some_and(|stop| order.trigger_price() == Some(stop));
+                    Some(
+                        if profit_stop_confirmed || modified_to_pending_profit_stop {
+                            TradeExitReason::ProfitProtection
+                        } else {
+                            TradeExitReason::Stop
+                        },
+                    )
                 } else if tags.iter().any(|tag| tag.as_str() == "SLC_EXIT") {
                     Some(TradeExitReason::RiskExit)
                 } else {
@@ -4536,9 +4679,10 @@ impl SlcStrategy {
         );
         let now = self.clock().timestamp_ns();
         let symbol = self.config.instrument_id.symbol.as_str();
+        let ranking = SignalRanking::new(signal, self.signals.daily_range.remaining_range());
         let Some(deadline) = self.signal_arbiter.queue(
             symbol,
-            signal.level,
+            ranking,
             signal.ts_event,
             now,
             self.config.signal_batch_delay_ms,
@@ -4562,11 +4706,20 @@ impl SlcStrategy {
             self.signal_arbiter.cancel(symbol, signal.ts_event)?;
             return Err(e);
         }
-        self.deferred_signal = Some(DeferredSignal { signal, local_date });
+        self.deferred_signal = Some(DeferredSignal {
+            signal,
+            ranking,
+            local_date,
+        });
+        let remaining_daily_range_pct = format_optional_decimal(ranking.remaining_daily_range_pct);
         log::info!(
-            "[{}] Queued SLC signal: level={}, signal_ts={}, arbitration_deadline={}, batch_delay_ms={}",
+            "[{}] Queued SLC signal: level={}, displacement_strength_atr={:.4}, confirmation_distance_atr={:.4}, confirmation_bars={}, remaining_daily_range_pct={}, signal_ts={}, arbitration_deadline={}, batch_delay_ms={}",
             self.config.instrument_id,
             signal.level,
+            ranking.displacement_strength_atr,
+            ranking.confirmation_distance_atr,
+            ranking.confirmation_bars,
+            remaining_daily_range_pct,
             signal.ts_event,
             deadline,
             self.config.signal_batch_delay_ms,
@@ -4594,13 +4747,19 @@ impl SlcStrategy {
                 RiskRejectionReason::ConcurrentSignalPriority
             };
             self.record_risk_rejection(reason);
+            let remaining_daily_range_pct =
+                format_optional_decimal(deferred.ranking.remaining_daily_range_pct);
             log::info!(
-                "[{}] Skipping ranked SLC signal: risk_rejection={}, level={}, rank={}/{}, available_slots={}",
+                "[{}] Skipping ranked SLC signal: risk_rejection={}, level={}, rank={}/{}, displacement_strength_atr={:.4}, confirmation_distance_atr={:.4}, confirmation_bars={}, remaining_daily_range_pct={}, available_slots={}",
                 self.config.instrument_id,
                 reason,
                 deferred.signal.level,
                 decision.rank,
                 decision.candidates,
+                deferred.ranking.displacement_strength_atr,
+                deferred.ranking.confirmation_distance_atr,
+                deferred.ranking.confirmation_bars,
+                remaining_daily_range_pct,
                 decision.capacity,
             );
             return Ok(());
@@ -4619,12 +4778,18 @@ impl SlcStrategy {
             );
             return Ok(());
         }
+        let remaining_daily_range_pct =
+            format_optional_decimal(deferred.ranking.remaining_daily_range_pct);
         log::info!(
-            "[{}] Selected SLC signal: level={}, rank={}/{}, batch_capacity={}",
+            "[{}] Selected SLC signal: level={}, rank={}/{}, displacement_strength_atr={:.4}, confirmation_distance_atr={:.4}, confirmation_bars={}, remaining_daily_range_pct={}, batch_capacity={}",
             self.config.instrument_id,
             deferred.signal.level,
             decision.rank,
             decision.candidates,
+            deferred.ranking.displacement_strength_atr,
+            deferred.ranking.confirmation_distance_atr,
+            deferred.ranking.confirmation_bars,
+            remaining_daily_range_pct,
             decision.capacity,
         );
         self.submit_signal(deferred.signal, deferred.local_date)
@@ -4852,6 +5017,10 @@ impl SlcStrategy {
             .active_trade
             .as_ref()
             .map_or(Decimal::ZERO, |active| active.initial_risk);
+        let mut protective_stop_order_ids = self
+            .active_trade
+            .as_ref()
+            .map_or_else(Vec::new, |active| active.protective_stop_order_ids.clone());
         let exit_reason = self
             .active_trade
             .as_ref()
@@ -4909,7 +5078,7 @@ impl SlcStrategy {
         } else {
             target
         };
-        match protective_stop_order_type(is_backtest) {
+        let protective_stop_order_id = match protective_stop_order_type(is_backtest) {
             OrderType::StopMarket => {
                 let (order_list_id, stop_order_id, target_order_id) = {
                     let orders = self.order();
@@ -4929,6 +5098,7 @@ impl SlcStrategy {
                     target_order_id,
                 )?;
                 self.submit_order_list(protective_orders, event.position_id, None, None)?;
+                stop_order_id
             }
             OrderType::MarketIfTouched => {
                 let stop_order = self.order().market_if_touched(
@@ -4948,10 +5118,13 @@ impl SlcStrategy {
                     Some(vec![Ustr::from("SLC_STOP")]),
                     None,
                 );
+                let stop_order_id = stop_order.client_order_id();
                 self.submit_order(stop_order, None, None, None)?;
+                stop_order_id
             }
             _ => unreachable!("unsupported SLC protective stop order type"),
-        }
+        };
+        protective_stop_order_ids.push(protective_stop_order_id);
         let protected_qty = self
             .active_trade
             .as_ref()
@@ -4981,10 +5154,13 @@ impl SlcStrategy {
             first_fill_ts,
             filled_qty,
             protected_qty,
+            protective_stop_order_ids,
             fill_notional,
             initial_risk,
             maximum_favorable_excursion,
             maximum_adverse_excursion,
+            profit_protection_floor_r: None,
+            pending_profit_stop: None,
             bars_held,
             exit_reason,
         });
@@ -5081,6 +5257,149 @@ impl SlcStrategy {
             }
         }
         Ok(true)
+    }
+
+    /// 把已跨过的最高阶梯保护档下发到所有券商端止损，每档只修改一次
+    ///
+    /// 入场余量结束前不抬高止损，确保后续部分成交与已保护数量保持一致。保护单尚未可修改
+    /// 而价格已穿越新保护档时返回 `true`，由调用方执行管理式全平。
+    fn ratchet_profit_stop(&mut self, executable_price: Price) -> anyhow::Result<bool> {
+        let Some(active) = self.active_trade.as_ref() else {
+            return Ok(false);
+        };
+        let Some(desired_floor_r) = stair_profit_floor_r(
+            active.mfe_r(),
+            self.config.profit_protection_trigger_r,
+            self.config.profit_protection_floor_r,
+            self.config.profit_protection_step_r,
+            self.config.risk_reward,
+        ) else {
+            return Ok(false);
+        };
+        let price_r = active.price_r(executable_price);
+        let pending = active.pending_profit_stop;
+        let current_floor_r = active.profit_protection_floor_r;
+        let stop_order_ids = active.protective_stop_order_ids.clone();
+        let stop_price = active.profit_stop_price(
+            desired_floor_r,
+            self.instrument.price_increment(),
+            self.instrument.price_precision(),
+        )?;
+        if current_floor_r.is_some_and(|floor_r| floor_r >= desired_floor_r) || pending.is_some() {
+            return Ok(false);
+        }
+        if let Some(current_floor_r) = current_floor_r
+            && active.profit_stop_price(
+                current_floor_r,
+                self.instrument.price_increment(),
+                self.instrument.price_precision(),
+            )? == stop_price
+        {
+            self.active_trade
+                .as_mut()
+                .expect("active trade checked above")
+                .profit_protection_floor_r = Some(desired_floor_r);
+            return Ok(false);
+        }
+        if price_r <= desired_floor_r {
+            self.request_exit(
+                TradeExitReason::ProfitProtection,
+                "executable price crossed a newly armed stair floor before protective stops could be modified",
+            )?;
+            return Ok(true);
+        }
+        if self.pending_entry.is_some() {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            !stop_order_ids.is_empty(),
+            "active SLC trade has no protective stop orders",
+        );
+        let modifiable_stop_order_ids = {
+            let cache = self.cache();
+            let mut modifiable = Vec::with_capacity(stop_order_ids.len());
+            for client_order_id in &stop_order_ids {
+                let Some(order) = cache.order(client_order_id) else {
+                    return Ok(false);
+                };
+                if order.is_closed() {
+                    continue;
+                }
+                if !order.is_open() || order.is_pending_update() || order.venue_order_id().is_none()
+                {
+                    return Ok(false);
+                }
+                modifiable.push(*client_order_id);
+            }
+            modifiable
+        };
+        if modifiable_stop_order_ids.is_empty() {
+            return Ok(false);
+        }
+        for client_order_id in &modifiable_stop_order_ids {
+            self.modify_order(*client_order_id, None, None, Some(stop_price), None, None)?;
+        }
+        self.active_trade
+            .as_mut()
+            .expect("active trade checked above")
+            .pending_profit_stop = Some((desired_floor_r, stop_price));
+        log::info!(
+            "[{}] Requested SLC stair profit protection: mfe_r={}, floor_r={}, stop={}, protective_orders={}",
+            self.config.instrument_id,
+            self.active_trade
+                .as_ref()
+                .expect("active trade checked above")
+                .mfe_r()
+                .round_dp(4),
+            desired_floor_r,
+            stop_price,
+            modifiable_stop_order_ids.len(),
+        );
+        Ok(false)
+    }
+
+    /// 在所有券商端止损均确认新触发价后，才把该阶梯档标记为已生效
+    fn confirm_profit_stop_update(&mut self, client_order_id: ClientOrderId) {
+        let Some((floor_r, stop_price, stop_order_ids)) =
+            self.active_trade.as_ref().and_then(|active| {
+                active.pending_profit_stop.map(|(floor_r, stop_price)| {
+                    (
+                        floor_r,
+                        stop_price,
+                        active.protective_stop_order_ids.clone(),
+                    )
+                })
+            })
+        else {
+            return;
+        };
+        if !stop_order_ids.contains(&client_order_id) {
+            return;
+        }
+        let all_confirmed = {
+            let cache = self.cache();
+            stop_order_ids.iter().all(|client_order_id| {
+                cache.order(client_order_id).is_some_and(|order| {
+                    order.is_closed() || order.trigger_price() == Some(stop_price)
+                })
+            })
+        };
+        if !all_confirmed {
+            return;
+        }
+        let active = self
+            .active_trade
+            .as_mut()
+            .expect("active trade checked above");
+        active.profit_protection_floor_r = Some(floor_r);
+        active.pending_profit_stop = None;
+        log::info!(
+            "[{}] Confirmed SLC stair profit protection: floor_r={}, stop={}, protective_orders={}",
+            self.config.instrument_id,
+            floor_r,
+            stop_price,
+            stop_order_ids.len(),
+        );
     }
 
     /// 先取消当前 symbol 的入场与保护单，再进入等待确认后市价平仓的退出状态
@@ -5249,6 +5568,32 @@ nautilus_strategy!(SlcStrategy, {
         }
     }
 
+    // 利润保护改单被拒后不再假定新止损生效，直接进入管理式风险退出
+    fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {
+        if event.instrument_id != self.config.instrument_id {
+            return;
+        }
+        let is_profit_stop = self.active_trade.as_ref().is_some_and(|active| {
+            active.pending_profit_stop.is_some()
+                && active
+                    .protective_stop_order_ids
+                    .contains(&event.client_order_id)
+        });
+        if is_profit_stop {
+            self.disable_after_order_failure(&format!(
+                "SLC stair profit-protection modification was rejected for {}: {}",
+                event.client_order_id, event.reason,
+            ));
+        }
+    }
+
+    // 等待所有止损都返回新触发价，再宣告该阶梯档已在券商端生效
+    fn on_order_updated(&mut self, event: OrderUpdated) {
+        if event.instrument_id == self.config.instrument_id {
+            self.confirm_profit_stop_update(event.client_order_id);
+        }
+    }
+
     // 持久化账户 PnL；若 entry remainder 仍可能成交则继续保留风险 reservation
     fn on_position_closed(&mut self, event: PositionClosed) {
         if event.instrument_id != self.config.instrument_id {
@@ -5404,9 +5749,16 @@ impl DataActor for SlcStrategy {
         );
         self.cache().try_instrument(&self.config.instrument_id)?;
         self.subscribe_bars(self.config.five_minute_bar_type, None, None);
+        log::info!(
+            "[{}] SLC no-progress exit: after_bars={}, mfe_r<{}, current_r<={}",
+            self.config.instrument_id,
+            self.config.no_progress_exit_after_bars,
+            self.config.no_progress_max_mfe_r,
+            self.config.no_progress_max_current_r,
+        );
         if self.backtest_four_hour_bars.is_some() {
             log::info!(
-                "[{}] SLC backtest active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
+                "[{}] SLC backtest active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, 5m={}, historical_4h_bars={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R step={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}",
                 self.config.instrument_id,
                 self.signals.rules.trade_direction,
                 self.signals.rules.level_selection,
@@ -5430,6 +5782,7 @@ impl DataActor for SlcStrategy {
                 self.config.risk_reward,
                 self.config.profit_protection_trigger_r,
                 self.config.profit_protection_floor_r,
+                self.config.profit_protection_step_r,
                 self.config.minimum_risk_utilization,
                 self.config.round_trip_cost_per_share,
             );
@@ -5449,7 +5802,7 @@ impl DataActor for SlcStrategy {
         self.subscribe_bars(self.config.four_hour_bar_type, None, None);
         self.subscribe_quotes(self.config.instrument_id, None, None);
         log::info!(
-            "[{}] SLC subscriptions active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
+            "[{}] SLC subscriptions active: direction={}, level_selection={}, signal_batch_delay_ms={}, confirmation_window={}bars, maximum_confirmation_distance={}ATR, quotes=true, 5m={}, 4h={}, entry_window={:02}:{:02}-{:02}:{:02}, flatten={:02}:{:02}, stop_distance_model={}, minimum_stop_atr_multiple={}, recent_range={}bars*{}, target={}R, profit_protection={}R->{}R step={}R, minimum_risk_utilization={}, estimated_round_trip_cost_per_share={}, account_halted={}, account_daily_pnl={}, open_risk={}, account_notional={}, open_positions={}, symbol_entries={}",
             self.config.instrument_id,
             self.signals.rules.trade_direction,
             self.signals.rules.level_selection,
@@ -5471,6 +5824,7 @@ impl DataActor for SlcStrategy {
             self.config.risk_reward,
             self.config.profit_protection_trigger_r,
             self.config.profit_protection_floor_r,
+            self.config.profit_protection_step_r,
             self.config.minimum_risk_utilization,
             self.config.round_trip_cost_per_share,
             snapshot.halted,
@@ -5529,10 +5883,10 @@ impl DataActor for SlcStrategy {
         Ok(())
     }
 
-    /// 当可立即成交的一档报价达到固定 R 目标或浮盈回落保护线时启动退出
+    /// 当可立即成交的一档报价达到目标时退出，跨过新阶梯档时抬高券商端止损
     ///
     /// 多头使用 bid、空头使用 ask，避免用不可成交的报价另一侧虚假触发。该路径依赖本地进程和
-    /// 实时 Quote；完成 Bar 检测只承担兜底职责，不能消除撤单与市价成交之间的延迟。
+    /// 实时 Quote；完成 Bar 检测只承担兜底职责，不能消除行情与改单之间的延迟。
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         if quote.instrument_id != self.config.instrument_id
             || self.faulted
@@ -5541,7 +5895,7 @@ impl DataActor for SlcStrategy {
         {
             return Ok(());
         }
-        let (side, target, protect_profit) = {
+        let (side, target, executable_price) = {
             let Some(active) = self.active_trade.as_mut() else {
                 return Ok(());
             };
@@ -5551,15 +5905,7 @@ impl DataActor for SlcStrategy {
                 OrderSide::NoOrderSide => return Ok(()),
             };
             active.observe_price(executable_price);
-            (
-                active.side,
-                active.target,
-                active.should_protect_profit(
-                    executable_price,
-                    self.config.profit_protection_trigger_r,
-                    self.config.profit_protection_floor_r,
-                ),
-            )
+            (active.side, active.target, executable_price)
         };
         if quote_reaches_target(side, target, quote) {
             log::info!(
@@ -5576,20 +5922,15 @@ impl DataActor for SlcStrategy {
                 "executable top-of-book quote reached the actual-fill-based SLC target",
             );
         }
-        if protect_profit {
-            return self.request_exit(
-                TradeExitReason::ProfitProtection,
-                "executable quote retraced to the configured profit-protection floor",
-            );
-        }
+        self.ratchet_profit_stop(executable_price)?;
         Ok(())
     }
 
     /// 按结构、数据完整性、时段、风险和执行顺序处理已完成 Bar
     ///
     /// 4 小时 Bar 只更新结构。5 分钟 Bar 先检查跨日与断档，再更新持仓 MFE/MAE、计算信号、
-    /// 执行收盘前退出、取消过期入场、检查实盘目标兜底，最后才允许新订单进入风险
-    /// 预留流程。任一故障、会话禁用、已有敞口或退出未完成都会阻断新入场。
+    /// 执行收盘前退出、取消过期入场、检查实盘目标兜底、阶梯保护和无进展退出，最后才允许
+    /// 新订单进入风险预留流程。任一故障、会话禁用、已有敞口或退出未完成都会阻断新入场。
     fn on_bar(&mut self, bar: &Bar) -> anyhow::Result<()> {
         if bar.bar_type == self.config.four_hour_bar_type {
             let Some(finalized) = self.signals.finalize_four_hour(*bar) else {
@@ -5737,17 +6078,32 @@ impl DataActor for SlcStrategy {
             )?;
             return Ok(());
         }
-        if self.active_trade.as_ref().is_some_and(|active| {
-            active.should_protect_profit(
-                finalized.close,
-                self.config.profit_protection_trigger_r,
-                self.config.profit_protection_floor_r,
-            )
-        }) {
-            self.request_exit(
-                TradeExitReason::ProfitProtection,
-                "completed five-minute bar closed at the configured profit-protection floor",
-            )?;
+        if self.ratchet_profit_stop(finalized.close)? {
+            return Ok(());
+        }
+        let no_progress = self.active_trade.as_ref().and_then(|active| {
+            active
+                .should_exit_no_progress(
+                    finalized.close,
+                    self.config.no_progress_exit_after_bars,
+                    self.config.no_progress_max_mfe_r,
+                    self.config.no_progress_max_current_r,
+                )
+                .then(|| {
+                    (
+                        active.bars_held,
+                        active.mfe_r(),
+                        active.price_r(finalized.close),
+                    )
+                })
+        });
+        if let Some((holding_bars, mfe_r, current_r)) = no_progress {
+            let detail = format!(
+                "no progress after {holding_bars} completed 5-minute bars: mfe_r={}, current_r={}",
+                mfe_r.round_dp(4),
+                current_r.round_dp(4),
+            );
+            self.request_exit(TradeExitReason::NoProgress, &detail)?;
             return Ok(());
         }
         if self.faulted
@@ -5892,6 +6248,30 @@ fn target_price(
     };
     anyhow::ensure!(target > Decimal::ZERO, "target price must be positive");
     Ok(Price::from_decimal_dp(target, precision)?)
+}
+
+/// 返回当前 MFE 已触发的最高利润保护档，目标价前每跨过一个步长同幅抬高
+fn stair_profit_floor_r(
+    mfe_r: Decimal,
+    trigger_r: Decimal,
+    initial_floor_r: Decimal,
+    step_r: Decimal,
+    target_r: Decimal,
+) -> Option<Decimal> {
+    if trigger_r <= Decimal::ZERO
+        || step_r <= Decimal::ZERO
+        || mfe_r < trigger_r
+        || trigger_r >= target_r
+    {
+        return None;
+    }
+    let mut stage_trigger_r = trigger_r;
+    let mut stage_floor_r = initial_floor_r;
+    while stage_trigger_r + step_r <= mfe_r && stage_trigger_r + step_r < target_r {
+        stage_trigger_r += step_r;
+        stage_floor_r += step_r;
+    }
+    Some(stage_floor_r)
 }
 
 /// 使用可立即成交的报价侧判断目标：多头看 bid，空头看 ask
@@ -7875,36 +8255,94 @@ open_updated = true
             first_fill_ts: UnixNanos::from(1),
             filled_qty: Decimal::from(10),
             protected_qty: Decimal::from(10),
+            protective_stop_order_ids: Vec::new(),
             fill_notional: Decimal::from(1_000),
             initial_risk: Decimal::from(10),
             maximum_favorable_excursion: Decimal::ZERO,
             maximum_adverse_excursion: Decimal::ZERO,
+            profit_protection_floor_r: None,
+            pending_profit_stop: None,
             bars_held: 0,
             exit_reason: None,
         }
     }
 
     #[rstest::rstest]
-    #[case(OrderSide::Buy, "101.00", "100.26", "100.25")]
-    #[case(OrderSide::Sell, "99.00", "99.74", "99.75")]
-    fn profit_protection_arms_after_trigger_and_exits_at_floor(
-        #[case] side: OrderSide,
-        #[case] trigger_price: &str,
-        #[case] above_floor: &str,
-        #[case] floor: &str,
-    ) {
-        let mut trade = active_trade(side);
-        trade.observe_price(Price::from(trigger_price));
+    #[case(OrderSide::Buy, "100.50")]
+    #[case(OrderSide::Sell, "99.50")]
+    fn profit_stop_price_locks_the_configured_r(#[case] side: OrderSide, #[case] expected: &str) {
+        let trade = active_trade(side);
 
-        assert!(!trade.should_protect_profit(
-            Price::from(above_floor),
-            Decimal::ONE,
-            Decimal::new(25, 2),
+        let stop = trade
+            .profit_stop_price(Decimal::new(5, 1), Price::from("0.01"), 2)
+            .unwrap();
+
+        assert_eq!(stop, Price::from(expected));
+    }
+
+    #[rstest::rstest]
+    #[case(OrderSide::Buy)]
+    #[case(OrderSide::Sell)]
+    fn no_progress_exit_requires_all_three_conditions(#[case] side: OrderSide) {
+        let mut trade = active_trade(side);
+        trade.maximum_favorable_excursion = Decimal::new(49, 2);
+        trade.bars_held = 11;
+
+        assert!(!trade.should_exit_no_progress(
+            Price::from("100.00"),
+            12,
+            Decimal::new(5, 1),
+            Decimal::ZERO,
         ));
-        assert!(
-            trade.should_protect_profit(Price::from(floor), Decimal::ONE, Decimal::new(25, 2),)
-        );
-        assert!(!trade.should_protect_profit(Price::from(floor), Decimal::ZERO, Decimal::ZERO,));
+
+        trade.bars_held = 12;
+        assert!(trade.should_exit_no_progress(
+            Price::from("100.00"),
+            12,
+            Decimal::new(5, 1),
+            Decimal::ZERO,
+        ));
+
+        trade.maximum_favorable_excursion = Decimal::new(5, 1);
+        assert!(!trade.should_exit_no_progress(
+            Price::from("100.00"),
+            12,
+            Decimal::new(5, 1),
+            Decimal::ZERO,
+        ));
+
+        trade.maximum_favorable_excursion = Decimal::new(49, 2);
+        let profitable_price = if side == OrderSide::Buy {
+            Price::from("100.01")
+        } else {
+            Price::from("99.99")
+        };
+        assert!(!trade.should_exit_no_progress(
+            profitable_price,
+            12,
+            Decimal::new(5, 1),
+            Decimal::ZERO,
+        ));
+    }
+
+    #[rstest::rstest]
+    fn stair_profit_floor_advances_once_per_completed_step() {
+        let floor = |mfe: &str| {
+            stair_profit_floor_r(
+                mfe.parse().unwrap(),
+                Decimal::ONE,
+                Decimal::new(5, 1),
+                Decimal::new(5, 1),
+                Decimal::from(2),
+            )
+        };
+
+        assert_eq!(floor("0.99"), None);
+        assert_eq!(floor("1.00"), Some(Decimal::new(5, 1)));
+        assert_eq!(floor("1.49"), Some(Decimal::new(5, 1)));
+        assert_eq!(floor("1.50"), Some(Decimal::ONE));
+        assert_eq!(floor("1.99"), Some(Decimal::ONE));
+        assert_eq!(floor("2.00"), Some(Decimal::ONE));
     }
 
     #[test]
@@ -8421,7 +8859,11 @@ open_updated = true
         assert_eq!(config.signal_batch_delay_ms, file.signal.batch_delay_ms);
         assert_eq!(config.universe_mode, UniverseMode::Dynamic);
         assert_eq!(config.profit_protection_trigger_r, Decimal::ONE);
-        assert_eq!(config.profit_protection_floor_r, Decimal::new(25, 2));
+        assert_eq!(config.profit_protection_floor_r, Decimal::new(5, 1));
+        assert_eq!(config.profit_protection_step_r, Decimal::new(5, 1));
+        assert_eq!(config.no_progress_exit_after_bars, 12);
+        assert_eq!(config.no_progress_max_mfe_r, Decimal::new(5, 1));
+        assert_eq!(config.no_progress_max_current_r, Decimal::ZERO);
         assert_eq!(
             config.stop_distance_model,
             file.signal.stop_distance_model.parse().unwrap(),
@@ -8456,6 +8898,26 @@ open_updated = true
         let e = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap_err();
 
         assert!(e.to_string().contains("maximum confirmation distance ATR"));
+    }
+
+    #[rstest::rstest]
+    fn enabled_profit_protection_requires_a_positive_step() {
+        let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
+        file.signal.profit_protection_step_r = "0".to_string();
+
+        let e = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap_err();
+
+        assert!(e.to_string().contains("0 < step"));
+    }
+
+    #[rstest::rstest]
+    fn no_progress_exit_rejects_a_positive_current_r_threshold() {
+        let mut file: SlcFileConfig = toml::from_str(include_str!("../slc_symbols.toml")).unwrap();
+        file.signal.no_progress_max_current_r = "0.1".to_string();
+
+        let e = AppConfig::from_file_config(&file, Path::new(DEFAULT_CONFIG_PATH)).unwrap_err();
+
+        assert!(e.to_string().contains("maximum current R <= 0"));
     }
 
     #[rstest::rstest]
@@ -8756,39 +9218,59 @@ open_updated = true
     }
 
     #[rstest::rstest]
-    fn signal_arbiter_prioritizes_reclaimed_before_fresh() {
+    fn signal_arbiter_uses_deterministic_unweighted_quality_order() {
         let arbiter = SignalArbiter::default();
         let signal_ts = UnixNanos::from(50);
         let now = UnixNanos::from(100);
-        for (symbol, level) in [
-            ("A.US", SignalLevel::Fresh),
-            ("B.US", SignalLevel::Reclaimed),
-            ("C.US", SignalLevel::Fresh),
-            ("D.US", SignalLevel::Reclaimed),
+        let ranking =
+            |displacement, distance, confirmation_bars, remaining_range_pct| SignalRanking {
+                displacement_strength_atr: displacement,
+                confirmation_distance_atr: distance,
+                confirmation_bars,
+                remaining_daily_range_pct: Some(remaining_range_pct),
+            };
+        for (symbol, ranking) in [
+            ("Z.US", ranking(3.0, 0.5, 3, Decimal::from(3))),
+            ("Y.US", ranking(2.0, 0.1, 3, Decimal::from(3))),
+            ("X.US", ranking(2.0, 0.2, 1, Decimal::from(5))),
+            ("W.US", ranking(2.0, 0.2, 2, Decimal::from(5))),
+            ("V.US", ranking(2.0, 0.2, 2, Decimal::from(4))),
+            ("A.US", ranking(2.0, 0.2, 2, Decimal::from(4))),
+            ("B.US", ranking(2.0, 0.2, 2, Decimal::from(4))),
         ] {
             assert!(
                 arbiter
-                    .queue(symbol, level, signal_ts, now, 1)
+                    .queue(symbol, ranking, signal_ts, now, 1)
                     .unwrap()
                     .is_some(),
             );
         }
 
-        assert_eq!(
-            arbiter.decide("A.US", signal_ts, 3).unwrap(),
-            SignalArbitrationDecision {
-                selected: true,
-                rank: 3,
-                candidates: 4,
-                capacity: 3,
-            },
-        );
-        assert!(arbiter.decide("B.US", signal_ts, 2).unwrap().selected);
-        assert!(!arbiter.decide("C.US", signal_ts, 1).unwrap().selected);
-        assert!(arbiter.decide("D.US", signal_ts, 0).unwrap().selected);
+        let expected = [
+            ("Z.US", 1, true),
+            ("Y.US", 2, true),
+            ("X.US", 3, true),
+            ("W.US", 4, false),
+            ("A.US", 5, false),
+            ("B.US", 6, false),
+            ("V.US", 7, false),
+        ];
+        for (symbol, rank, selected) in expected {
+            let decision = arbiter.decide(symbol, signal_ts, 3).unwrap();
+            assert_eq!(decision.rank, rank);
+            assert_eq!(decision.selected, selected);
+            assert_eq!(decision.candidates, 7);
+            assert_eq!(decision.capacity, 3);
+        }
         assert!(
             arbiter
-                .queue("LATE.US", SignalLevel::Reclaimed, signal_ts, now, 1)
+                .queue(
+                    "LATE.US",
+                    ranking(4.0, 0.0, 1, Decimal::from(10)),
+                    signal_ts,
+                    now,
+                    1,
+                )
                 .unwrap()
                 .is_none(),
         );
