@@ -1,0 +1,39 @@
+catalog_path = "target/intraday_momentum_catalog"
+output_path = "target/intraday_momentum_report.json"
+
+# download_start must leave at least lookback_days + 1 complete sessions before backtest_start.
+download_start = "2025-01-01"
+backtest_start = "2025-04-01"
+backtest_end = "2026-05-05"
+
+starting_balance = "100000 USD"
+spread_bps = "1"
+commission_rate = "0.0001"
+slippage_probability = 1.0
+random_seed = 42
+# Temporary subset while the monthly historical-symbol quota is exhausted.
+calendar_instrument = "APP.US.LONGBRIDGE"
+instruments = [
+  "APP.US.LONGBRIDGE",
+  "BA.US.LONGBRIDGE",
+]
+
+# Optional per-share ex-dividend adjustments keyed by New York date.
+# [dividends."APP.US.LONGBRIDGE"]
+# "2026-03-20" = "1.80"
+[dividends]
+
+[instrument_price_increments]
+"APP.US.LONGBRIDGE" = "0.01"
+"BA.US.LONGBRIDGE" = "0.01"
+
+[strategy]
+lookback_days = 14
+volatility_multiplier = "1"
+relative_volume_threshold = "1"
+target_daily_volatility = 0.03
+max_leverage = "4"
+capital_fraction = "0.15"
+decision_interval_minutes = 30
+flatten_before_close_minutes = 0
+bars_are_final = true

@@ -49,7 +49,7 @@ impl ClientConfig for LongbridgeExecClientConfig {
 }
 
 /// Factory for Longbridge data clients.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.adapters.longbridge", from_py_object)
@@ -58,13 +58,35 @@ impl ClientConfig for LongbridgeExecClientConfig {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.longbridge")
 )]
-pub struct LongbridgeDataClientFactory;
+pub struct LongbridgeDataClientFactory {
+    context_sender: Option<tokio::sync::watch::Sender<Option<longbridge::quote::QuoteContext>>>,
+}
+
+impl std::fmt::Debug for LongbridgeDataClientFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LongbridgeDataClientFactory")
+            .field("shares_quote_context", &self.context_sender.is_some())
+            .finish()
+    }
+}
 
 impl LongbridgeDataClientFactory {
     /// Creates a new factory.
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            context_sender: None,
+        }
+    }
+
+    /// Shares the data client's single quote connection with a native data collector.
+    #[must_use]
+    pub fn with_quote_context(
+        mut self,
+        sender: tokio::sync::watch::Sender<Option<longbridge::quote::QuoteContext>>,
+    ) -> Self {
+        self.context_sender = Some(sender);
+        self
     }
 }
 
@@ -86,10 +108,11 @@ impl DataClientFactory for LongbridgeDataClientFactory {
             })?
             .clone();
         config.validate()?;
-        Ok(Box::new(LongbridgeDataClient::new(
-            ClientId::from(name),
-            config,
-        )))
+        let mut client = LongbridgeDataClient::new(ClientId::from(name), config);
+        if let Some(sender) = &self.context_sender {
+            client = client.with_quote_context(sender.clone());
+        }
+        Ok(Box::new(client))
     }
 
     fn name(&self) -> &'static str {

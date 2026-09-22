@@ -1,0 +1,255 @@
+{
+  "synthetic": true,
+  "provenance": "Invented deterministic engineering fixture; no historical return or alpha evidence. OHLC-derived quotes use explicit adverse spread; native fill model adds impact/slippage.",
+  "events_path": "events.jsonl",
+  "starting_equity": "100000",
+  "price_increments": {
+    "AAA.SIM": "0.01",
+    "BBB.SIM": "0.01",
+    "CCC.SIM": "0.01",
+    "DDD.SIM": "0.01",
+    "EEE.SIM": "0.01",
+    "SPY.SIM": "0.01",
+    "QQQ.SIM": "0.01",
+    "IWM.SIM": "0.01",
+    "XLK.SIM": "0.01"
+  },
+  "strategy": {
+    "universe": [
+      {
+        "instrument_id": "AAA.SIM",
+        "sector": "SYNTHETIC_TECH",
+        "sector_etf": "XLK.SIM",
+        "market_cap": "2000000000",
+        "effective_from": 0,
+        "effective_until": 18446744073709551615,
+        "known_at": 0
+      },
+      {
+        "instrument_id": "BBB.SIM",
+        "sector": "SYNTHETIC_TECH",
+        "sector_etf": "XLK.SIM",
+        "market_cap": "2000000000",
+        "effective_from": 0,
+        "effective_until": 18446744073709551615,
+        "known_at": 0
+      },
+      {
+        "instrument_id": "CCC.SIM",
+        "sector": "SYNTHETIC_TECH",
+        "sector_etf": "XLK.SIM",
+        "market_cap": "2000000000",
+        "effective_from": 0,
+        "effective_until": 18446744073709551615,
+        "known_at": 0
+      },
+      {
+        "instrument_id": "DDD.SIM",
+        "sector": "SYNTHETIC_TECH",
+        "sector_etf": "XLK.SIM",
+        "market_cap": "2000000000",
+        "effective_from": 0,
+        "effective_until": 18446744073709551615,
+        "known_at": 0
+      },
+      {
+        "instrument_id": "EEE.SIM",
+        "sector": "SYNTHETIC_TECH",
+        "sector_etf": "XLK.SIM",
+        "market_cap": "2000000000",
+        "effective_from": 0,
+        "effective_until": 18446744073709551615,
+        "known_at": 0
+      }
+    ],
+    "benchmarks": [
+      "SPY.SIM",
+      "QQQ.SIM",
+      "IWM.SIM"
+    ],
+    "sessions": [
+      {
+        "open": 1735828200000000000,
+        "close": 1735851600000000000
+      },
+      {
+        "open": 1735914600000000000,
+        "close": 1735938000000000000
+      },
+      {
+        "open": 1736173800000000000,
+        "close": 1736197200000000000
+      },
+      {
+        "open": 1736260200000000000,
+        "close": 1736283600000000000
+      },
+      {
+        "open": 1736346600000000000,
+        "close": 1736370000000000000
+      },
+      {
+        "open": 1736433000000000000,
+        "close": 1736456400000000000
+      },
+      {
+        "open": 1736519400000000000,
+        "close": 1736542800000000000
+      },
+      {
+        "open": 1736778600000000000,
+        "close": 1736802000000000000
+      },
+      {
+        "open": 1736865000000000000,
+        "close": 1736888400000000000
+      },
+      {
+        "open": 1736951400000000000,
+        "close": 1736974800000000000
+      },
+      {
+        "open": 1737037800000000000,
+        "close": 1737061200000000000
+      },
+      {
+        "open": 1737124200000000000,
+        "close": 1737147600000000000
+      },
+      {
+        "open": 1737469800000000000,
+        "close": 1737493200000000000
+      },
+      {
+        "open": 1737556200000000000,
+        "close": 1737579600000000000
+      },
+      {
+        "open": 1737642600000000000,
+        "close": 1737666000000000000
+      },
+      {
+        "open": 1737729000000000000,
+        "close": 1737752400000000000
+      },
+      {
+        "open": 1737988200000000000,
+        "close": 1738011600000000000
+      },
+      {
+        "open": 1738074600000000000,
+        "close": 1738098000000000000
+      },
+      {
+        "open": 1738161000000000000,
+        "close": 1738184400000000000
+      },
+      {
+        "open": 1738247400000000000,
+        "close": 1738270800000000000
+      },
+      {
+        "open": 1738333800000000000,
+        "close": 1738357200000000000
+      },
+      {
+        "open": 1738593000000000000,
+        "close": 1738616400000000000
+      },
+      {
+        "open": 1738679400000000000,
+        "close": 1738702800000000000
+      },
+      {
+        "open": 1738765800000000000,
+        "close": 1738789200000000000
+      },
+      {
+        "open": 1738852200000000000,
+        "close": 1738875600000000000
+      },
+      {
+        "open": 1738938600000000000,
+        "close": 1738962000000000000
+      },
+      {
+        "open": 1739197800000000000,
+        "close": 1739221200000000000
+      },
+      {
+        "open": 1739284200000000000,
+        "close": 1739307600000000000
+      },
+      {
+        "open": 1739370600000000000,
+        "close": 1739394000000000000
+      },
+      {
+        "open": 1739457000000000000,
+        "close": 1739480400000000000
+      },
+      {
+        "open": 1739543400000000000,
+        "close": 1739566800000000000
+      },
+      {
+        "open": 1739889000000000000,
+        "close": 1739912400000000000
+      },
+      {
+        "open": 1739975400000000000,
+        "close": 1739998800000000000
+      },
+      {
+        "open": 1740061800000000000,
+        "close": 1740085200000000000
+      },
+      {
+        "open": 1740148200000000000,
+        "close": 1740171600000000000
+      },
+      {
+        "open": 1740407400000000000,
+        "close": 1740430800000000000
+      },
+      {
+        "open": 1740493800000000000,
+        "close": 1740517200000000000
+      },
+      {
+        "open": 1740580200000000000,
+        "close": 1740603600000000000
+      },
+      {
+        "open": 1740666600000000000,
+        "close": 1740690000000000000
+      },
+      {
+        "open": 1740753000000000000,
+        "close": 1740776400000000000
+      }
+    ],
+    "trading_start": 1739543400000000000,
+    "trading_end": 1740776400000000000,
+    "dry_run": false,
+    "momentum": {
+      "minimum_market_cap": "1000000000",
+      "minimum_average_dollar_volume": "1000000",
+      "minimum_atr_fraction": 0.001,
+      "maximum_gap_fraction": 0.5,
+      "min_percentile": 60.0
+    },
+    "slc": {
+      "htf_minutes": 30,
+      "ema_fast": 3,
+      "ema_slow": 5,
+      "require_htf_ema": false
+    },
+    "risk": {
+      "participation": "0.02",
+      "max_sector_positions": 2
+    },
+    "max_slippage_bps": "30",
+    "max_spread_bps": "20"
+  }
+}

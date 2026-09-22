@@ -50,7 +50,7 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Bar, BarType, Data},
+    data::{Bar, BarType, CustomData, Data},
     enums::AggregationSource,
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -63,12 +63,12 @@ use crate::{
     common::{
         consts::LONGBRIDGE_VENUE,
         parse::{
-            instrument_id, parse_bar_with_price_precision, parse_depth, parse_instrument,
-            parse_trades, period_from_bar_type,
+            instrument_id, parse_bar_with_price_precision, parse_completed_minute_bar, parse_depth,
+            parse_instrument, parse_trades, period_from_bar_type,
         },
         rate_limit::{
-            MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, quote_api_call_with_retry,
-            try_acquire_quote_connection,
+            MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, history_api_call_with_retry,
+            quote_api_call_with_retry, try_acquire_quote_connection,
         },
     },
     config::LongbridgeDataClientConfig,
@@ -80,12 +80,29 @@ struct SubscriptionState {
     depth10: AHashSet<InstrumentId>,
     trades: AHashSet<InstrumentId>,
     bars: AHashMap<(String, i32), (BarType, u8)>,
-    // ponytail: Retain slots until reset to avoid async unsubscribe/subscribe races exceeding 500;
-    // reclaim after confirmed unsubscriptions if rotating through more than 500 symbols is needed.
     reserved_symbols: AHashSet<String>,
+    applied_flags: AHashMap<String, SubFlags>,
+    applied_bars: AHashMap<(String, i32), Period>,
 }
 
 impl SubscriptionState {
+    fn release_acknowledged(&mut self, symbol: &str) {
+        let id = instrument_id(symbol);
+        if !self.quotes.contains(&id)
+            && !self.depth10.contains(&id)
+            && !self.trades.contains(&id)
+            && !self.bars.keys().any(|(s, _)| s == symbol)
+            && self
+                .applied_flags
+                .get(symbol)
+                .is_none_or(SubFlags::is_empty)
+            && !self.applied_bars.keys().any(|(s, _)| s == symbol)
+        {
+            self.reserved_symbols.remove(symbol);
+            self.applied_flags.remove(symbol);
+        }
+    }
+
     fn reserve_subscription(&mut self, symbol: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.reserved_symbols.contains(symbol)
@@ -102,6 +119,8 @@ pub struct LongbridgeDataClient {
     client_id: ClientId,
     config: LongbridgeDataClientConfig,
     context: Option<QuoteContext>,
+    context_sender: Option<tokio::sync::watch::Sender<Option<QuoteContext>>>,
+    subscription_lock: Arc<tokio::sync::Mutex<()>>,
     connection_guard: Option<QuoteConnectionGuard>,
     stream_handle: Option<JoinHandle<()>>,
     pending_tasks: TaskHandles,
@@ -132,6 +151,8 @@ impl LongbridgeDataClient {
             client_id,
             config,
             context: None,
+            context_sender: None,
+            subscription_lock: Arc::new(tokio::sync::Mutex::new(())),
             connection_guard: None,
             stream_handle: None,
             pending_tasks: TaskHandles::default(),
@@ -141,6 +162,106 @@ impl LongbridgeDataClient {
             clock: get_atomic_clock_realtime(),
             connected: AtomicBool::new(false),
         }
+    }
+
+    /// Shares this client's single quote connection with a native market-data collector.
+    #[must_use]
+    pub fn with_quote_context(
+        mut self,
+        sender: tokio::sync::watch::Sender<Option<QuoteContext>>,
+    ) -> Self {
+        self.context_sender = Some(sender);
+        self
+    }
+
+    fn reconcile_subscriptions(&self, symbol: String) -> anyhow::Result<()> {
+        let context = self.context()?;
+        let state = self.subscriptions.clone();
+        let serial = self.subscription_lock.clone();
+        self.spawn_result("subscription reconciliation", async move {
+            // Serialize desired/applied changes, including quote/depth sharing and bar subscriptions.
+            let _guard = serial.lock().await;
+            let id = instrument_id(&symbol);
+            let (wanted, applied, wanted_bars, applied_bars) = {
+                let s = state.lock().expect(MUTEX_POISONED);
+                let mut flags = SubFlags::empty();
+                if s.quotes.contains(&id) || s.depth10.contains(&id) {
+                    flags |= SubFlags::DEPTH;
+                }
+                if s.trades.contains(&id) {
+                    flags |= SubFlags::TRADE;
+                }
+                (
+                    flags,
+                    s.applied_flags
+                        .get(&symbol)
+                        .copied()
+                        .unwrap_or_else(SubFlags::empty),
+                    s.bars
+                        .iter()
+                        .filter(|((name, _), _)| name == &symbol)
+                        .map(|(key, (bar, _))| {
+                            (
+                                key.clone(),
+                                period_from_bar_type(*bar).expect("validated period"),
+                            )
+                        })
+                        .collect::<AHashMap<_, _>>(),
+                    s.applied_bars
+                        .iter()
+                        .filter(|((name, _), _)| name == &symbol)
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect::<AHashMap<_, _>>(),
+                )
+            };
+            let removed = applied & !wanted;
+            if !removed.is_empty() {
+                quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], removed))
+                    .await?;
+                state
+                    .lock()
+                    .expect(MUTEX_POISONED)
+                    .applied_flags
+                    .insert(symbol.clone(), applied & !removed);
+            }
+            for (key, period) in &applied_bars {
+                if !wanted_bars.contains_key(key) {
+                    quote_api_call_with_retry(|| {
+                        context.unsubscribe_candlesticks(symbol.clone(), *period)
+                    })
+                    .await?;
+                    state.lock().expect(MUTEX_POISONED).applied_bars.remove(key);
+                }
+            }
+            let added = wanted & !applied;
+            if !added.is_empty() {
+                quote_api_call_with_retry(|| context.subscribe([symbol.clone()], added)).await?;
+                state
+                    .lock()
+                    .expect(MUTEX_POISONED)
+                    .applied_flags
+                    .insert(symbol.clone(), wanted);
+            }
+            for (key, period) in &wanted_bars {
+                if !applied_bars.contains_key(key) {
+                    quote_api_call_with_retry(|| {
+                        context.subscribe_candlesticks(symbol.clone(), *period, TradeSessions::All)
+                    })
+                    .await?;
+                    state
+                        .lock()
+                        .expect(MUTEX_POISONED)
+                        .applied_bars
+                        .insert(key.clone(), *period);
+                }
+            }
+            state
+                .lock()
+                .expect(MUTEX_POISONED)
+                .release_acknowledged(&symbol);
+            Ok(())
+        });
+        Ok(())
     }
 
     fn context(&self) -> anyhow::Result<QuoteContext> {
@@ -173,6 +294,9 @@ impl LongbridgeDataClient {
 
         if let Some(handle) = self.stream_handle.take() {
             handle.abort();
+        }
+        if let Some(sender) = &self.context_sender {
+            sender.send_replace(None);
         }
         self.context = None;
         self.connected.store(false, Ordering::Release);
@@ -286,7 +410,7 @@ async fn request_historical_bars(
     let candlesticks = if let (Some(start), Some(end)) = (start, end) {
         let start_date = history_date(&symbol, start)?;
         let end_date = history_date(&symbol, end)?;
-        quote_api_call_with_retry(|| {
+        history_api_call_with_retry(|| {
             context.history_candlesticks_by_date(
                 symbol.clone(),
                 period,
@@ -299,7 +423,7 @@ async fn request_historical_bars(
         .await?
     } else if let Some(end) = end {
         let end = history_datetime(&symbol, end)?;
-        quote_api_call_with_retry(|| {
+        history_api_call_with_retry(|| {
             context.history_candlesticks_by_offset(
                 symbol.clone(),
                 period,
@@ -326,7 +450,7 @@ async fn request_historical_bars(
         let start_date = start
             .map(|value| history_date(&symbol, value))
             .transpose()?;
-        quote_api_call_with_retry(|| {
+        history_api_call_with_retry(|| {
             context.history_candlesticks_by_date(
                 symbol.clone(),
                 period,
@@ -501,6 +625,17 @@ impl DataClient for LongbridgeDataClient {
                                         price_precision,
                                     ) {
                                         Ok(bar) => {
+                                            if update.is_confirmed && update.period == Period::OneMinute {
+                                                match parse_completed_minute_bar(bar_type,update.candlestick,ts_init) {
+                                                    Ok(value) => {
+                                                        let data = CustomData::from_arc(Arc::new(value));
+                                                        if let Err(e) = sender.send(DataEvent::Data(Data::Custom(data))) {
+                                                            log::error!("Failed to dispatch confirmed Longbridge VWAP bar: {e}");
+                                                        }
+                                                    }
+                                                    Err(e) => log::error!("Invalid confirmed Longbridge VWAP bar: {e:#}"),
+                                                }
+                                            }
                                             if let Err(e) = sender.send(DataEvent::Data(Data::Bar(bar))) {
                                                 log::error!("Failed to dispatch Longbridge bar: {e}");
                                             }
@@ -516,6 +651,9 @@ impl DataClient for LongbridgeDataClient {
             }
         }));
 
+        if let Some(sender) = &self.context_sender {
+            sender.send_replace(Some(context.clone()));
+        }
         self.context = Some(context);
         self.connection_guard = Some(connection_guard);
         self.connected.store(true, Ordering::Release);
@@ -585,160 +723,96 @@ impl DataClient for LongbridgeDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
-        state.reserve_subscription(cmd.instrument_id.symbol.as_str())?;
-        let already_active = state.depth10.contains(&cmd.instrument_id);
-        let inserted = state.quotes.insert(cmd.instrument_id);
-        drop(state);
-
-        if already_active || !inserted {
-            return Ok(());
+        self.context()?;
+        let symbol = cmd.instrument_id.symbol.to_string();
+        {
+            let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+            state.reserve_subscription(&symbol)?;
+            state.quotes.insert(cmd.instrument_id);
         }
-        let symbol = cmd.instrument_id.symbol.as_str().to_string();
-        self.spawn_result("quote subscription", async move {
-            quote_api_call_with_retry(|| context.subscribe([symbol.clone()], SubFlags::DEPTH)).await
-        });
-        Ok(())
-    }
-
-    fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
-        state.reserve_subscription(cmd.instrument_id.symbol.as_str())?;
-        let already_active = state.quotes.contains(&cmd.instrument_id);
-        let inserted = state.depth10.insert(cmd.instrument_id);
-        drop(state);
-
-        if already_active || !inserted {
-            return Ok(());
-        }
-        let symbol = cmd.instrument_id.symbol.as_str().to_string();
-        self.spawn_result("depth subscription", async move {
-            quote_api_call_with_retry(|| context.subscribe([symbol.clone()], SubFlags::DEPTH)).await
-        });
-        Ok(())
-    }
-
-    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
-        state.reserve_subscription(cmd.instrument_id.symbol.as_str())?;
-        let inserted = state.trades.insert(cmd.instrument_id);
-        drop(state);
-
-        if !inserted {
-            return Ok(());
-        }
-        let symbol = cmd.instrument_id.symbol.as_str().to_string();
-        self.spawn_result("trade subscription", async move {
-            quote_api_call_with_retry(|| context.subscribe([symbol.clone()], SubFlags::TRADE)).await
-        });
-        Ok(())
-    }
-
-    fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let period = period_from_bar_type(cmd.bar_type)?;
-        let price_precision = self
-            .config
-            .price_increment(cmd.bar_type.instrument_id())?
-            .precision;
-        let symbol = cmd.bar_type.instrument_id().symbol.as_str().to_string();
-        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
-        state.reserve_subscription(&symbol)?;
-        let previous = state.bars.insert(
-            (symbol.clone(), period as i32),
-            (cmd.bar_type, price_precision),
-        );
-        drop(state);
-
-        if previous.is_some() {
-            return Ok(());
-        }
-        self.spawn_result("bar subscription", async move {
-            quote_api_call_with_retry(|| {
-                context.subscribe_candlesticks(symbol.clone(), period, TradeSessions::All)
-            })
-            .await
-            .map(|_| ())
-        });
-        Ok(())
+        self.reconcile_subscriptions(symbol)
     }
 
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
-        let removed = state.quotes.remove(&cmd.instrument_id);
-        let retain_depth = state.depth10.contains(&cmd.instrument_id);
-        drop(state);
+        self.context()?;
+        self.subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .quotes
+            .remove(&cmd.instrument_id);
+        self.reconcile_subscriptions(cmd.instrument_id.symbol.to_string())
+    }
 
-        if removed && !retain_depth {
-            let symbol = cmd.instrument_id.symbol.as_str().to_string();
-            self.spawn_result("quote unsubscription", async move {
-                quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], SubFlags::DEPTH))
-                    .await
-            });
+    fn subscribe_book_depth10(&mut self, cmd: SubscribeBookDepth10) -> anyhow::Result<()> {
+        self.context()?;
+        let symbol = cmd.instrument_id.symbol.to_string();
+        {
+            let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+            state.reserve_subscription(&symbol)?;
+            state.depth10.insert(cmd.instrument_id);
         }
-        Ok(())
+        self.reconcile_subscriptions(symbol)
     }
 
     fn unsubscribe_book_depth10(&mut self, cmd: &UnsubscribeBookDepth10) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
-        let removed = state.depth10.remove(&cmd.instrument_id);
-        let retain_depth = state.quotes.contains(&cmd.instrument_id);
-        drop(state);
+        self.context()?;
+        self.subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .depth10
+            .remove(&cmd.instrument_id);
+        self.reconcile_subscriptions(cmd.instrument_id.symbol.to_string())
+    }
 
-        if removed && !retain_depth {
-            let symbol = cmd.instrument_id.symbol.as_str().to_string();
-            self.spawn_result("depth unsubscription", async move {
-                quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], SubFlags::DEPTH))
-                    .await
-            });
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        self.context()?;
+        let symbol = cmd.instrument_id.symbol.to_string();
+        {
+            let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+            state.reserve_subscription(&symbol)?;
+            state.trades.insert(cmd.instrument_id);
         }
-        Ok(())
+        self.reconcile_subscriptions(symbol)
     }
 
     fn unsubscribe_trades(&mut self, cmd: &UnsubscribeTrades) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let removed = self
-            .subscriptions
+        self.context()?;
+        self.subscriptions
             .lock()
             .expect(MUTEX_POISONED)
             .trades
             .remove(&cmd.instrument_id);
+        self.reconcile_subscriptions(cmd.instrument_id.symbol.to_string())
+    }
 
-        if !removed {
-            return Ok(());
+    fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        self.context()?;
+        let period = period_from_bar_type(cmd.bar_type)?;
+        let precision = self
+            .config
+            .price_increment(cmd.bar_type.instrument_id())?
+            .precision;
+        let symbol = cmd.bar_type.instrument_id().symbol.to_string();
+        {
+            let mut state = self.subscriptions.lock().expect(MUTEX_POISONED);
+            state.reserve_subscription(&symbol)?;
+            state
+                .bars
+                .insert((symbol.clone(), period as i32), (cmd.bar_type, precision));
         }
-        let symbol = cmd.instrument_id.symbol.as_str().to_string();
-        self.spawn_result("trade unsubscription", async move {
-            quote_api_call_with_retry(|| context.unsubscribe([symbol.clone()], SubFlags::TRADE))
-                .await
-        });
-        Ok(())
+        self.reconcile_subscriptions(symbol)
     }
 
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
-        let context = self.context()?;
-        let period: Period = period_from_bar_type(cmd.bar_type)?;
-        let symbol = cmd.bar_type.instrument_id().symbol.as_str().to_string();
-        let removed = self
-            .subscriptions
+        self.context()?;
+        let period = period_from_bar_type(cmd.bar_type)?;
+        let symbol = cmd.bar_type.instrument_id().symbol.to_string();
+        self.subscriptions
             .lock()
             .expect(MUTEX_POISONED)
             .bars
             .remove(&(symbol.clone(), period as i32));
-
-        if removed.is_none() {
-            return Ok(());
-        }
-        self.spawn_result("bar unsubscription", async move {
-            quote_api_call_with_retry(|| context.unsubscribe_candlesticks(symbol.clone(), period))
-                .await
-        });
-        Ok(())
+        self.reconcile_subscriptions(symbol)
     }
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
@@ -946,6 +1020,34 @@ mod tests {
             history_datetime("AAPL.US", timestamp).unwrap().time(),
             time!(20:00)
         );
+    }
+
+    #[test]
+    fn test_rotating_subscriptions_release_only_after_acknowledgement() {
+        let mut state = SubscriptionState::default();
+        for n in 0..1_000 {
+            let symbol = format!("STOCK{n}.US");
+            let id = instrument_id(&symbol);
+            state.reserve_subscription(&symbol).unwrap();
+            state.quotes.insert(id);
+            state.applied_flags.insert(symbol.clone(), SubFlags::DEPTH);
+            state.quotes.remove(&id);
+            state.release_acknowledged(&symbol);
+            assert!(state.reserved_symbols.contains(&symbol));
+            // A resubscription received while unsubscribe is in flight retains its slot.
+            state.quotes.insert(id);
+            state.applied_flags.remove(&symbol);
+            state.release_acknowledged(&symbol);
+            assert!(state.reserved_symbols.contains(&symbol));
+            state.quotes.remove(&id);
+            state.release_acknowledged(&symbol);
+            assert!(state.reserved_symbols.is_empty());
+        }
+        let id = instrument_id("AAPL.US");
+        state.reserve_subscription("AAPL.US").unwrap();
+        state.depth10.insert(id);
+        state.release_acknowledged("AAPL.US");
+        assert_eq!(state.reserved_symbols.len(), 1);
     }
 
     #[rstest]

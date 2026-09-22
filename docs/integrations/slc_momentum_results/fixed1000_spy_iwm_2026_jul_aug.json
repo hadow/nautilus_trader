@@ -1,0 +1,367 @@
+{
+  "status": "AVAILABLE_PERIOD_REPLAY_COMPLETE; FULL_PERIOD_BLOCKED_BY_INDEX_QUOTA",
+  "observed_at": "2026-09-15T12:48:42.033370+00:00",
+  "requested_period": {
+    "start": "2026-07-01",
+    "end": "2026-08-31",
+    "sessions": 43,
+    "complete": false
+  },
+  "available_period_research": {
+    "start": "2026-07-01",
+    "end": "2026-08-28",
+    "sessions": 42,
+    "cache_root": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28",
+    "candidate_union": 649,
+    "completed_histories": 651,
+    "required_histories": 651,
+    "backtest_complete": true,
+    "metrics": {
+      "trades": 0,
+      "win_rate": null,
+      "profit_factor": null,
+      "expectancy": null,
+      "average_r": null,
+      "median_r": null,
+      "average_winner": null,
+      "average_loser": null,
+      "largest_winner": null,
+      "largest_loser": null,
+      "net_pnl": 0,
+      "cagr": 0.0,
+      "sharpe": null,
+      "sortino": null,
+      "max_drawdown": 0.0,
+      "calmar": null,
+      "time_exposure": 0.0,
+      "average_notional_exposure": 0.0,
+      "turnover": 0.0,
+      "missing_equity_sessions": [],
+      "synthetic": true,
+      "alpha_verified": false,
+      "account_rounding_delta": "0.00",
+      "cohorts": {}
+    },
+    "minute_csv_mib": 404.98,
+    "download_audit": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/minute-audit.json",
+    "result": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/result.json",
+    "sessions_replayed": 42,
+    "complete_period": true,
+    "complete_minute_prices": false,
+    "signals": 0,
+    "metrics_file": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/result-metrics.json",
+    "remaining_positions": 0,
+    "remaining_orders": 0,
+    "rejected": {
+      "CONFIRMATION_MISSING": 1084,
+      "DATA_MISSING": 24726,
+      "HTF_RANGE": 57196,
+      "INTRADAY_TREND_MISMATCH": 253070,
+      "LEVEL_INVALID": 42042,
+      "LEVEL_OVERTESTED": 110,
+      "MARKET_BEARISH": 20756,
+      "MARKET_BULLISH": 17120,
+      "RVOL_LOW": 2,
+      "WARMUP": 1201
+    },
+    "price_coverage": {
+      "candidate_and_index_symbol_sessions": 5511,
+      "sessions_with_minute_gaps": 386,
+      "sessions_without_valid_prices": 0,
+      "expected_minutes": 2149290,
+      "observed_valid_minutes": 2148718,
+      "missing_minutes": 572,
+      "maximum_missing_minutes_per_symbol_session": 5,
+      "ohlc_envelope_normalizations_including_warmup": 774,
+      "discarded_nonpositive_ohlc_including_warmup": 2385
+    }
+  },
+  "universe": {
+    "size": 1000,
+    "manifest": "test_data/local/slc_momentum/2026-jul-aug-fixed1000/universe.json",
+    "rule": "The fixed set of successful quota-consuming daily-gap responses, including empty responses; not selected using replay returns. Mostly A-F symbols; availability and survivorship bias.",
+    "membership_fixed": true,
+    "all_candidates_within_membership": true
+  },
+  "ranking": {
+    "frequency": "daily, frozen at regular-session open",
+    "rankable_sessions": 43,
+    "eligible_min": 529,
+    "eligible_max": 685,
+    "candidates_min": 106,
+    "candidates_max": 138,
+    "long": "strongest eligible 10%",
+    "short": "weakest eligible 10%",
+    "qqq_daily_rs_lookback": 5
+  },
+  "regime": {
+    "benchmarks": [
+      "SPY.US.LONGBRIDGE",
+      "IWM.US.LONGBRIDGE"
+    ],
+    "votes": 2,
+    "missing_required_index": "NO_TRADE; no implicit fallback",
+    "default_unchanged": "SPY + QQQ + IWM when regime_benchmarks is absent/null",
+    "verified_minute_span": [
+      "2026-06-12",
+      "2026-08-28"
+    ],
+    "verified_minutes_per_index": 21060,
+    "excluded_qqq_minute_reason": "Longbridge quota error 301607"
+  },
+  "access_checks": {
+    "aa_june_1_to_5_daily": 5,
+    "aa_july_1_minute_by_date": 390,
+    "aa_july_1_minute_by_offset": 1000,
+    "aa_august_31_minute_by_date": 390,
+    "aa_august_31_minute_by_offset": 1000,
+    "spy_august_31_by_date_and_offset": "301607 requested:1000/limit:1000",
+    "iwm_august_31_by_date_and_offset": "301607 requested:1000/limit:1000",
+    "logs": [
+      "/tmp/slc-fixed1000-native-access.log",
+      "/tmp/slc-fixed1000-native-end-access.log"
+    ],
+    "note": "A successful query for one date is not proof of access to every requested date."
+  },
+  "download_policy": {
+    "stocks": "daily candidate union only; no full-pool minute download",
+    "history_requests": "60 per 30.5 seconds, at least 510 ms spacing; shared quote limiter also applies",
+    "workers": 4,
+    "monthly_quota_automatic_retries": 0,
+    "disk_floor_gib": 3,
+    "broker_orders_submitted": 0,
+    "reuse": "original daily/gap files retained; identical raw data hardlinked",
+    "history_timeout_retries": "At most 3, sharing the existing rate-limit retry budget; each attempt reacquires history and quote rate limits",
+    "cache_reuse": "Same plan and directory: exact range completion markers and existing timestamp-keyed CSV pages are reused. Offline replay never invokes Longbridge. Cross-directory or changed-endpoint overlap reuse is not automatic."
+  },
+  "full_period_backtest_attempt": {
+    "exit_code": 1,
+    "log": "/tmp/slc-fixed1000-full-backtest-attempt.log",
+    "result": "Rejected incomplete candidate cache; no performance report emitted"
+  },
+  "full_period_metrics": null,
+  "ablation_results": null,
+  "walk_forward_results": null,
+  "alpha_attribution": {
+    "momentum": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "slc": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "momentum_plus_slc": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "vwap": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "stochastic": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "regime_drawdown_reduction": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "short_side_increment": "NOT_ESTIMABLE_WITH_CURRENT_DATA"
+  },
+  "checks": {
+    "slc_unit_tests": {
+      "passed": 45,
+      "log": "/tmp/slc-fixed1000-tests.log"
+    },
+    "native_history_integration": {
+      "passed": 1,
+      "log": "/tmp/slc-fixed1000-history-test.log",
+      "scope": "three-index default, explicit two-index native short replay, missing-candidate refusal; invented fixtures"
+    },
+    "backtest_clippy_no_deps": "passed",
+    "adapter_clippy_no_deps": "passed",
+    "trading_dependency_clippy": "12 pre-existing unrelated momentum_pullback findings",
+    "json_score_regression": "float_roundtrip preserves distinct one-ULP scores and deterministic rank order",
+    "native_backtest_tests": {
+      "passed": 14,
+      "log": "/tmp/slc-fixed1000-backtest-tests.log"
+    },
+    "history_rate_limit_tests": {
+      "passed": 10,
+      "log": "/tmp/slc-fixed1000-history-retry-tests.log",
+      "coverage": "timeout recovery, bounded history-only retries, quota refusal and rate/concurrency guards"
+    },
+    "available_period_native_replay": {
+      "sessions": 42,
+      "passed": true,
+      "cash_and_temporal_audit": "passed; zero trades, zero signals, zero account rounding delta",
+      "unresolved_orders": 0,
+      "unresolved_positions": 0,
+      "errors": [],
+      "log": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/result.log"
+    }
+  },
+  "provenance": {
+    "full_plan_sha256": "fc81c4cace6a69f1ddacd0b8bd0541d81253bf1f4cb3e8eb11eded5125dcfdb2",
+    "shorter_plan_sha256": "71a412e58f8669287a88600976cf057a83e2704606be6674bb2f91669e564679",
+    "universe_sha256": "61cb80a89a17ccbc31a91704024048ccdb41628dd492a04d26a8f39bf4b06dfd",
+    "backtest_executable_sha256": "8253fe1ac256632268f78809d9b2a4879073ec4f54156cc994bed73d3d56f490",
+    "backtest_history_source_sha256": "eaf0603ee6fa7d3f63283f7fc198606b9e3231f4d711c68f655078232f967ae6",
+    "available_result_sha256": "56daae517bb44e427d2c75c6267cdbaedc24997a2b3f9fc695dad08c0a371982",
+    "available_metrics_sha256": "cb9e8d4c6f75934e026a150652c10988c174c1ccc65a0b67a98a8a2d0c488791"
+  },
+  "limitations": [
+    "Current September security master, sectors and market caps are held fixed historically; not point-in-time or survivorship-free.",
+    "The 1000-symbol cache order is not representative of all US equities.",
+    "Historical ranking uses prior completed daily bars and models current-session opening-price availability at the open; historical receipt times are not verified.",
+    "OHLC-path quotes, spread, displayed depth, slippage and short availability are simulation assumptions.",
+    "Sample pagination check found no missing minutes for AA, AAL or ABCL; ABSI has a non-boundary missing minute on 2026-08-24 19:30 UTC. No replacement candle is invented.",
+    "No complete July-August return or incremental-alpha claim is supported."
+  ],
+  "free_disk_gib": 6.19,
+  "changed_files": [
+    "crates/trading/Cargo.toml",
+    "crates/trading/src/examples/strategies/slc_momentum/config.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/signal.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/strategy.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/tests.rs",
+    "crates/adapters/longbridge/examples/slc_momentum_market.rs",
+    "crates/adapters/longbridge/examples/slc_momentum_history.rs",
+    "crates/backtest/examples/slc_momentum_history.rs",
+    "examples/backtest/test_slc_momentum_market.py",
+    "docs/integrations/slc_momentum.md",
+    "docs/integrations/slc_momentum.zh-CN.md",
+    "docs/integrations/slc_momentum_results/fixed1000_spy_iwm_2026_jul_aug.json",
+    "crates/adapters/longbridge/src/common/rate_limit.rs"
+  ],
+  "execution_assumptions": {
+    "starting_equity": "100000",
+    "spread_bps": "4",
+    "opening_spread_multiplier": "2",
+    "quote_depth": "100",
+    "slippage_probability": 1.0
+  },
+  "pilot": {
+    "start": "2026-07-01",
+    "end": "2026-07-01",
+    "complete": true,
+    "result": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/pilot-2026-07-01.json",
+    "metrics": {
+      "trades": 0,
+      "win_rate": null,
+      "profit_factor": null,
+      "expectancy": null,
+      "average_r": null,
+      "median_r": null,
+      "average_winner": null,
+      "average_loser": null,
+      "largest_winner": null,
+      "largest_loser": null,
+      "net_pnl": 0,
+      "cagr": 0.0,
+      "sharpe": null,
+      "sortino": null,
+      "max_drawdown": 0.0,
+      "calmar": null,
+      "time_exposure": 0.0,
+      "average_notional_exposure": 0.0,
+      "turnover": 0.0,
+      "missing_equity_sessions": [],
+      "synthetic": true,
+      "alpha_verified": false,
+      "account_rounding_delta": "0.00",
+      "cohorts": {}
+    },
+    "complete_minute_prices": false,
+    "ohlc_envelope_normalizations": 61,
+    "discarded_nonpositive_ohlc_including_warmup": 182,
+    "rejected": {
+      "CONFIRMATION_MISSING": 24,
+      "DATA_MISSING": 1729,
+      "HTF_RANGE": 1064,
+      "INTRADAY_TREND_MISMATCH": 5848,
+      "LEVEL_INVALID": 1014,
+      "LEVEL_OVERTESTED": 3,
+      "MARKET_BULLISH": 865,
+      "WARMUP": 18
+    },
+    "remaining_positions": 0,
+    "remaining_orders": 0,
+    "note": "Zero trades in one session is execution-path evidence, not a return or alpha estimate for July-August."
+  },
+  "source_data_handling": {
+    "raw_csv_changed": false,
+    "normalization": "Same observed-price envelope and instrument price precision as existing Longbridge parse_bar_with_price_precision; occurrences retained in report",
+    "nonpositive_ohlc": "Recorded as unavailable minute prices; no bar or quote fabricated and no forward fill",
+    "coverage": "complete_period means requested ranking sessions replayed; complete_minute_prices separately records price gaps",
+    "completed_cache_audit": {
+      "observed_at": "2026-09-15T12:06:46.182364+00:00",
+      "completed_symbols_checked": 532,
+      "candidate_symbol_sessions_checked": 5044,
+      "sessions_with_gaps": 374,
+      "sessions_without_valid_prices": 0,
+      "path": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/completed-cache-coverage-audit.json"
+    },
+    "available_period_coverage": {
+      "candidate_and_index_symbol_sessions": 5511,
+      "sessions_with_minute_gaps": 386,
+      "sessions_without_valid_prices": 0,
+      "expected_minutes": 2149290,
+      "observed_valid_minutes": 2148718,
+      "missing_minutes": 572,
+      "maximum_missing_minutes_per_symbol_session": 5,
+      "ohlc_envelope_normalizations_including_warmup": 774,
+      "discarded_nonpositive_ohlc_including_warmup": 2385
+    },
+    "coverage_note": "The earlier completed-cache audit is a partial snapshot. Final native result minute_coverage covers all 42 requested research sessions and their actual daily candidates and indices."
+  },
+  "removed_own_failed_replay_scratch_mib": 181.6,
+  "validated_partial_replay": {
+    "start": "2026-07-01",
+    "end": "2026-07-08",
+    "sessions": 5,
+    "result": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/available-2026-07-01_2026-07-08.json",
+    "complete_period": true,
+    "complete_minute_prices": false,
+    "metrics": {
+      "trades": 0,
+      "win_rate": null,
+      "profit_factor": null,
+      "expectancy": null,
+      "average_r": null,
+      "median_r": null,
+      "average_winner": null,
+      "average_loser": null,
+      "largest_winner": null,
+      "largest_loser": null,
+      "net_pnl": 0,
+      "cagr": 0.0,
+      "sharpe": null,
+      "sortino": null,
+      "max_drawdown": 0.0,
+      "calmar": null,
+      "time_exposure": 0.0,
+      "average_notional_exposure": 0.0,
+      "turnover": 0.0,
+      "missing_equity_sessions": [],
+      "synthetic": true,
+      "alpha_verified": false,
+      "account_rounding_delta": "0.00",
+      "cohorts": {}
+    },
+    "remaining_positions": 0,
+    "remaining_orders": 0,
+    "rejected": {
+      "CONFIRMATION_MISSING": 107,
+      "DATA_MISSING": 10003,
+      "HTF_RANGE": 4653,
+      "INTRADAY_TREND_MISMATCH": 26101,
+      "LEVEL_INVALID": 5347,
+      "LEVEL_OVERTESTED": 12,
+      "MARKET_BEARISH": 3140,
+      "MARKET_BULLISH": 1773,
+      "WARMUP": 116
+    },
+    "ohlc_envelope_normalizations": 156,
+    "discarded_nonpositive_ohlc": 880
+  },
+  "download_interruptions": [
+    {
+      "symbol": "CON.US.LONGBRIDGE",
+      "before": "2026-07-10T14:39:00-04:00",
+      "code": 301603,
+      "message": "no quote",
+      "date_probe": "CLI July 6-7 succeeded; native resume then completed CON history (18 pages). No fallback or universe removal was introduced."
+    },
+    {
+      "symbol": "BBY.US.LONGBRIDGE",
+      "before": "2026-08-17T12:19:00-04:00",
+      "message": "request timeout",
+      "resolution": "Bounded typed timeout retries added to the shared read-only history helper; cache retained."
+    }
+  ],
+  "interpretation": "The configured full long/short strategy produced no signals or trades in this fixed-pool, two-index OHLC research variant. Zero return and drawdown reflect inactivity. Sharpe, Sortino, Calmar, win rate, profit factor and expectancy are undefined; no component alpha or short-side improvement is established."
+}

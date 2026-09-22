@@ -184,13 +184,33 @@ where
 /// Executes a repeatable quote API call with bounded rate-limit retries.
 #[doc(hidden)]
 #[allow(clippy::result_large_err)] // Preserve the SDK error type for existing adapter callers
-pub async fn quote_api_call_with_retry<F, Fut, T>(mut call: F) -> longbridge::Result<T>
+pub async fn quote_api_call_with_retry<F, Fut, T>(call: F) -> longbridge::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = longbridge::Result<T>>,
 {
+    quote_retry(call, false).await
+}
+
+#[allow(clippy::result_large_err)] // Preserve the SDK error type for existing adapter callers
+async fn quote_retry<F, Fut, T>(mut call: F, history: bool) -> longbridge::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = longbridge::Result<T>>,
+{
+    static HISTORY: LazyLock<RateLimiter> = LazyLock::new(|| {
+        RateLimiter::new(
+            60,
+            Duration::from_millis(30_500),
+            Duration::from_millis(510),
+            None,
+        )
+    });
     let mut retries = 0;
     loop {
+        if history {
+            drop(HISTORY.acquire().await);
+        }
         match quote_api_call(call()).await {
             Err(e)
                 if e.openapi_error_code() == Some(QUOTE_RATE_LIMIT_ERROR_CODE)
@@ -203,9 +223,41 @@ where
                 );
                 tokio::time::sleep(QUOTE_WINDOW).await;
             }
+            Err(e)
+                if history
+                    && retries < QUOTE_RATE_LIMIT_MAX_RETRIES
+                    && matches!(
+                        &e,
+                        longbridge::Error::WsClient(
+                            longbridge::wsclient::WsClientError::RequestTimeout
+                                | longbridge::wsclient::WsClientError::ConnectTimeout
+                        ) | longbridge::Error::HttpClient(
+                            longbridge::httpclient::HttpClientError::RequestTimeout
+                        )
+                    ) =>
+            {
+                retries += 1;
+                log::warn!(
+                    "Longbridge history request timed out; retrying in {} ms ({retries}/{QUOTE_RATE_LIMIT_MAX_RETRIES}): {e}",
+                    QUOTE_WINDOW.as_millis(),
+                );
+                tokio::time::sleep(QUOTE_WINDOW).await;
+            }
             result => return result,
         }
     }
+}
+
+/// History has an additional 60 requests / 30 seconds quota, including retries.
+/// Read-only timeout retries share the rate-limit retry budget; symbol quota errors are returned.
+#[doc(hidden)]
+#[allow(clippy::result_large_err)]
+pub async fn history_api_call_with_retry<F, Fut, T>(call: F) -> longbridge::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = longbridge::Result<T>>,
+{
+    quote_retry(call, true).await
 }
 
 /// Executes one trade API call after acquiring the process-wide trade limits.
@@ -324,6 +376,70 @@ mod tests {
         drop(limiter.acquire().await);
 
         assert!(started.elapsed() >= window);
+    }
+
+    #[tokio::test]
+    async fn test_history_symbol_quota_is_not_retried() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: longbridge::Result<()> = history_api_call_with_retry(|| async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(longbridge::Error::WsClient(
+                longbridge::wsclient::WsClientError::ResponseError {
+                    status: 7,
+                    detail: Some(longbridge::wsclient::WsResponseErrorDetail {
+                        code: 301607,
+                        msg: "history candlestick symbol count out of limit".to_string(),
+                    }),
+                },
+            ))
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err().openapi_error_code(), Some(301607));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_history_request_timeout_recovers() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = history_api_call_with_retry(|| async {
+            if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(longbridge::Error::WsClient(
+                    longbridge::wsclient::WsClientError::RequestTimeout,
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_history_timeout_retries_are_bounded_and_history_only() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: longbridge::Result<()> = history_api_call_with_retry(|| async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(longbridge::Error::HttpClient(
+                longbridge::httpclient::HttpClientError::RequestTimeout,
+            ))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+
+        attempts.store(0, Ordering::Relaxed);
+        let result: longbridge::Result<()> = quote_api_call_with_retry(|| async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(longbridge::Error::WsClient(
+                longbridge::wsclient::WsClientError::RequestTimeout,
+            ))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]

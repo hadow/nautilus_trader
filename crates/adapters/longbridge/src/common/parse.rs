@@ -31,6 +31,7 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{
         Bar, BarType, DEPTH10_LEN, OrderBookDepth10, QuoteTick, TradeTick,
+        bar_vwap::BarWithVwap,
         order::{BookOrder, NULL_ORDER},
     },
     enums::{
@@ -300,6 +301,49 @@ pub fn parse_bar(
     ts_init: UnixNanos,
 ) -> anyhow::Result<Bar> {
     parse_bar_inner(bar_type, candlestick, ts_init, None)
+}
+
+/// Preserves source prices and turnover VWAP for a completed one-minute bar.
+///
+/// # Errors
+/// Returns an error for another period, an unfinished minute or invalid source values.
+pub fn parse_completed_minute_bar(
+    bar_type: BarType,
+    candle: Candlestick,
+    received_at: UnixNanos,
+) -> anyhow::Result<BarWithVwap> {
+    anyhow::ensure!(
+        period_from_bar_type(bar_type)? == Period::OneMinute,
+        "VWAP enrichment requires one-minute bars"
+    );
+    let raw = parse_bar(bar_type, candle, received_at)?;
+    let end = raw
+        .ts_event
+        .checked_add(60_000_000_000_u64)
+        .context("minute timestamp overflow")?;
+    anyhow::ensure!(
+        end <= received_at,
+        "confirmed bar is ahead of receiver clock"
+    );
+    let vwap = if candle.volume > 0 {
+        candle.turnover / Decimal::from(candle.volume)
+    } else {
+        candle.close
+    };
+    anyhow::ensure!(vwap > Decimal::ZERO, "invalid provider minute VWAP");
+    Ok(BarWithVwap {
+        bar: Bar::new(
+            bar_type,
+            raw.open,
+            raw.high,
+            raw.low,
+            raw.close,
+            raw.volume,
+            end,
+            received_at,
+        ),
+        vwap,
+    })
 }
 
 /// Parses a Longbridge candlestick at the configured instrument price precision.
@@ -655,6 +699,28 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[rstest]
+    fn test_completed_minute_preserves_source_vwap_precision_and_timestamp() {
+        let timestamp = datetime!(2026-09-18 13:30 UTC);
+        let mut candle: Candlestick = serde_json::from_value(serde_json::json!({
+            "open":"123.4567","high":"123.5000","low":"123.4000","close":"123.4789",
+            "volume":1000,"turnover":"123456.78","timestamp":"2026-09-18T13:30:00Z",
+            "trade_session":"Intraday","open_updated":false
+        }))
+        .unwrap();
+        let kind: BarType = "SPY.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        let end = unix_nanos(timestamp).unwrap() + 60_000_000_000_u64;
+        let value = parse_completed_minute_bar(kind, candle, end).unwrap();
+        assert_eq!(value.bar.open.as_decimal(), candle.open);
+        assert_eq!(value.vwap, Decimal::new(12345678, 5));
+        assert_eq!(value.bar.ts_event, end);
+        assert!(parse_completed_minute_bar(kind, candle, end - 1_u64).is_err());
+        candle.volume = 0;
+        candle.turnover = Decimal::ZERO;
+        let zero = parse_completed_minute_bar(kind, candle, end).unwrap();
+        assert_eq!(zero.vwap, candle.close);
+    }
 
     #[rstest]
     fn test_instrument_id_uses_adapter_venue() {

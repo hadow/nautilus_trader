@@ -1,0 +1,31 @@
+{
+  "account_id": "LONGBRIDGE-001",
+  "cache": "test_data/local/intraday_momentum/warmup",
+  "report": "reports/intraday-live.json",
+  "paper_cost_per_share": "0.0045",
+  "data": {
+    "instrument_price_increments": {
+      "SPY.US.LONGBRIDGE": "0.01"
+    }
+  },
+  "strategy": {
+    "instrument_id": "SPY.US.LONGBRIDGE",
+    "lookback_days": 14,
+    "volume_lookback_days": 14,
+    "volatility_lookback_days": 14,
+    "volatility_multiplier": "1.0",
+    "relative_volume_threshold": "1.0",
+    "target_daily_volatility": 0.03,
+    "max_leverage": "4",
+    "flatten_before_close_minutes": 1,
+    "dry_run_equity": "100000",
+    "max_position_notional": "400000",
+    "max_order_notional": "400000",
+    "max_daily_loss": "0.03",
+    "max_orders_per_day": 100,
+    "stale_data_seconds": 120,
+    "order_timeout_seconds": 120,
+    "allow_ohlc_vwap_approximation": false,
+    "timing": "session_close"
+  }
+}

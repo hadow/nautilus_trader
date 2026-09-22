@@ -188,6 +188,9 @@ tests/unit_tests/persistence/catalog/
 /test_data/**/backtest/**
 
 
+reports/
+tests/
+
 # Exceptions
 !/test_data/large/checksums.json
 !/test_data/large/*.metadata.json

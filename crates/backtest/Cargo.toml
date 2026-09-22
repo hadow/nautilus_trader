@@ -22,7 +22,7 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-examples = ["nautilus-trading/examples"]
+examples = ["nautilus-trading/examples", "dep:flate2", "dep:rand"]
 high-precision = ["nautilus-model/high-precision"]
 mimalloc = ["dep:mimalloc"]
 defi = ["nautilus-common/defi", "nautilus-data/defi", "nautilus-model/defi"]
@@ -84,9 +84,11 @@ rust_decimal = { workspace = true }
 serde = { workspace = true }
 ustr = { workspace = true }
 
+flate2 = { workspace = true, optional = true }
 mimalloc = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
@@ -101,6 +103,35 @@ nautilus-trading = { workspace = true, features = ["examples"] }
 criterion = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true, features = ["display"] }
+
+[[bin]]
+name = "slc-momentum-backtest"
+path = "bin/slc_momentum.rs"
+required-features = ["examples"]
+test = false
+doc = false
+
+[[bin]]
+name = "dynamic-grid-backtest"
+path = "bin/dynamic_grid.rs"
+required-features = ["examples"]
+test = false
+doc = false
+
+[[bin]]
+name = "intraday-optimize"
+path = "bin/intraday_optimize.rs"
+required-features = ["examples"]
+test = false
+doc = false
+
+[[bin]]
+name = "intraday-backtest"
+path = "bin/intraday_backtest.rs"
+test = false
+required-features = ["examples"]
+doc = false
 
 # Run with `cargo bench -p nautilus-backtest --bench engine`
 [[bench]]
@@ -108,11 +139,25 @@ name = "engine"
 path = "benches/engine.rs"
 harness = false
 
+# Run with `cargo run -p nautilus-backtest --features examples --example slc-momentum -- INPUT.json OUTPUT.json`
+[[example]]
+name = "slc-momentum"
+path = "examples/slc_momentum.rs"
+required-features = ["examples"]
+doc = false
+
 # Run with `cargo run -p nautilus-backtest --features examples --example engine-ema-cross`
 [[example]]
 name = "engine-ema-cross"
 path = "examples/engine_ema_cross.rs"
 required-features = ["examples"]
+doc = false
+
+# Run with `cargo run -p nautilus-backtest --features examples,streaming,high-precision --example momentum-pullback -- path/to/config.toml`
+[[example]]
+name = "momentum-pullback"
+path = "examples/momentum_pullback.rs"
+required-features = ["examples", "streaming", "high-precision"]
 doc = false
 
 # Run with `cargo run -p nautilus-backtest --features examples,streaming --example node-ema-cross`

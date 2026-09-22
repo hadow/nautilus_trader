@@ -361,6 +361,58 @@ fn clear_order_event_handler_messages(
 }
 
 #[rstest]
+#[case(OrderType::Limit, OrderSide::Buy, "1010.00", "1010.00")]
+#[case(OrderType::Limit, OrderSide::Sell, "1000.00", "1000.00")]
+#[case(OrderType::Limit, OrderSide::Buy, "1011.00", "1010.01")]
+#[case(OrderType::Limit, OrderSide::Sell, "999.00", "999.99")]
+#[case(OrderType::Market, OrderSide::Buy, "1010.00", "1010.01")]
+#[case(OrderType::Market, OrderSide::Sell, "1000.00", "999.99")]
+fn test_l1_slippage_respects_limit_price(
+    order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
+    account_id: AccountId,
+    instrument_eth_usdt: InstrumentAny,
+    #[case] order_type: OrderType,
+    #[case] side: OrderSide,
+    #[case] limit: &str,
+    #[case] expected: &str,
+) {
+    let mut engine = get_order_matching_engine(instrument_eth_usdt.clone(), None, None, None, None);
+    engine.set_fill_model(
+        FillModelAny::Default(DefaultFillModel::new(1.0, 1.0, Some(42)).unwrap()).into(),
+    );
+    engine.process_quote_tick(&QuoteTick::new(
+        instrument_eth_usdt.id(),
+        Price::from("1000.00"),
+        Price::from("1010.00"),
+        Quantity::from("100.000"),
+        Quantity::from("100.000"),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    ));
+    let mut builder = OrderTestBuilder::new(order_type);
+    builder
+        .instrument_id(instrument_eth_usdt.id())
+        .side(side)
+        .quantity(Quantity::from("1.000"))
+        .submit(true);
+    if order_type == OrderType::Limit {
+        builder.price(Price::from(limit));
+    }
+    engine.process_order(&mut builder.build(), account_id);
+    let events = get_order_event_handler_messages(&order_event_handler);
+    let fills = events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].last_px, Price::from(expected));
+    assert_eq!(fills[0].last_qty, Quantity::from("1.000"));
+}
+
+#[rstest]
 fn test_process_order_when_instrument_already_expired(
     order_event_handler: TypedIntoMessageSavingHandler<OrderEventAny>,
     account_id: AccountId,

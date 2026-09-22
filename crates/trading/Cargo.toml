@@ -23,7 +23,7 @@ crate-type = ["rlib"]
 [features]
 default = []
 defi = ["nautilus-model/defi"]
-examples = ["nautilus-indicators"]
+examples = ["nautilus-data", "nautilus-indicators", "nautilus-risk"]
 high-precision = ["nautilus-model/high-precision"]
 extension-module = [
   "nautilus-common/extension-module",
@@ -52,9 +52,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 nautilus-analysis = { workspace = true }
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
+nautilus-data = { workspace = true, optional = true }
 nautilus-execution = { workspace = true }
 nautilus-model = { workspace = true, features = ["stubs"] }
 nautilus-portfolio = { workspace = true }
+nautilus-risk = { workspace = true, optional = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }
@@ -64,7 +66,7 @@ jiff = { workspace = true }
 log = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 strum = { workspace = true }
 ustr = { workspace = true }
 
@@ -73,7 +75,12 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-backtest = { workspace = true, features = ["examples"] }
+nautilus-longbridge = { workspace = true }
+nautilus-sandbox = { workspace = true }
+
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }

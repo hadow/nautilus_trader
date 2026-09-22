@@ -292,7 +292,8 @@ impl FeeModel for FixedFeeModel {
     )
 )]
 pub struct PerContractFeeModel {
-    commission: Money,
+    commission: Decimal,
+    currency: Currency,
 }
 
 impl PerContractFeeModel {
@@ -302,10 +303,22 @@ impl PerContractFeeModel {
     ///
     /// Returns an error if `commission` is negative.
     pub fn new(commission: Money) -> anyhow::Result<Self> {
-        if commission.raw < 0 {
+        Self::from_rate(commission.as_decimal(), commission.currency)
+    }
+
+    /// Creates a per-unit fee without rounding sub-cent rates before multiplication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `commission` is negative.
+    pub fn from_rate(commission: Decimal, currency: Currency) -> anyhow::Result<Self> {
+        if commission < Decimal::ZERO {
             anyhow::bail!("Commission must be greater than or equal to zero")
         }
-        Ok(Self { commission })
+        Ok(Self {
+            commission,
+            currency,
+        })
     }
 }
 
@@ -323,9 +336,9 @@ impl FeeModel for PerContractFeeModel {
         instrument: &InstrumentAny,
     ) -> anyhow::Result<Money> {
         let contracts = spread_contract_count(instrument)?;
-        let total = mul_checked(self.commission.as_decimal(), fill_quantity.as_decimal())
+        let total = mul_checked(self.commission, fill_quantity.as_decimal())
             .and_then(|v| mul_checked(v, contracts))?;
-        Money::from_decimal(total, self.commission.currency).map_err(Into::into)
+        Money::from_decimal(total, self.currency).map_err(Into::into)
     }
 }
 
@@ -892,6 +905,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(commission, Money::new(50.0, Currency::USD()));
+    }
+
+    #[rstest]
+    fn test_per_share_subcent_rate_is_rounded_after_multiplication() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let model = PerContractFeeModel::from_rate(dec!(0.0045), Currency::USD()).unwrap();
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(1110))
+            .build();
+        let commission = model
+            .get_commission(
+                &order,
+                Quantity::from(1110),
+                Price::from("100.00"),
+                &instrument,
+            )
+            .unwrap();
+        assert_eq!(commission, Money::from("5.00 USD"));
+        assert!(PerContractFeeModel::from_rate(dec!(-0.0001), Currency::USD()).is_err());
     }
 
     #[rstest]

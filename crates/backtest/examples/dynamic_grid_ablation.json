@@ -1,0 +1,219 @@
+{
+  "settings": {
+    "train_days": 30,
+    "validation_days": 10,
+    "test_days": 10,
+    "validation_finalists": 2,
+    "drawdown_penalty": 1.0,
+    "sensitivity_atr_multipliers": ["0.8", "1.0", "1.2"],
+    "sensitivity_reset_distances": ["0.01", "0.015", "0.02"],
+    "parameter_cliff_threshold": 0.02,
+    "simulations": 1000,
+    "ruin_equity_fraction": 0.5,
+    "random_seed": 42,
+    "stress": {
+      "return_noise": 0.002,
+      "fee_multiplier_max": 2.0,
+      "additional_slippage_max": 0.001
+    }
+  },
+  "candidates": [
+    {
+      "name": "original_dgt",
+      "grid_overrides": {
+        "strategy_mode": "LegacyDgt",
+        "spacing_mode": "Percentage",
+        "enable_trend_filter": false,
+        "enable_volatility_filter": false,
+        "breakout_confirmation_bars": 1,
+        "regular_session_only": false,
+        "max_gap_pct": "0",
+        "max_gap_atr_multiple": "0",
+        "minimum_average_dollar_volume": "0",
+        "maximum_spread_bps": "0",
+        "minimum_price": "0"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {
+        "max_order_value": "100000",
+        "max_orders_per_minute": 10000,
+        "max_instrument_allocation": "1",
+        "max_total_exposure": "1",
+        "max_total_grid_exposure": "1",
+        "max_total_equity_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_portfolio_drawdown": "1",
+        "max_portfolio_daily_loss": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1"
+      }
+    },
+    {
+      "name": "dgt_plus_atr_grid",
+      "grid_overrides": {
+        "strategy_mode": "LegacyDgt",
+        "spacing_mode": "Atr",
+        "enable_trend_filter": false,
+        "enable_volatility_filter": false,
+        "breakout_confirmation_bars": 1,
+        "regular_session_only": false,
+        "max_gap_pct": "0",
+        "max_gap_atr_multiple": "0",
+        "minimum_average_dollar_volume": "0",
+        "maximum_spread_bps": "0",
+        "minimum_price": "0"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {
+        "max_order_value": "100000",
+        "max_orders_per_minute": 10000,
+        "max_instrument_allocation": "1",
+        "max_total_exposure": "1",
+        "max_total_grid_exposure": "1",
+        "max_total_equity_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_portfolio_drawdown": "1",
+        "max_portfolio_daily_loss": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1"
+      }
+    },
+    {
+      "name": "dgt_plus_regime_filter",
+      "grid_overrides": {
+        "strategy_mode": "LegacyDgt",
+        "spacing_mode": "Atr",
+        "enable_trend_filter": true,
+        "enable_volatility_filter": true,
+        "breakout_confirmation_bars": 1,
+        "regular_session_only": false,
+        "max_gap_pct": "0",
+        "max_gap_atr_multiple": "0",
+        "minimum_average_dollar_volume": "0",
+        "maximum_spread_bps": "0",
+        "minimum_price": "0"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {
+        "max_order_value": "100000",
+        "max_orders_per_minute": 10000,
+        "max_instrument_allocation": "1",
+        "max_total_exposure": "1",
+        "max_total_grid_exposure": "1",
+        "max_total_equity_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_portfolio_drawdown": "1",
+        "max_portfolio_daily_loss": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1"
+      }
+    },
+    {
+      "name": "dgt_plus_target_position",
+      "grid_overrides": {
+        "strategy_mode": "StockAdaptive",
+        "spacing_mode": "Atr",
+        "breakout_confirmation_bars": 1,
+        "regular_session_only": false,
+        "max_gap_pct": "0",
+        "max_gap_atr_multiple": "0",
+        "minimum_average_dollar_volume": "0",
+        "maximum_spread_bps": "0",
+        "minimum_price": "0"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {
+        "max_order_value": "100000",
+        "max_orders_per_minute": 10000,
+        "max_instrument_allocation": "1",
+        "max_total_exposure": "1",
+        "max_total_grid_exposure": "1",
+        "max_total_equity_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_portfolio_drawdown": "1",
+        "max_portfolio_daily_loss": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1"
+      }
+    },
+    {
+      "name": "dgt_plus_gap_filter",
+      "grid_overrides": {
+        "strategy_mode": "StockAdaptive",
+        "spacing_mode": "Atr",
+        "breakout_confirmation_bars": 2,
+        "regular_session_only": true,
+        "max_gap_pct": "0.08",
+        "max_gap_atr_multiple": "3",
+        "minimum_average_dollar_volume": "0",
+        "maximum_spread_bps": "0",
+        "minimum_price": "0"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {
+        "max_order_value": "100000",
+        "max_orders_per_minute": 10000,
+        "max_instrument_allocation": "1",
+        "max_total_exposure": "1",
+        "max_total_grid_exposure": "1",
+        "max_total_equity_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_portfolio_drawdown": "1",
+        "max_portfolio_daily_loss": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1"
+      }
+    },
+    {
+      "name": "dgt_plus_liquidity_filter",
+      "grid_overrides": {
+        "strategy_mode": "StockAdaptive",
+        "spacing_mode": "Atr",
+        "breakout_confirmation_bars": 2,
+        "regular_session_only": true,
+        "max_gap_pct": "0.08",
+        "max_gap_atr_multiple": "3",
+        "minimum_average_dollar_volume": "100000",
+        "maximum_spread_bps": "30",
+        "minimum_price": "5"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {
+        "max_order_value": "100000",
+        "max_orders_per_minute": 10000,
+        "max_instrument_allocation": "1",
+        "max_total_exposure": "1",
+        "max_total_grid_exposure": "1",
+        "max_total_equity_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_portfolio_drawdown": "1",
+        "max_portfolio_daily_loss": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1"
+      }
+    },
+    {
+      "name": "dgt_plus_portfolio_risk",
+      "grid_overrides": {
+        "strategy_mode": "LegacyDgt",
+        "spacing_mode": "Percentage",
+        "enable_trend_filter": false,
+        "enable_volatility_filter": false,
+        "regular_session_only": false,
+        "max_gap_pct": "0",
+        "max_gap_atr_multiple": "0",
+        "minimum_average_dollar_volume": "0",
+        "maximum_spread_bps": "0",
+        "minimum_price": "0"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    },
+    {
+      "name": "full_sadg",
+      "grid_overrides": {},
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    }
+  ]
+}

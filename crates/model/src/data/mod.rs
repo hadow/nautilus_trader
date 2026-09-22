@@ -16,6 +16,7 @@
 //! Data types for the trading domain model.
 
 pub mod bar;
+pub mod bar_vwap;
 pub mod bet;
 pub mod black_scholes;
 pub mod close;

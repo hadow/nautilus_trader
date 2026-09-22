@@ -23,6 +23,8 @@ crate-type = ["rlib"]
 [features]
 default = ["high-precision"]
 examples = ["nautilus-live/node", "nautilus-trading/examples"]
+dynamic-grid = ["examples", "dep:nautilus-sandbox", "dep:nautilus-execution", "dep:serde_json"]
+intraday = ["nautilus-live/node", "dep:nautilus-trading", "nautilus-trading/examples", "dep:nautilus-sandbox", "dep:serde_json", "dep:nautilus-execution"]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
@@ -53,8 +55,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
+nautilus-execution = { workspace = true, optional = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
+nautilus-sandbox = { workspace = true, optional = true }
+nautilus-trading = { workspace = true, optional = true }
 nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
@@ -66,6 +71,7 @@ log = { workspace = true }
 longbridge = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -75,8 +81,11 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+futures-util = { workspace = true }
 nautilus-backtest = { workspace = true }
+nautilus-execution = { workspace = true }
 nautilus-indicators = { workspace = true }
+nautilus-persistence = { workspace = true }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
 ] }
@@ -85,6 +94,19 @@ nautilus-trading = { workspace = true }
 rstest = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true, features = ["display"] }
+
+[[bin]]
+name = "intraday"
+path = "bin/intraday.rs"
+required-features = ["intraday"]
+test = false
+doc = false
+
+[[example]]
+name = "longbridge-slc-momentum"
+path = "examples/node_slc_momentum.rs"
+required-features = ["examples"]
+doc = false
 
 [[example]]
 name = "longbridge-data-tester"
@@ -104,15 +126,16 @@ path = "examples/node_grid_mm.rs"
 required-features = ["examples"]
 doc = false
 
-[[example]]
-name = "longbridge-range-fakeout-backtest"
-path = "examples/node_range_fakeout_backtest.rs"
-required-features = ["examples"]
+[[bin]]
+name = "longbridge-dynamic-grid"
+path = "bin/dynamic_grid.rs"
+required-features = ["dynamic-grid"]
+test = false
 doc = false
 
 [[example]]
-name = "longbridge-wyckoff-research"
-path = "examples/node_wyckoff_research.rs"
+name = "longbridge-range-fakeout-backtest"
+path = "examples/node_range_fakeout_backtest.rs"
 required-features = ["examples"]
 doc = false
 
@@ -131,6 +154,54 @@ doc = false
 [[example]]
 name = "longbridge-slc-selector"
 path = "examples/node_slc_selector.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-manipulation-backtest"
+path = "examples/node_manipulation_backtest.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-manipulation-trader"
+path = "examples/node_manipulation_trader.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-manipulation-swing-backtest"
+path = "examples/node_manipulation_swing_backtest.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-manipulation-swing-trader"
+path = "examples/node_manipulation_swing_trader.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-momentum-pullback-trader"
+path = "examples/node_momentum_pullback_trader.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-momentum-pullback-download"
+path = "examples/momentum_pullback_download.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-intraday-momentum"
+path = "examples/node_intraday_momentum.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
+name = "longbridge-intraday-momentum-backtest"
+path = "examples/intraday_momentum_backtest.rs"
 required-features = ["examples"]
 doc = false
 

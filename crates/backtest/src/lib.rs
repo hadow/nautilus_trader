@@ -79,6 +79,9 @@ pub mod execution_client;
 pub mod modules;
 pub mod result;
 
+#[cfg(feature = "examples")]
+pub mod dynamic_grid;
+
 #[cfg(feature = "streaming")]
 pub mod node;
 

@@ -29,10 +29,10 @@ use async_trait::async_trait;
 use longbridge::{
     Error as LongbridgeError,
     trade::{
-        CancelOrderOptions, Execution, GetHistoryExecutionsOptions, GetHistoryOrdersOptions,
-        GetStockPositionsOptions, GetTodayExecutionsOptions, GetTodayOrdersOptions, Order,
-        OrderSide as LongbridgeOrderSide, OutsideRTH, PushEvent, ReplaceOrderOptions,
-        SubmitOrderOptions, TopicType, TradeContext,
+        CancelOrderOptions, EstimateMaxPurchaseQuantityOptions, Execution,
+        GetHistoryExecutionsOptions, GetHistoryOrdersOptions, GetStockPositionsOptions,
+        GetTodayExecutionsOptions, GetTodayOrdersOptions, Order, OrderSide as LongbridgeOrderSide,
+        OutsideRTH, PushEvent, ReplaceOrderOptions, SubmitOrderOptions, TopicType, TradeContext,
     },
 };
 use nautilus_common::{
@@ -89,10 +89,20 @@ struct OrderContexts {
     by_venue: AHashMap<String, OrderContext>,
     client_order: VecDeque<String>,
     venue_order: VecDeque<String>,
+    short_preflights: AHashMap<ClientOrderId, bool>,
 }
 
 impl OrderContexts {
     const CAPACITY: usize = 10_000;
+
+    fn cancel_preflight(&mut self, id: ClientOrderId) -> bool {
+        if let Some(canceled) = self.short_preflights.get_mut(&id) {
+            *canceled = true;
+            true
+        } else {
+            false
+        }
+    }
 
     fn insert_client(&mut self, context: OrderContext) {
         let key = context.client_order_id.to_string();
@@ -704,14 +714,79 @@ impl ExecutionClient for LongbridgeExecutionClient {
             .lock()
             .expect(MUTEX_POISONED)
             .insert_client(local_context.clone());
+        let short_entry = order
+            .tags()
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == "SHORT_ENTRY"));
+        if short_entry {
+            self.order_contexts
+                .lock()
+                .expect(MUTEX_POISONED)
+                .short_preflights
+                .insert(client_order_id, false);
+        }
         self.emitter.emit_order_submitted(&order);
 
         let contexts = Arc::clone(&self.order_contexts);
         let emitter = self.emitter.clone();
         let clock = self.clock;
         self.spawn_task("order submission", async move {
-            match trade_api_call(context.submit_order(options)).await {
-                Ok(response) => {
+            // A cancel received while awaiting short capacity must prevent dispatch.
+            if short_entry {
+                let mut estimate = EstimateMaxPurchaseQuantityOptions::new(
+                    order.instrument_id().symbol.as_str(),
+                    order_type,
+                    LongbridgeOrderSide::Sell,
+                );
+                if let Some(price) = order.price() {
+                    estimate = estimate.price(price.as_decimal());
+                }
+                let capacity = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    trade_api_call(context.estimate_max_purchase_quantity(estimate)),
+                )
+                .await;
+                let failure = match capacity {
+                    Ok(Ok(value)) if order.order_side() == OrderSide::Sell
+                        && value.margin_max_qty >= order.quantity().as_decimal() => None,
+                    Ok(Ok(_)) => Some("Insufficient short capacity or invalid order side".to_string()),
+                    Ok(Err(e)) => Some(format!("Short capacity could not be verified: {e}")),
+                    Err(_) => Some("Short capacity check timed out".to_string()),
+                };
+                if let Some(reason) = failure {
+                    contexts
+                        .lock()
+                        .expect(MUTEX_POISONED)
+                        .short_preflights
+                        .remove(&client_order_id);
+                    emitter.emit_order_rejected_event(
+                        order.strategy_id(), order.instrument_id(), client_order_id,
+                        &reason, clock.get_time_ns(), false,
+                    );
+                    return Ok(());
+                }
+            }
+            let result = trade_api_call(async {
+                // Check after the submit rate limiter, immediately before transport.
+                let canceled = contexts
+                    .lock()
+                    .expect(MUTEX_POISONED)
+                    .short_preflights
+                    .remove(&client_order_id)
+                    .unwrap_or(false);
+                if canceled {
+                    return Ok(None);
+                }
+                context.submit_order(options).await.map(Some)
+            })
+            .await;
+            match result {
+                Ok(None) => {
+                    emitter.emit_order_rejected_event(
+                        order.strategy_id(), order.instrument_id(), client_order_id,
+                        "Short entry canceled before broker submission", clock.get_time_ns(), false,
+                    );
+                }
+                Ok(Some(response)) => {
                     let venue_order_id = VenueOrderId::from(response.order_id.as_str());
                     contexts
                         .lock()
@@ -805,6 +880,14 @@ impl ExecutionClient for LongbridgeExecutionClient {
     }
 
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
+        if self
+            .order_contexts
+            .lock()
+            .expect(MUTEX_POISONED)
+            .cancel_preflight(cmd.client_order_id)
+        {
+            return Ok(());
+        }
         let Some(venue_order_id) = cmd.venue_order_id else {
             self.emitter.emit_order_cancel_rejected_event(
                 cmd.strategy_id,
@@ -1025,5 +1108,24 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let mut contexts = self.order_contexts.lock().expect(MUTEX_POISONED);
         contexts.insert_client(context.clone());
         contexts.associate_venue(venue_order_id.as_str(), context);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_preflight_cancel_survives_until_dispatch() {
+        let mut contexts = OrderContexts::default();
+        let id = ClientOrderId::from("SHORT-ENTRY-1");
+        assert!(!contexts.cancel_preflight(id));
+        contexts.short_preflights.insert(id, false);
+        assert!(contexts.cancel_preflight(id));
+        assert!(contexts.cancel_preflight(id));
+        assert_eq!(contexts.short_preflights.remove(&id), Some(true));
+        assert!(!contexts.cancel_preflight(id));
+        contexts.short_preflights.insert(id, false);
+        assert_eq!(contexts.short_preflights.remove(&id), Some(false));
     }
 }

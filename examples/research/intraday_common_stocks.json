@@ -1,0 +1,23 @@
+{
+  "model": {
+    "lookback": 14,
+    "volume_lookback": 14,
+    "volatility_lookback": 14,
+    "volatility_multiplier": "1.0",
+    "relative_volume_threshold": "1.0",
+    "target_volatility": 0.03,
+    "max_leverage": "4",
+    "interval_minutes": 30,
+    "timing": "session_close",
+    "baseline_stop": false
+  },
+  "initial_equity": "100000",
+  "commission_per_share": "0.0035",
+  "slippage_per_share": "0.001",
+  "realistic": false,
+  "spread_bps": "1.0",
+  "impact_bps": "0.5",
+  "flatten_minutes": 1,
+  "retain_features": false,
+  "max_entries_per_day": 3
+}

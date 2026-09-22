@@ -1,0 +1,142 @@
+{
+  "instrument_price_increments": {
+    "AAPL.US.LONGBRIDGE": "0.01",
+    "MSFT.US.LONGBRIDGE": "0.01",
+    "NVDA.US.LONGBRIDGE": "0.01",
+    "AMD.US.LONGBRIDGE": "0.01",
+    "AVGO.US.LONGBRIDGE": "0.01",
+    "SPY.US.LONGBRIDGE": "0.01",
+    "QQQ.US.LONGBRIDGE": "0.01",
+    "IWM.US.LONGBRIDGE": "0.01",
+    "XLK.US.LONGBRIDGE": "0.01"
+  },
+  "warmup_minute_batches": 4,
+  "strategy": {
+    "universe": [
+      {
+        "instrument_id": "AAPL.US.LONGBRIDGE",
+        "sector": "EXAMPLE_TECH_GROUP",
+        "sector_etf": "XLK.US.LONGBRIDGE",
+        "market_cap": "0",
+        "known_at": 0,
+        "effective_from": 0,
+        "effective_until": 18446744073709551615
+      },
+      {
+        "instrument_id": "MSFT.US.LONGBRIDGE",
+        "sector": "EXAMPLE_TECH_GROUP",
+        "sector_etf": "XLK.US.LONGBRIDGE",
+        "market_cap": "0",
+        "known_at": 0,
+        "effective_from": 0,
+        "effective_until": 18446744073709551615
+      },
+      {
+        "instrument_id": "NVDA.US.LONGBRIDGE",
+        "sector": "EXAMPLE_TECH_GROUP",
+        "sector_etf": "XLK.US.LONGBRIDGE",
+        "market_cap": "0",
+        "known_at": 0,
+        "effective_from": 0,
+        "effective_until": 18446744073709551615
+      },
+      {
+        "instrument_id": "AMD.US.LONGBRIDGE",
+        "sector": "EXAMPLE_TECH_GROUP",
+        "sector_etf": "XLK.US.LONGBRIDGE",
+        "market_cap": "0",
+        "known_at": 0,
+        "effective_from": 0,
+        "effective_until": 18446744073709551615
+      },
+      {
+        "instrument_id": "AVGO.US.LONGBRIDGE",
+        "sector": "EXAMPLE_TECH_GROUP",
+        "sector_etf": "XLK.US.LONGBRIDGE",
+        "market_cap": "0",
+        "known_at": 0,
+        "effective_from": 0,
+        "effective_until": 18446744073709551615
+      }
+    ],
+    "benchmarks": [
+      "SPY.US.LONGBRIDGE",
+      "QQQ.US.LONGBRIDGE",
+      "IWM.US.LONGBRIDGE"
+    ],
+    "momentum": {
+      "lookbacks": [
+        1,
+        5,
+        10,
+        20
+      ],
+      "return_weights": [
+        0,
+        1,
+        1,
+        1
+      ],
+      "spy_weight": 0,
+      "qqq_weight": 0,
+      "sector_weight": 1,
+      "relative_volume_weight": 1,
+      "intraday_weight": 1,
+      "min_percentile": 80,
+      "refresh_minutes": 5,
+      "minimum_price": "5",
+      "minimum_market_cap": "1000000000",
+      "minimum_average_dollar_volume": "20000000",
+      "minimum_atr_fraction": 0.01
+    },
+    "slc": {
+      "htf_minutes": 60,
+      "ltf_minutes": 5,
+      "stochastic_k": 5,
+      "stochastic_d": 3,
+      "stochastic_smoothing": 3,
+      "max_level_tests": 1,
+      "max_level_breaks": 1,
+      "reclaim_impulse_atr": 0.5,
+      "confirmation_threshold": 9,
+      "opening_range_minutes": 15,
+      "require_intraday_trend": true
+    },
+    "risk": {
+      "risk_per_trade": "0.005",
+      "max_daily_loss": "0.02",
+      "max_total_risk": "0.02",
+      "max_positions": 4,
+      "max_sector_positions": 2,
+      "max_sector_risk": "0.01",
+      "max_consecutive_losses": 3,
+      "correlation_threshold": 0.8,
+      "correlation_penalty": "0.5",
+      "short_margin_ratio": "1.5"
+    },
+    "entry_mode": "LIMIT",
+    "max_spread_bps": "10",
+    "max_slippage_bps": "10",
+    "trading_windows": [
+      [
+        5,
+        120
+      ]
+    ],
+    "batch_delay_ms": 2000,
+    "flatten_before_close_minutes": 5,
+    "dry_run": true,
+    "exit": {
+      "target_r": "2",
+      "partial_r": "1",
+      "partial_fraction": "0.5",
+      "atr_multiplier": "3",
+      "trailing_enabled": true,
+      "momentum_failure": true
+    },
+    "directions": [
+      "LONG",
+      "SHORT"
+    ]
+  }
+}

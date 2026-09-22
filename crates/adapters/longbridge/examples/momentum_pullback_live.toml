@@ -1,0 +1,55 @@
+# LongBridge paper/live configuration. Monetary and risk values are strings to preserve decimals.
+# OAuth uses LONGBRIDGE_OAUTH_CLIENT_ID and the adapter's normal browser authorization flow.
+
+trader_id = "MOMENTUM-PULLBACK-001"
+account_id = "LONGBRIDGE-001"
+node_name = "LONGBRIDGE-MOMENTUM-PULLBACK-001"
+papertrading = true
+max_notional_per_order = "25000"
+
+[instrument_price_increments]
+"AAPL.US.LONGBRIDGE" = "0.01"
+"MSFT.US.LONGBRIDGE" = "0.01"
+"NVDA.US.LONGBRIDGE" = "0.01"
+"SPY.US.LONGBRIDGE" = "0.01"
+"QQQ.US.LONGBRIDGE" = "0.01"
+
+[strategy]
+universe = [
+  "AAPL.US.LONGBRIDGE",
+  "MSFT.US.LONGBRIDGE",
+  "NVDA.US.LONGBRIDGE",
+]
+market_regime_instrument_id = "SPY.US.LONGBRIDGE"
+secondary_market_instrument_id = "QQQ.US.LONGBRIDGE"
+relative_strength_instrument_id = "SPY.US.LONGBRIDGE"
+historical_warmup_bars = 260
+
+min_return_short = 0.05
+min_return_medium = 0.10
+min_rs_short = 0.03
+min_rs_medium = 0.05
+minimum_momentum_score = 70.0
+pullback_min_pct = 0.03
+pullback_normal_max_pct = 0.08
+pullback_max_pct = 0.10
+entry_volume_multiplier = 1.20
+max_entry_extension_atr = 2.0
+
+atr_stop_multiple = "1.5"
+max_stop_distance_pct = "0.08"
+risk_per_trade = "0.005"
+maximum_position_notional_pct = "0.20"
+max_positions = 10
+max_sector_exposure = "0.30"
+max_correlated_positions = 2
+
+enable_market_cap_filter = false
+enable_earnings_filter = false
+earnings_blackout_days = 2
+partial_exit_r = 2.0
+partial_exit_fraction = "0.50"
+time_stop_days = 5
+time_stop_min_r = 0.5
+maximum_holding_days = 30
+commission_rate = "0.0001"

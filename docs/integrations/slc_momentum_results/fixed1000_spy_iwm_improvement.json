@@ -1,0 +1,2881 @@
+{
+  "status": "LOCAL_REPLAY_COMPLETE",
+  "observed_at": "2026-09-15T15:01:45.576659+00:00",
+  "study": {
+    "source": "/Users/hadow/Downloads/nautilus_trader/test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28",
+    "diagnostic_date": "2026-07-01",
+    "training": [
+      "2026-07-01",
+      "2026-07-15"
+    ],
+    "validation": [
+      "2026-07-16",
+      "2026-07-31"
+    ],
+    "test": [
+      "2026-08-03",
+      "2026-08-28"
+    ],
+    "variants": {
+      "no_intraday_trend": {
+        "require_intraday_trend": false
+      },
+      "price_response": {
+        "confirmation_mode": "PRICE_RESPONSE"
+      },
+      "two_level_tests": {
+        "max_level_tests": 2
+      },
+      "impulse_1_atr": {
+        "impulse_atr": 1.0
+      },
+      "confirmation_six_bars": {
+        "confirmation_window_bars": 6
+      },
+      "levels_four_hours": {
+        "max_level_age_bars": 48
+      }
+    },
+    "selection_objective": "diagnose signal suppression, not maximize historical PnL",
+    "risk_unchanged": true,
+    "data_network_calls": 0,
+    "predeclared_profiles": {
+      "corrected_baseline": {},
+      "moderate_pullback": {
+        "impulse_atr": 1.2,
+        "oversold": 25.0,
+        "confirmation_window_bars": 6
+      },
+      "responsive_pullback": {
+        "impulse_atr": 1.0,
+        "oversold": 30.0,
+        "confirmation_window_bars": 6
+      }
+    },
+    "selection_note": "Compare signal production and execution under unchanged risk; prefer the smaller parameter adjustment. Freeze configuration before August replay. Prior baseline results were already seen, so this remains retrospective research.",
+    "current_native_sha256": "79dd64f4775193f65ee9d94e5cfa429d10dea07154c0abab45d9b68ed15b64fd",
+    "baseline_native_sha256": "8253fe1ac256632268f78809d9b2a4879073ec4f54156cc994bed73d3d56f490",
+    "training_started_at": "2026-09-15T13:15:12.196798+00:00",
+    "implementation_changes": [
+      "Retain completed stochastic reentry inside the touch confirmation window",
+      "Invalidate retained confirmation on a new touch, broken level, return to the extreme or elapsed-time expiry",
+      "Report entry-window rejections separately from all-session evaluations"
+    ],
+    "regression_tests": {
+      "slc_tests_passed": 48,
+      "reentry_red_log": "/tmp/slc-improvement-reentry-red.log",
+      "expiry_red_log": "/tmp/slc-improvement-window-red.log",
+      "green_log": "/tmp/slc-improvement-unit.log"
+    },
+    "followup_profiles": {
+      "structural_intraday": {
+        "base": "responsive_pullback",
+        "slc": {
+          "require_intraday_trend": false
+        },
+        "remaining_direction_checks": "HTF structure and HTF EMA, VWAP, level exit and confirmation score"
+      },
+      "momentum_control": {
+        "base": "structural_intraday",
+        "ablation": "A",
+        "purpose": "single-day real-cache execution control, not a proposed trading configuration"
+      },
+      "without_stochastic_control": {
+        "base": "structural_intraday",
+        "ablation": "WITHOUT_STOCHASTIC",
+        "purpose": "diagnose stochastic hard gate, not a full-system candidate"
+      },
+      "fast_stochastic": {
+        "base": "structural_intraday",
+        "slc": {
+          "stochastic_smoothing": 1
+        },
+        "purpose": "test smoothing delay under unchanged risk and mandatory SLC/VWAP/volume"
+      }
+    },
+    "final_replay_design": {
+      "profiles": [
+        "corrected_baseline",
+        "fast_stochastic"
+      ],
+      "start": "2026-07-01",
+      "end": "2026-08-28",
+      "freeze_at": "2026-09-15T13:41:45.806783+00:00",
+      "selection_rule": "Retain original-parameter control and predeclared fast-confirmation sensitivity profile. No profitability optimizer or promotion to paper defaults. Phase metrics are derived from the fixed-configuration full replay.",
+      "validation_status": "not observed",
+      "test_status": "not observed",
+      "plan_sha256": {
+        "corrected_baseline": "7fa22a11ed7722bf060717d615d3f23e6412f669ea10c39abb4969b9dc75aeb7",
+        "fast_stochastic": "dcb89d76d3d5f31c475502afe266fc67d52ac74497542b7baf60e393d9824abf"
+      },
+      "rerun_reason": "Shared matching-engine limit-price correctness fix after August 27 halted. Parameters remain frozen."
+    },
+    "validation_checks": {
+      "slc_unit": 48,
+      "native_example": 14,
+      "python_integration": 5,
+      "python_subtests": 4,
+      "backtest_example_clippy": "passed",
+      "debug_instrumentation_removed": true,
+      "git_diff_check": "passed",
+      "matching_engine_integration": 252,
+      "matching_engine_ignored": 1,
+      "matching_engine_internal": 44,
+      "execution_clippy": "passed",
+      "python_research": 6,
+      "final_native_integration_status": "11 passed, 4 subtests passed"
+    },
+    "limit_fill_failure": {
+      "day": "2026-08-27",
+      "symbol": "CNXC.US.LONGBRIDGE",
+      "order_limit": "28.23",
+      "observed_fill": "28.24",
+      "outcome": "risk guard halted and flattened; original attempt did not produce a complete result",
+      "artifact": "/Users/hadow/Downloads/nautilus_trader/test_data/local/slc_momentum/2026-jul-aug-improvement/cnxc-2026-08-27-repro.zip",
+      "root_cause": "L1 one-tick slippage applied after limit matching could cross order.price()",
+      "pre_fix_binary_sha256": "2b0a2eaa25af44cab34656d066da1be557f52d359615082887521afb0d10c2e4",
+      "regression": "Buy and sell limit-boundary cases failed; market and within-limit slippage controls passed.",
+      "fix": "Cap slippage at the existing order limit in shared apply_fills; retain market slippage and risk guard.",
+      "repaired_day": {
+        "trades": 2,
+        "net_pnl_exact": "86.63",
+        "errors": [],
+        "remaining_orders": 0,
+        "remaining_positions": 0,
+        "cash_and_time_audit": "passed"
+      },
+      "artifact_note": "Verified ZIP of generated replay input/events, original failure output and repaired output; raw history untouched.",
+      "saved_bytes": 178574965
+    }
+  },
+  "source_data_changed": false,
+  "network_calls": 0,
+  "broker_orders": 0,
+  "baseline": {
+    "artifact": "test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/result.json",
+    "signals": 0,
+    "net_pnl_exact": "0.00",
+    "ending_equity": "100000.00",
+    "metrics": {
+      "trades": 0,
+      "win_rate": null,
+      "profit_factor": null,
+      "expectancy": null,
+      "average_r": null,
+      "median_r": null,
+      "average_winner": null,
+      "average_loser": null,
+      "largest_winner": null,
+      "largest_loser": null,
+      "net_pnl": 0,
+      "cagr": 0.0,
+      "sharpe": null,
+      "sortino": null,
+      "max_drawdown": 0.0,
+      "calmar": null,
+      "time_exposure": 0.0,
+      "average_notional_exposure": 0.0,
+      "turnover": 0.0,
+      "missing_equity_sessions": [],
+      "synthetic": true,
+      "alpha_verified": false,
+      "account_rounding_delta": "0.00",
+      "cohorts": {}
+    },
+    "entry_rejected": null,
+    "all_session_rejected": {
+      "CONFIRMATION_MISSING": 1084,
+      "DATA_MISSING": 24726,
+      "HTF_RANGE": 57196,
+      "INTRADAY_TREND_MISMATCH": 253070,
+      "LEVEL_INVALID": 42042,
+      "LEVEL_OVERTESTED": 110,
+      "MARKET_BEARISH": 20756,
+      "MARKET_BULLISH": 17120,
+      "RVOL_LOW": 2,
+      "WARMUP": 1201
+    },
+    "sessions": 42
+  },
+  "single_day_diagnostics_old_binary": [
+    {
+      "variant": "no_intraday_trend",
+      "seconds": 48.85,
+      "signals": 0,
+      "trades": 0,
+      "rejected": {
+        "CONFIRMATION_MISSING": 87,
+        "DATA_MISSING": 1729,
+        "HTF_RANGE": 4927,
+        "LEVEL_INVALID": 2807,
+        "LEVEL_OVERTESTED": 14,
+        "MARKET_BULLISH": 865,
+        "WARMUP": 136
+      }
+    },
+    {
+      "variant": "price_response",
+      "seconds": 49.24,
+      "signals": 0,
+      "trades": 0,
+      "rejected": {
+        "CONFIRMATION_MISSING": 24,
+        "DATA_MISSING": 1729,
+        "HTF_RANGE": 1064,
+        "INTRADAY_TREND_MISMATCH": 5848,
+        "LEVEL_INVALID": 1032,
+        "LEVEL_OVERTESTED": 3,
+        "MARKET_BULLISH": 865
+      }
+    },
+    {
+      "variant": "two_level_tests",
+      "seconds": 52.46,
+      "signals": 0,
+      "trades": 0,
+      "rejected": {
+        "CONFIRMATION_MISSING": 31,
+        "DATA_MISSING": 1729,
+        "HTF_RANGE": 1064,
+        "INTRADAY_TREND_MISMATCH": 5848,
+        "LEVEL_INVALID": 1007,
+        "LEVEL_OVERTESTED": 3,
+        "MARKET_BULLISH": 865,
+        "WARMUP": 18
+      }
+    },
+    {
+      "variant": "impulse_1_atr",
+      "seconds": 51.81,
+      "signals": 0,
+      "trades": 0,
+      "rejected": {
+        "CONFIRMATION_MISSING": 51,
+        "DATA_MISSING": 1729,
+        "HTF_RANGE": 1064,
+        "INTRADAY_TREND_MISMATCH": 5848,
+        "LEVEL_INVALID": 984,
+        "LEVEL_OVERTESTED": 6,
+        "MARKET_BULLISH": 865,
+        "WARMUP": 18
+      }
+    },
+    {
+      "variant": "confirmation_six_bars",
+      "seconds": 65.76,
+      "signals": 0,
+      "trades": 0,
+      "rejected": {
+        "CONFIRMATION_MISSING": 24,
+        "DATA_MISSING": 1729,
+        "HTF_RANGE": 1064,
+        "INTRADAY_TREND_MISMATCH": 5848,
+        "LEVEL_INVALID": 1014,
+        "LEVEL_OVERTESTED": 3,
+        "MARKET_BULLISH": 865,
+        "WARMUP": 18
+      }
+    },
+    {
+      "variant": "levels_four_hours",
+      "seconds": 65.74,
+      "signals": 0,
+      "trades": 0,
+      "rejected": {
+        "CONFIRMATION_MISSING": 24,
+        "DATA_MISSING": 1729,
+        "HTF_RANGE": 1064,
+        "INTRADAY_TREND_MISMATCH": 5848,
+        "LEVEL_INVALID": 1014,
+        "LEVEL_OVERTESTED": 3,
+        "MARKET_BULLISH": 865,
+        "WARMUP": 18
+      }
+    }
+  ],
+  "training_comparison_pre_limit_fix": {
+    "corrected_baseline": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/corrected_baseline/training.json",
+      "signals": 0,
+      "net_pnl_exact": "0.00",
+      "ending_equity": "100000.00",
+      "metrics": {
+        "trades": 0,
+        "win_rate": null,
+        "profit_factor": null,
+        "expectancy": null,
+        "average_r": null,
+        "median_r": null,
+        "average_winner": null,
+        "average_loser": null,
+        "largest_winner": null,
+        "largest_loser": null,
+        "net_pnl": 0,
+        "cagr": 0.0,
+        "sharpe": null,
+        "sortino": null,
+        "max_drawdown": 0.0,
+        "calmar": null,
+        "time_exposure": 0.0,
+        "average_notional_exposure": 0.0,
+        "turnover": 0.0,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {}
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 51,
+        "DATA_MISSING": 3238,
+        "HTF_RANGE": 4060,
+        "INTRADAY_TREND_MISMATCH": 15179,
+        "LEVEL_INVALID": 2734,
+        "LEVEL_OVERTESTED": 5,
+        "MARKET_BEARISH": 2213,
+        "MARKET_BULLISH": 1691,
+        "WARMUP": 182
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 191,
+        "DATA_MISSING": 15532,
+        "HTF_RANGE": 11029,
+        "INTRADAY_TREND_MISMATCH": 53701,
+        "LEVEL_INVALID": 8977,
+        "LEVEL_OVERTESTED": 21,
+        "MARKET_BEARISH": 5423,
+        "MARKET_BULLISH": 2997,
+        "RVOL_LOW": 1,
+        "WARMUP": 182
+      },
+      "sessions": 10
+    },
+    "moderate_pullback": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/moderate_pullback/training.json",
+      "signals": 0,
+      "net_pnl_exact": "0.00",
+      "ending_equity": "100000.00",
+      "metrics": {
+        "trades": 0,
+        "win_rate": null,
+        "profit_factor": null,
+        "expectancy": null,
+        "average_r": null,
+        "median_r": null,
+        "average_winner": null,
+        "average_loser": null,
+        "largest_winner": null,
+        "largest_loser": null,
+        "net_pnl": 0,
+        "cagr": 0.0,
+        "sharpe": null,
+        "sortino": null,
+        "max_drawdown": 0.0,
+        "calmar": null,
+        "time_exposure": 0.0,
+        "average_notional_exposure": 0.0,
+        "turnover": 0.0,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {}
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 97,
+        "DATA_MISSING": 3238,
+        "HTF_RANGE": 4060,
+        "INTRADAY_TREND_MISMATCH": 15179,
+        "LEVEL_INVALID": 2685,
+        "LEVEL_OVERTESTED": 8,
+        "MARKET_BEARISH": 2213,
+        "MARKET_BULLISH": 1691,
+        "WARMUP": 182
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 377,
+        "DATA_MISSING": 15532,
+        "HTF_RANGE": 11029,
+        "INTRADAY_TREND_MISMATCH": 53701,
+        "LEVEL_INVALID": 8764,
+        "LEVEL_OVERTESTED": 47,
+        "MARKET_BEARISH": 5423,
+        "MARKET_BULLISH": 2997,
+        "RVOL_LOW": 2,
+        "WARMUP": 182
+      },
+      "sessions": 10
+    },
+    "responsive_pullback": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/responsive_pullback/training.json",
+      "signals": 0,
+      "net_pnl_exact": "0.00",
+      "ending_equity": "100000.00",
+      "metrics": {
+        "trades": 0,
+        "win_rate": null,
+        "profit_factor": null,
+        "expectancy": null,
+        "average_r": null,
+        "median_r": null,
+        "average_winner": null,
+        "average_loser": null,
+        "largest_winner": null,
+        "largest_loser": null,
+        "net_pnl": 0,
+        "cagr": 0.0,
+        "sharpe": null,
+        "sortino": null,
+        "max_drawdown": 0.0,
+        "calmar": null,
+        "time_exposure": 0.0,
+        "average_notional_exposure": 0.0,
+        "turnover": 0.0,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {}
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 140,
+        "DATA_MISSING": 3238,
+        "HTF_RANGE": 4060,
+        "INTRADAY_TREND_MISMATCH": 15179,
+        "LEVEL_INVALID": 2637,
+        "LEVEL_OVERTESTED": 13,
+        "MARKET_BEARISH": 2213,
+        "MARKET_BULLISH": 1691,
+        "WARMUP": 182
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 584,
+        "DATA_MISSING": 15532,
+        "HTF_RANGE": 11029,
+        "INTRADAY_TREND_MISMATCH": 53701,
+        "LEVEL_INVALID": 8527,
+        "LEVEL_OVERTESTED": 77,
+        "MARKET_BEARISH": 5423,
+        "MARKET_BULLISH": 2997,
+        "RVOL_LOW": 2,
+        "WARMUP": 182
+      },
+      "sessions": 10
+    },
+    "structural_intraday": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/structural_intraday/training.json",
+      "signals": 0,
+      "net_pnl_exact": "0.00",
+      "ending_equity": "100000.00",
+      "metrics": {
+        "trades": 0,
+        "win_rate": null,
+        "profit_factor": null,
+        "expectancy": null,
+        "average_r": null,
+        "median_r": null,
+        "average_winner": null,
+        "average_loser": null,
+        "largest_winner": null,
+        "largest_loser": null,
+        "net_pnl": 0,
+        "cagr": 0.0,
+        "sharpe": null,
+        "sortino": null,
+        "max_drawdown": 0.0,
+        "calmar": null,
+        "time_exposure": 0.0,
+        "average_notional_exposure": 0.0,
+        "turnover": 0.0,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {}
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 363,
+        "DATA_MISSING": 3238,
+        "HTF_RANGE": 13532,
+        "LEVEL_INVALID": 7399,
+        "LEVEL_OVERTESTED": 45,
+        "MARKET_BEARISH": 2213,
+        "MARKET_BULLISH": 1691,
+        "RVOL_LOW": 6,
+        "WARMUP": 866
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 1410,
+        "DATA_MISSING": 15532,
+        "HTF_RANGE": 46583,
+        "LATE_SESSION": 2,
+        "LEVEL_INVALID": 24974,
+        "LEVEL_OVERTESTED": 245,
+        "MARKET_BEARISH": 5423,
+        "MARKET_BULLISH": 2997,
+        "RVOL_LOW": 22,
+        "WARMUP": 866
+      },
+      "sessions": 10
+    },
+    "fast_stochastic": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/fast_stochastic/training.json",
+      "signals": 2,
+      "net_pnl_exact": "55.89",
+      "ending_equity": "100055.89",
+      "metrics": {
+        "trades": 2,
+        "win_rate": 0.5,
+        "profit_factor": 2.0095736994219653,
+        "expectancy": 27.945,
+        "average_r": 0.28596425904398803,
+        "median_r": 0.28596425904398803,
+        "average_winner": 111.25,
+        "average_loser": -55.36,
+        "largest_winner": 111.25,
+        "largest_loser": -55.36,
+        "net_pnl": 55.89,
+        "cagr": 0.014403322900364834,
+        "sharpe": 2.166890769909895,
+        "sortino": 5.079242626526711,
+        "max_drawdown": 0.0005891232740949937,
+        "calmar": 24.448741941983368,
+        "time_exposure": 0.02904884318766067,
+        "average_notional_exposure": 0.0009249374208671895,
+        "turnover": 0.16414431899321358,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {
+          "side": {
+            "LONG": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            },
+            "SHORT": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -55.36,
+              "average_r": -1.0962376237623763,
+              "median_r": -1.0962376237623763,
+              "average_winner": null,
+              "average_loser": -55.36,
+              "largest_winner": null,
+              "largest_loser": -55.36,
+              "net_pnl": -55.36
+            }
+          },
+          "market_regime": {
+            "NEUTRAL": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 2.0095736994219653,
+              "expectancy": 27.945,
+              "average_r": 0.28596425904398803,
+              "median_r": 0.28596425904398803,
+              "average_winner": 111.25,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 55.89
+            }
+          },
+          "setup_type": {
+            "MOMENTUM_SLC_PULLBACK": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 2.0095736994219653,
+              "expectancy": 27.945,
+              "average_r": 0.28596425904398803,
+              "median_r": 0.28596425904398803,
+              "average_winner": 111.25,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 55.89
+            }
+          },
+          "time_of_day": {
+            "10:00": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 2.0095736994219653,
+              "expectancy": 27.945,
+              "average_r": 0.28596425904398803,
+              "median_r": 0.28596425904398803,
+              "average_winner": 111.25,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 55.89
+            }
+          },
+          "symbol": {
+            "AMD.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            },
+            "CRCL.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -55.36,
+              "average_r": -1.0962376237623763,
+              "median_r": -1.0962376237623763,
+              "average_winner": null,
+              "average_loser": -55.36,
+              "largest_winner": null,
+              "largest_loser": -55.36,
+              "net_pnl": -55.36
+            }
+          },
+          "sector": {
+            "XLK.US": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 2.0095736994219653,
+              "expectancy": 27.945,
+              "average_r": 0.28596425904398803,
+              "median_r": 0.28596425904398803,
+              "average_winner": 111.25,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 55.89
+            }
+          },
+          "momentum_percentile": {
+            "90": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            },
+            "0": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -55.36,
+              "average_r": -1.0962376237623763,
+              "median_r": -1.0962376237623763,
+              "average_winner": null,
+              "average_loser": -55.36,
+              "largest_winner": null,
+              "largest_loser": -55.36,
+              "net_pnl": -55.36
+            }
+          },
+          "confirmation_score": {
+            "10.0": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 2.0095736994219653,
+              "expectancy": 27.945,
+              "average_r": 0.28596425904398803,
+              "median_r": 0.28596425904398803,
+              "average_winner": 111.25,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 55.89
+            }
+          },
+          "volatility": {
+            "HIGH": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 2.0095736994219653,
+              "expectancy": 27.945,
+              "average_r": 0.28596425904398803,
+              "median_r": 0.28596425904398803,
+              "average_winner": 111.25,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 55.89
+            }
+          }
+        }
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 351,
+        "DATA_MISSING": 3238,
+        "HTF_RANGE": 13532,
+        "LEVEL_INVALID": 7403,
+        "LEVEL_OVERTESTED": 45,
+        "MARKET_BEARISH": 2213,
+        "MARKET_BULLISH": 1691,
+        "RVOL_LOW": 12,
+        "WARMUP": 866
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 1360,
+        "DATA_MISSING": 15532,
+        "HTF_RANGE": 46583,
+        "LATE_SESSION": 13,
+        "LEVEL_INVALID": 24989,
+        "LEVEL_OVERTESTED": 242,
+        "MARKET_BEARISH": 5423,
+        "MARKET_BULLISH": 2997,
+        "RVOL_LOW": 47,
+        "WARMUP": 866
+      },
+      "sessions": 10
+    },
+    "without_stochastic_control": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/without_stochastic_control/training.json",
+      "signals": 8,
+      "net_pnl_exact": "173.98",
+      "ending_equity": "100173.98",
+      "metrics": {
+        "trades": 3,
+        "win_rate": 0.6666666666666666,
+        "profit_factor": 24.25935828877005,
+        "expectancy": 57.99333333333333,
+        "average_r": 0.8126831228904594,
+        "median_r": 1.5269682470639407,
+        "average_winner": 90.72999999999999,
+        "average_loser": -7.48,
+        "largest_winner": 111.25,
+        "largest_loser": -7.48,
+        "net_pnl": 173.98,
+        "cagr": 0.045494552993549986,
+        "sharpe": 7.189268045853516,
+        "sortino": null,
+        "max_drawdown": 0.00034351999685044987,
+        "calmar": 132.43640373388763,
+        "time_exposure": 0.02853470437017995,
+        "average_notional_exposure": 0.0008003218302945841,
+        "turnover": 0.18466459282088832,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {
+          "side": {
+            "SHORT": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 9.386363636363635,
+              "expectancy": 31.364999999999995,
+              "average_r": 0.38494161341051286,
+              "median_r": 0.38494161341051286,
+              "average_winner": 70.21,
+              "average_loser": -7.48,
+              "largest_winner": 70.21,
+              "largest_loser": -7.48,
+              "net_pnl": 62.72999999999999
+            },
+            "LONG": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            }
+          },
+          "market_regime": {
+            "NEUTRAL": {
+              "trades": 3,
+              "win_rate": 0.6666666666666666,
+              "profit_factor": 24.25935828877005,
+              "expectancy": 57.99333333333333,
+              "average_r": 0.8126831228904594,
+              "median_r": 1.5269682470639407,
+              "average_winner": 90.72999999999999,
+              "average_loser": -7.48,
+              "largest_winner": 111.25,
+              "largest_loser": -7.48,
+              "net_pnl": 173.98
+            }
+          },
+          "setup_type": {
+            "MOMENTUM_SLC_PULLBACK": {
+              "trades": 3,
+              "win_rate": 0.6666666666666666,
+              "profit_factor": 24.25935828877005,
+              "expectancy": 57.99333333333333,
+              "average_r": 0.8126831228904594,
+              "median_r": 1.5269682470639407,
+              "average_winner": 90.72999999999999,
+              "average_loser": -7.48,
+              "largest_winner": 111.25,
+              "largest_loser": -7.48,
+              "net_pnl": 173.98
+            }
+          },
+          "time_of_day": {
+            "10:00": {
+              "trades": 3,
+              "win_rate": 0.6666666666666666,
+              "profit_factor": 24.25935828877005,
+              "expectancy": 57.99333333333333,
+              "average_r": 0.8126831228904594,
+              "median_r": 1.5269682470639407,
+              "average_winner": 90.72999999999999,
+              "average_loser": -7.48,
+              "largest_winner": 111.25,
+              "largest_loser": -7.48,
+              "net_pnl": 173.98
+            }
+          },
+          "symbol": {
+            "DDS.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -7.48,
+              "average_r": -0.757085020242915,
+              "median_r": -0.757085020242915,
+              "average_winner": null,
+              "average_loser": -7.48,
+              "largest_winner": null,
+              "largest_loser": -7.48,
+              "net_pnl": -7.48
+            },
+            "CORZ.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 70.21,
+              "average_r": 1.5269682470639407,
+              "median_r": 1.5269682470639407,
+              "average_winner": 70.21,
+              "average_loser": null,
+              "largest_winner": 70.21,
+              "largest_loser": null,
+              "net_pnl": 70.21
+            },
+            "AMD.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            }
+          },
+          "sector": {
+            "XLY.US": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -7.48,
+              "average_r": -0.757085020242915,
+              "median_r": -0.757085020242915,
+              "average_winner": null,
+              "average_loser": -7.48,
+              "largest_winner": null,
+              "largest_loser": -7.48,
+              "net_pnl": -7.48
+            },
+            "XLK.US": {
+              "trades": 2,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 90.72999999999999,
+              "average_r": 1.5975671944571466,
+              "median_r": 1.5975671944571466,
+              "average_winner": 90.72999999999999,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 181.45999999999998
+            }
+          },
+          "momentum_percentile": {
+            "0": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 9.386363636363635,
+              "expectancy": 31.364999999999995,
+              "average_r": 0.38494161341051286,
+              "median_r": 0.38494161341051286,
+              "average_winner": 70.21,
+              "average_loser": -7.48,
+              "largest_winner": 70.21,
+              "largest_loser": -7.48,
+              "net_pnl": 62.72999999999999
+            },
+            "90": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            }
+          },
+          "confirmation_score": {
+            "9.0": {
+              "trades": 3,
+              "win_rate": 0.6666666666666666,
+              "profit_factor": 24.25935828877005,
+              "expectancy": 57.99333333333333,
+              "average_r": 0.8126831228904594,
+              "median_r": 1.5269682470639407,
+              "average_winner": 90.72999999999999,
+              "average_loser": -7.48,
+              "largest_winner": 111.25,
+              "largest_loser": -7.48,
+              "net_pnl": 173.98
+            }
+          },
+          "volatility": {
+            "HIGH": {
+              "trades": 3,
+              "win_rate": 0.6666666666666666,
+              "profit_factor": 24.25935828877005,
+              "expectancy": 57.99333333333333,
+              "average_r": 0.8126831228904594,
+              "median_r": 1.5269682470639407,
+              "average_winner": 90.72999999999999,
+              "average_loser": -7.48,
+              "largest_winner": 111.25,
+              "largest_loser": -7.48,
+              "net_pnl": 173.98
+            }
+          }
+        }
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 309,
+        "DATA_MISSING": 3238,
+        "HTF_RANGE": 13532,
+        "LATE_SESSION": 2,
+        "LEVEL_INVALID": 8266,
+        "LEVEL_OVERTESTED": 44,
+        "MARKET_BEARISH": 2213,
+        "MARKET_BULLISH": 1691,
+        "RISK_TOO_HIGH": 3,
+        "RVOL_LOW": 52,
+        "SPREAD_TOO_WIDE": 16
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 1185,
+        "DATA_MISSING": 15532,
+        "HTF_RANGE": 46583,
+        "LATE_SESSION": 41,
+        "LEVEL_INVALID": 25892,
+        "LEVEL_OVERTESTED": 229,
+        "MARKET_BEARISH": 5423,
+        "MARKET_BULLISH": 2997,
+        "RISK_TOO_HIGH": 3,
+        "RVOL_LOW": 166,
+        "SPREAD_TOO_WIDE": 16
+      },
+      "sessions": 10
+    }
+  },
+  "execution_control": {
+    "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/momentum_control/diagnostic.json",
+    "signals": 1323,
+    "net_pnl_exact": "31.61",
+    "ending_equity": "100031.61",
+    "metrics": {
+      "trades": 5,
+      "win_rate": 0.6,
+      "profit_factor": 1.5126500162179695,
+      "expectancy": 6.321999999999999,
+      "average_r": 0.4238224080790789,
+      "median_r": 1.0578512396694215,
+      "average_winner": 31.09,
+      "average_loser": -30.830000000000002,
+      "largest_winner": 67.41,
+      "largest_loser": -60.82,
+      "net_pnl": 31.609999999999996,
+      "cagr": 0.5314729136549052,
+      "sharpe": null,
+      "sortino": null,
+      "max_drawdown": 0.0005287143683853079,
+      "calmar": 1005.2174584890172,
+      "time_exposure": 0.32390745501285345,
+      "average_notional_exposure": 0.003137712906173489,
+      "turnover": 0.17188753317538166,
+      "missing_equity_sessions": [],
+      "synthetic": true,
+      "alpha_verified": false,
+      "account_rounding_delta": "0.00",
+      "cohorts": {
+        "side": {
+          "LONG": {
+            "trades": 5,
+            "win_rate": 0.6,
+            "profit_factor": 1.5126500162179695,
+            "expectancy": 6.321999999999999,
+            "average_r": 0.4238224080790789,
+            "median_r": 1.0578512396694215,
+            "average_winner": 31.09,
+            "average_loser": -30.830000000000002,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 31.609999999999996
+          }
+        },
+        "market_regime": {
+          "NEUTRAL": {
+            "trades": 4,
+            "win_rate": 0.75,
+            "profit_factor": 1.5335415981585003,
+            "expectancy": 8.112499999999999,
+            "average_r": 0.8214446767655152,
+            "median_r": 1.3434495444359675,
+            "average_winner": 31.09,
+            "average_loser": -60.82,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 32.449999999999996
+          },
+          "BULLISH": {
+            "trades": 1,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": -0.84,
+            "average_r": -1.1666666666666667,
+            "median_r": -1.1666666666666667,
+            "average_winner": null,
+            "average_loser": -0.84,
+            "largest_winner": null,
+            "largest_loser": -0.84,
+            "net_pnl": -0.84
+          }
+        },
+        "setup_type": {
+          "MOMENTUM_ONLY": {
+            "trades": 5,
+            "win_rate": 0.6,
+            "profit_factor": 1.5126500162179695,
+            "expectancy": 6.321999999999999,
+            "average_r": 0.4238224080790789,
+            "median_r": 1.0578512396694215,
+            "average_winner": 31.09,
+            "average_loser": -30.830000000000002,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 31.609999999999996
+          }
+        },
+        "time_of_day": {
+          "09:30": {
+            "trades": 3,
+            "win_rate": 0.6666666666666666,
+            "profit_factor": 1.466129562643867,
+            "expectancy": 9.45,
+            "average_r": 0.5010566704699625,
+            "median_r": 1.0578512396694215,
+            "average_winner": 44.585,
+            "average_loser": -60.82,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 28.349999999999998
+          },
+          "10:00": {
+            "trades": 1,
+            "win_rate": 1.0,
+            "profit_factor": null,
+            "expectancy": 4.1,
+            "average_r": 1.7826086956521738,
+            "median_r": 1.7826086956521738,
+            "average_winner": 4.1,
+            "average_loser": null,
+            "largest_winner": 4.1,
+            "largest_loser": null,
+            "net_pnl": 4.1
+          },
+          "11:00": {
+            "trades": 1,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": -0.84,
+            "average_r": -1.1666666666666667,
+            "median_r": -1.1666666666666667,
+            "average_winner": null,
+            "average_loser": -0.84,
+            "largest_winner": null,
+            "largest_loser": -0.84,
+            "net_pnl": -0.84
+          }
+        },
+        "symbol": {
+          "ABVX.US.LONGBRIDGE": {
+            "trades": 1,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": -60.82,
+            "average_r": -1.1837290774620475,
+            "median_r": -1.1837290774620475,
+            "average_winner": null,
+            "average_loser": -60.82,
+            "largest_winner": null,
+            "largest_loser": -60.82,
+            "net_pnl": -60.82
+          },
+          "ACMR.US.LONGBRIDGE": {
+            "trades": 1,
+            "win_rate": 1.0,
+            "profit_factor": null,
+            "expectancy": 67.41,
+            "average_r": 1.6290478492025133,
+            "median_r": 1.6290478492025133,
+            "average_winner": 67.41,
+            "average_loser": null,
+            "largest_winner": 67.41,
+            "largest_loser": null,
+            "net_pnl": 67.41
+          },
+          "ACIW.US.LONGBRIDGE": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 4.8809523809523805,
+            "expectancy": 1.63,
+            "average_r": 0.30797101449275355,
+            "median_r": 0.30797101449275355,
+            "average_winner": 4.1,
+            "average_loser": -0.84,
+            "largest_winner": 4.1,
+            "largest_loser": -0.84,
+            "net_pnl": 3.26
+          },
+          "ADPT.US.LONGBRIDGE": {
+            "trades": 1,
+            "win_rate": 1.0,
+            "profit_factor": null,
+            "expectancy": 21.76,
+            "average_r": 1.0578512396694215,
+            "median_r": 1.0578512396694215,
+            "average_winner": 21.76,
+            "average_loser": null,
+            "largest_winner": 21.76,
+            "largest_loser": null,
+            "net_pnl": 21.76
+          }
+        },
+        "sector": {
+          "XLV.US": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 0.3577770470240053,
+            "expectancy": -19.53,
+            "average_r": -0.06293891889631298,
+            "median_r": -0.06293891889631298,
+            "average_winner": 21.76,
+            "average_loser": -60.82,
+            "largest_winner": 21.76,
+            "largest_loser": -60.82,
+            "net_pnl": -39.06
+          },
+          "XLK.US": {
+            "trades": 3,
+            "win_rate": 0.6666666666666666,
+            "profit_factor": 85.13095238095238,
+            "expectancy": 23.556666666666665,
+            "average_r": 0.7483299593960068,
+            "median_r": 1.6290478492025133,
+            "average_winner": 35.754999999999995,
+            "average_loser": -0.84,
+            "largest_winner": 67.41,
+            "largest_loser": -0.84,
+            "net_pnl": 70.67
+          }
+        },
+        "momentum_percentile": {
+          "90": {
+            "trades": 5,
+            "win_rate": 0.6,
+            "profit_factor": 1.5126500162179695,
+            "expectancy": 6.321999999999999,
+            "average_r": 0.4238224080790789,
+            "median_r": 1.0578512396694215,
+            "average_winner": 31.09,
+            "average_loser": -30.830000000000002,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 31.609999999999996
+          }
+        },
+        "confirmation_score": {
+          "0.0": {
+            "trades": 5,
+            "win_rate": 0.6,
+            "profit_factor": 1.5126500162179695,
+            "expectancy": 6.321999999999999,
+            "average_r": 0.4238224080790789,
+            "median_r": 1.0578512396694215,
+            "average_winner": 31.09,
+            "average_loser": -30.830000000000002,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 31.609999999999996
+          }
+        },
+        "volatility": {
+          "HIGH": {
+            "trades": 3,
+            "win_rate": 0.6666666666666666,
+            "profit_factor": 1.466129562643867,
+            "expectancy": 9.45,
+            "average_r": 0.5010566704699625,
+            "median_r": 1.0578512396694215,
+            "average_winner": 44.585,
+            "average_loser": -60.82,
+            "largest_winner": 67.41,
+            "largest_loser": -60.82,
+            "net_pnl": 28.349999999999998
+          },
+          "NORMAL": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 4.8809523809523805,
+            "expectancy": 1.63,
+            "average_r": 0.30797101449275355,
+            "median_r": 0.30797101449275355,
+            "average_winner": 4.1,
+            "average_loser": -0.84,
+            "largest_winner": 4.1,
+            "largest_loser": -0.84,
+            "net_pnl": 3.26
+          }
+        }
+      }
+    },
+    "entry_rejected": {
+      "CONFIRMATION_MISSING": 1460,
+      "DATA_MISSING": 355,
+      "LATE_SESSION": 364,
+      "MAX_EXPOSURE": 835,
+      "RISK_TOO_HIGH": 142,
+      "SPREAD_TOO_WIDE": 2732
+    },
+    "all_session_rejected": {
+      "CONFIRMATION_MISSING": 4740,
+      "DATA_MISSING": 1729,
+      "LATE_SESSION": 3114,
+      "MAX_EXPOSURE": 835,
+      "RISK_TOO_HIGH": 142,
+      "SPREAD_TOO_WIDE": 2732
+    },
+    "sessions": 1
+  },
+  "old_code_fast_training": {
+    "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/fast_stochastic/old-code-training.json",
+    "signals": 2,
+    "net_pnl_exact": "55.89",
+    "ending_equity": "100055.89",
+    "metrics": {
+      "trades": 2,
+      "win_rate": 0.5,
+      "profit_factor": 2.0095736994219653,
+      "expectancy": 27.945,
+      "average_r": 0.28596425904398803,
+      "median_r": 0.28596425904398803,
+      "average_winner": 111.25,
+      "average_loser": -55.36,
+      "largest_winner": 111.25,
+      "largest_loser": -55.36,
+      "net_pnl": 55.89,
+      "cagr": 0.014403322900364834,
+      "sharpe": 2.166890769909895,
+      "sortino": 5.079242626526711,
+      "max_drawdown": 0.0005891232740949937,
+      "calmar": 24.448741941983368,
+      "time_exposure": 0.02904884318766067,
+      "average_notional_exposure": 0.0009249374208671895,
+      "turnover": 0.16414431899321358,
+      "missing_equity_sessions": [],
+      "synthetic": true,
+      "alpha_verified": false,
+      "account_rounding_delta": "0.00",
+      "cohorts": {
+        "side": {
+          "LONG": {
+            "trades": 1,
+            "win_rate": 1.0,
+            "profit_factor": null,
+            "expectancy": 111.25,
+            "average_r": 1.6681661418503524,
+            "median_r": 1.6681661418503524,
+            "average_winner": 111.25,
+            "average_loser": null,
+            "largest_winner": 111.25,
+            "largest_loser": null,
+            "net_pnl": 111.25
+          },
+          "SHORT": {
+            "trades": 1,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": -55.36,
+            "average_r": -1.0962376237623763,
+            "median_r": -1.0962376237623763,
+            "average_winner": null,
+            "average_loser": -55.36,
+            "largest_winner": null,
+            "largest_loser": -55.36,
+            "net_pnl": -55.36
+          }
+        },
+        "market_regime": {
+          "NEUTRAL": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89
+          }
+        },
+        "setup_type": {
+          "MOMENTUM_SLC_PULLBACK": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89
+          }
+        },
+        "time_of_day": {
+          "10:00": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89
+          }
+        },
+        "symbol": {
+          "AMD.US.LONGBRIDGE": {
+            "trades": 1,
+            "win_rate": 1.0,
+            "profit_factor": null,
+            "expectancy": 111.25,
+            "average_r": 1.6681661418503524,
+            "median_r": 1.6681661418503524,
+            "average_winner": 111.25,
+            "average_loser": null,
+            "largest_winner": 111.25,
+            "largest_loser": null,
+            "net_pnl": 111.25
+          },
+          "CRCL.US.LONGBRIDGE": {
+            "trades": 1,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": -55.36,
+            "average_r": -1.0962376237623763,
+            "median_r": -1.0962376237623763,
+            "average_winner": null,
+            "average_loser": -55.36,
+            "largest_winner": null,
+            "largest_loser": -55.36,
+            "net_pnl": -55.36
+          }
+        },
+        "sector": {
+          "XLK.US": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89
+          }
+        },
+        "momentum_percentile": {
+          "90": {
+            "trades": 1,
+            "win_rate": 1.0,
+            "profit_factor": null,
+            "expectancy": 111.25,
+            "average_r": 1.6681661418503524,
+            "median_r": 1.6681661418503524,
+            "average_winner": 111.25,
+            "average_loser": null,
+            "largest_winner": 111.25,
+            "largest_loser": null,
+            "net_pnl": 111.25
+          },
+          "0": {
+            "trades": 1,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "expectancy": -55.36,
+            "average_r": -1.0962376237623763,
+            "median_r": -1.0962376237623763,
+            "average_winner": null,
+            "average_loser": -55.36,
+            "largest_winner": null,
+            "largest_loser": -55.36,
+            "net_pnl": -55.36
+          }
+        },
+        "confirmation_score": {
+          "10.0": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89
+          }
+        },
+        "volatility": {
+          "HIGH": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89
+          }
+        }
+      }
+    },
+    "entry_rejected": null,
+    "all_session_rejected": {
+      "CONFIRMATION_MISSING": 1388,
+      "DATA_MISSING": 15532,
+      "HTF_RANGE": 46583,
+      "LATE_SESSION": 12,
+      "LEVEL_INVALID": 24989,
+      "LEVEL_OVERTESTED": 242,
+      "MARKET_BEARISH": 5423,
+      "MARKET_BULLISH": 2997,
+      "RVOL_LOW": 20,
+      "WARMUP": 866
+    },
+    "sessions": 10
+  },
+  "unfilled_signal_audit": [
+    {
+      "symbol": "CERT.US.LONGBRIDGE",
+      "signal_timestamp": 1785336900000000000,
+      "new_york": "2026-07-29T10:55:00-04:00",
+      "side": "LONG",
+      "source_csv": "/Users/hadow/Downloads/nautilus_trader/test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/minute/CERT.US.LONGBRIDGE/1785428340.csv",
+      "source_row": [
+        "1785336900",
+        "7.955",
+        "7.960",
+        "7.950",
+        "7.960",
+        "2172"
+      ],
+      "normalized_next_open": "7.96",
+      "first_quote_at": 1785336900010000000,
+      "modeled_bid": "7.95",
+      "modeled_ask": "7.97",
+      "modeled_spread_bps": "25.15723270440251572327044025",
+      "max_spread_bps": "10",
+      "unrounded_entry_ceiling": "7.95795",
+      "first_rejection": "SPREAD_TOO_WIDE",
+      "method": "Reconstructed from cached OHLC with native Price half-even normalization and identical outward tick-rounded quote formula; modeled quotes, not historical order-book data."
+    },
+    {
+      "symbol": "COHR.US.LONGBRIDGE",
+      "signal_timestamp": 1786112400000000000,
+      "new_york": "2026-08-07T10:20:00-04:00",
+      "side": "LONG",
+      "source_csv": "/Users/hadow/Downloads/nautilus_trader/test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/minute/COHR.US.LONGBRIDGE/1786113480.csv",
+      "source_row": [
+        "1786112400",
+        "377.400",
+        "377.400",
+        "374.930",
+        "376.409",
+        "20566"
+      ],
+      "normalized_next_open": "377.40",
+      "first_quote_at": 1786112400010000000,
+      "modeled_bid": "377.32",
+      "modeled_ask": "377.48",
+      "modeled_spread_bps": "4.240432524117459980918053641",
+      "max_spread_bps": "10",
+      "unrounded_entry_ceiling": "377.31694",
+      "first_rejection": "RISK_TOO_HIGH",
+      "method": "Reconstructed from cached OHLC with native Price half-even normalization and identical outward tick-rounded quote formula; modeled quotes, not historical order-book data."
+    },
+    {
+      "symbol": "CELH.US.LONGBRIDGE",
+      "signal_timestamp": 1787581200000000000,
+      "new_york": "2026-08-24T10:20:00-04:00",
+      "side": "LONG",
+      "source_csv": "/Users/hadow/Downloads/nautilus_trader/test_data/local/slc_momentum/2026-jul-aug-fixed1000-through-aug28/minute/CELH.US.LONGBRIDGE/1787674740.csv",
+      "source_row": [
+        "1787581200",
+        "34.590",
+        "34.660",
+        "34.545",
+        "34.605",
+        "20778"
+      ],
+      "normalized_next_open": "34.59",
+      "first_quote_at": 1787581200010000000,
+      "modeled_bid": "34.58",
+      "modeled_ask": "34.60",
+      "modeled_spread_bps": "5.783689994216310005783689994",
+      "max_spread_bps": "10",
+      "unrounded_entry_ceiling": "34.57454",
+      "first_rejection": "RISK_TOO_HIGH",
+      "method": "Reconstructed from cached OHLC with native Price half-even normalization and identical outward tick-rounded quote formula; modeled quotes, not historical order-book data."
+    }
+  ],
+  "replays": {
+    "corrected_baseline": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/corrected_baseline/full.json",
+      "signals": 0,
+      "net_pnl_exact": "0.00",
+      "ending_equity": "100000.00",
+      "metrics": {
+        "trades": 0,
+        "win_rate": null,
+        "profit_factor": null,
+        "expectancy": null,
+        "average_r": null,
+        "median_r": null,
+        "average_winner": null,
+        "average_loser": null,
+        "largest_winner": null,
+        "largest_loser": null,
+        "net_pnl": 0,
+        "cagr": 0.0,
+        "sharpe": null,
+        "sortino": null,
+        "max_drawdown": 0.0,
+        "calmar": null,
+        "time_exposure": 0.0,
+        "average_notional_exposure": 0.0,
+        "turnover": 0.0,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "0.00",
+        "cohorts": {}
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 278,
+        "DATA_MISSING": 11532,
+        "HTF_RANGE": 19393,
+        "INTRADAY_TREND_MISMATCH": 65617,
+        "LEVEL_INVALID": 12667,
+        "LEVEL_OVERTESTED": 23,
+        "MARKET_BEARISH": 7243,
+        "MARKET_BULLISH": 6779,
+        "RVOL_LOW": 1,
+        "WARMUP": 1201
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 1083,
+        "DATA_MISSING": 24726,
+        "HTF_RANGE": 57196,
+        "INTRADAY_TREND_MISMATCH": 253070,
+        "LEVEL_INVALID": 42042,
+        "LEVEL_OVERTESTED": 110,
+        "MARKET_BEARISH": 20756,
+        "MARKET_BULLISH": 17120,
+        "RVOL_LOW": 3,
+        "WARMUP": 1201
+      },
+      "sessions": 42,
+      "phases": {
+        "training": {
+          "start": "2026-07-01",
+          "end": "2026-07-15",
+          "sessions": 10,
+          "signals": 0,
+          "starting_equity": "100000",
+          "ending_equity": "100000.00",
+          "net_pnl_exact": "0.00",
+          "metrics": {
+            "trades": 0,
+            "win_rate": null,
+            "profit_factor": null,
+            "expectancy": null,
+            "average_r": null,
+            "median_r": null,
+            "average_winner": null,
+            "average_loser": null,
+            "largest_winner": null,
+            "largest_loser": null,
+            "net_pnl": 0,
+            "cagr": 0.0,
+            "sharpe": null,
+            "sortino": null,
+            "max_drawdown": 0.0,
+            "calmar": null,
+            "time_exposure": 0.0,
+            "average_notional_exposure": 0.0,
+            "turnover": 0.0,
+            "missing_equity_sessions": [],
+            "synthetic": true,
+            "alpha_verified": false,
+            "account_rounding_delta": "0.00",
+            "cohorts": {}
+          }
+        },
+        "validation": {
+          "start": "2026-07-16",
+          "end": "2026-07-31",
+          "sessions": 12,
+          "signals": 0,
+          "starting_equity": "100000.00",
+          "ending_equity": "100000.00",
+          "net_pnl_exact": "0.00",
+          "metrics": {
+            "trades": 0,
+            "win_rate": null,
+            "profit_factor": null,
+            "expectancy": null,
+            "average_r": null,
+            "median_r": null,
+            "average_winner": null,
+            "average_loser": null,
+            "largest_winner": null,
+            "largest_loser": null,
+            "net_pnl": 0,
+            "cagr": 0.0,
+            "sharpe": null,
+            "sortino": null,
+            "max_drawdown": 0.0,
+            "calmar": null,
+            "time_exposure": 0.0,
+            "average_notional_exposure": 0.0,
+            "turnover": 0.0,
+            "missing_equity_sessions": [],
+            "synthetic": true,
+            "alpha_verified": false,
+            "account_rounding_delta": "0.00",
+            "cohorts": {}
+          }
+        },
+        "test": {
+          "start": "2026-08-03",
+          "end": "2026-08-28",
+          "sessions": 20,
+          "signals": 0,
+          "starting_equity": "100000.00",
+          "ending_equity": "100000.00",
+          "net_pnl_exact": "0.00",
+          "metrics": {
+            "trades": 0,
+            "win_rate": null,
+            "profit_factor": null,
+            "expectancy": null,
+            "average_r": null,
+            "median_r": null,
+            "average_winner": null,
+            "average_loser": null,
+            "largest_winner": null,
+            "largest_loser": null,
+            "net_pnl": 0,
+            "cagr": 0.0,
+            "sharpe": null,
+            "sortino": null,
+            "max_drawdown": 0.0,
+            "calmar": null,
+            "time_exposure": 0.0,
+            "average_notional_exposure": 0.0,
+            "turnover": 0.0,
+            "missing_equity_sessions": [],
+            "synthetic": true,
+            "alpha_verified": false,
+            "account_rounding_delta": "0.00",
+            "cohorts": {}
+          }
+        }
+      },
+      "complete_period": true,
+      "complete_minute_prices": false,
+      "missing_minutes": 572,
+      "configuration_sha256": "7fa22a11ed7722bf060717d615d3f23e6412f669ea10c39abb4969b9dc75aeb7",
+      "strategy_parameters": {
+        "slc": {
+          "atr_period": 14,
+          "breadth_threshold": null,
+          "confirmation_mode": "STOCHASTIC_REENTRY",
+          "confirmation_threshold": 9.0,
+          "confirmation_weights": [
+            2.0,
+            2.0,
+            2.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0
+          ],
+          "confirmation_window_bars": 4,
+          "ema_fast": 20,
+          "ema_slow": 50,
+          "htf_minutes": 60,
+          "impulse_atr": 1.5,
+          "impulse_volume": 1.2,
+          "ltf_minutes": 5,
+          "max_level_age_bars": 24,
+          "max_level_breaks": 1,
+          "max_level_distance_atr": 1.0,
+          "max_level_tests": 1,
+          "min_level_score": 6.0,
+          "minimum_confirmation_volume": 1.2,
+          "minimum_intraday_return": 0.0,
+          "neutral_extra_score": 1.0,
+          "opening_range_minutes": 15,
+          "oversold": 20.0,
+          "reclaim_impulse_atr": 0.5,
+          "regime_momentum_minutes": 5,
+          "regime_votes": 2,
+          "require_htf_ema": true,
+          "require_intraday_trend": true,
+          "stochastic_d": 3,
+          "stochastic_k": 5,
+          "stochastic_smoothing": 3
+        },
+        "risk": {
+          "commission_rate": "0.0001",
+          "correlation_lookback": 20,
+          "correlation_penalty": "0.5",
+          "correlation_threshold": 0.8,
+          "max_consecutive_losses": 3,
+          "max_correlated_positions": 2,
+          "max_daily_loss": "0.01",
+          "max_notional": "100000",
+          "max_position_value": "5000",
+          "max_positions": 2,
+          "max_sector_exposure": "0.3",
+          "max_sector_positions": 1,
+          "max_sector_risk": "0.01",
+          "max_total_exposure": "0.8",
+          "max_total_risk": "0.02",
+          "minimum_stop_distance": "0.10",
+          "neutral_multiplier": "0.5",
+          "participation": "0.01",
+          "risk_per_trade": "0.0025",
+          "short_margin_ratio": "1.5",
+          "stop_buffer_atr": "0.2"
+        },
+        "momentum": {
+          "daily_only": true,
+          "intraday_weight": 1.0,
+          "lookbacks": [
+            1,
+            5,
+            10,
+            20
+          ],
+          "maximum_atr_fraction": 0.15,
+          "maximum_gap_fraction": 0.15,
+          "min_percentile": 90.0,
+          "minimum_atr_fraction": 0.01,
+          "minimum_average_dollar_volume": "20000000",
+          "minimum_coverage": 0.95,
+          "minimum_market_cap": "1000000000",
+          "minimum_price": "5",
+          "minimum_relative_volume": 0.5,
+          "minimum_universe_size": 500,
+          "qqq_weight": 1.0,
+          "refresh_minutes": 15,
+          "relative_strength_lookback": 5,
+          "relative_volume_weight": 1.0,
+          "return_weights": [
+            0.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "sector_weight": 1.0,
+          "spy_weight": 1.0
+        },
+        "regime_benchmarks": [
+          "SPY.US.LONGBRIDGE",
+          "IWM.US.LONGBRIDGE"
+        ],
+        "trading_windows": [
+          [
+            5,
+            120
+          ]
+        ],
+        "directions": [
+          "LONG",
+          "SHORT"
+        ],
+        "entry_mode": "LIMIT"
+      }
+    },
+    "fast_stochastic": {
+      "artifact": "test_data/local/slc_momentum/2026-jul-aug-improvement/fast_stochastic/full.json",
+      "signals": 9,
+      "net_pnl_exact": "79.71",
+      "ending_equity": "100079.71",
+      "metrics": {
+        "trades": 6,
+        "win_rate": 0.5,
+        "profit_factor": 1.6746784021665537,
+        "expectancy": 13.286666666666667,
+        "average_r": -0.04622382631517999,
+        "median_r": -0.22111817700052996,
+        "average_winner": 65.96000000000001,
+        "average_loser": -39.38666666666667,
+        "largest_winner": 111.25,
+        "largest_loser": -55.36,
+        "net_pnl": 79.72,
+        "cagr": 0.005006840243742872,
+        "sharpe": 1.227101782066001,
+        "sortino": 2.753112378807413,
+        "max_drawdown": 0.0015153593067642745,
+        "calmar": 3.304061433742673,
+        "time_exposure": 0.02032072469090464,
+        "average_notional_exposure": 0.0006899817808615195,
+        "turnover": 0.41925344217102967,
+        "missing_equity_sessions": [],
+        "synthetic": true,
+        "alpha_verified": false,
+        "account_rounding_delta": "-0.01",
+        "cohorts": {
+          "side": {
+            "LONG": {
+              "trades": 5,
+              "win_rate": 0.6,
+              "profit_factor": 3.1509554140127385,
+              "expectancy": 27.016000000000002,
+              "average_r": 0.1637789331742593,
+              "median_r": 0.39019607843137255,
+              "average_winner": 65.96000000000001,
+              "average_loser": -31.400000000000002,
+              "largest_winner": 111.25,
+              "largest_loser": -33.88,
+              "net_pnl": 135.08
+            },
+            "SHORT": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -55.36,
+              "average_r": -1.0962376237623763,
+              "median_r": -1.0962376237623763,
+              "average_winner": null,
+              "average_loser": -55.36,
+              "largest_winner": null,
+              "largest_loser": -55.36,
+              "net_pnl": -55.36
+            }
+          },
+          "market_regime": {
+            "NEUTRAL": {
+              "trades": 6,
+              "win_rate": 0.5,
+              "profit_factor": 1.6746784021665537,
+              "expectancy": 13.286666666666667,
+              "average_r": -0.04622382631517999,
+              "median_r": -0.22111817700052996,
+              "average_winner": 65.96000000000001,
+              "average_loser": -39.38666666666667,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 79.72
+            }
+          },
+          "setup_type": {
+            "MOMENTUM_SLC_PULLBACK": {
+              "trades": 6,
+              "win_rate": 0.5,
+              "profit_factor": 1.6746784021665537,
+              "expectancy": 13.286666666666667,
+              "average_r": -0.04622382631517999,
+              "median_r": -0.22111817700052996,
+              "average_winner": 65.96000000000001,
+              "average_loser": -39.38666666666667,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 79.72
+            }
+          },
+          "time_of_day": {
+            "10:00": {
+              "trades": 5,
+              "win_rate": 0.6,
+              "profit_factor": 2.347887992406265,
+              "expectancy": 22.720000000000002,
+              "average_r": 0.1110178949082705,
+              "median_r": 0.39019607843137255,
+              "average_winner": 65.96000000000001,
+              "average_loser": -42.14,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 113.60000000000001
+            },
+            "11:00": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -33.88,
+              "average_r": -0.8324324324324325,
+              "median_r": -0.8324324324324325,
+              "average_winner": null,
+              "average_loser": -33.88,
+              "largest_winner": null,
+              "largest_loser": -33.88,
+              "net_pnl": -33.88
+            }
+          },
+          "symbol": {
+            "AMD.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 111.25,
+              "average_r": 1.6681661418503524,
+              "median_r": 1.6681661418503524,
+              "average_winner": 111.25,
+              "average_loser": null,
+              "largest_winner": 111.25,
+              "largest_loser": null,
+              "net_pnl": 111.25
+            },
+            "CRCL.US.LONGBRIDGE": {
+              "trades": 2,
+              "win_rate": 0.5,
+              "profit_factor": 1.4929552023121389,
+              "expectancy": 13.645000000000003,
+              "average_r": -0.18745377435282368,
+              "median_r": -0.18745377435282368,
+              "average_winner": 82.65,
+              "average_loser": -55.36,
+              "largest_winner": 82.65,
+              "largest_loser": -55.36,
+              "net_pnl": 27.290000000000006
+            },
+            "EDU.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -28.92,
+              "average_r": -1.128365197034725,
+              "median_r": -1.128365197034725,
+              "average_winner": null,
+              "average_loser": -28.92,
+              "largest_winner": null,
+              "largest_loser": -28.92,
+              "net_pnl": -28.92
+            },
+            "ERO.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -33.88,
+              "average_r": -0.8324324324324325,
+              "median_r": -0.8324324324324325,
+              "average_winner": null,
+              "average_loser": -33.88,
+              "largest_winner": null,
+              "largest_loser": -33.88,
+              "net_pnl": -33.88
+            },
+            "CNXC.US.LONGBRIDGE": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 3.98,
+              "average_r": 0.39019607843137255,
+              "median_r": 0.39019607843137255,
+              "average_winner": 3.98,
+              "average_loser": null,
+              "largest_winner": 3.98,
+              "largest_loser": null,
+              "net_pnl": 3.98
+            }
+          },
+          "sector": {
+            "XLK.US": {
+              "trades": 3,
+              "win_rate": 0.6666666666666666,
+              "profit_factor": 3.502528901734104,
+              "expectancy": 46.18,
+              "average_r": 0.4310861977149017,
+              "median_r": 0.721330075056729,
+              "average_winner": 96.95,
+              "average_loser": -55.36,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 138.54000000000002
+            },
+            "XLY.US": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -28.92,
+              "average_r": -1.128365197034725,
+              "median_r": -1.128365197034725,
+              "average_winner": null,
+              "average_loser": -28.92,
+              "largest_winner": null,
+              "largest_loser": -28.92,
+              "net_pnl": -28.92
+            },
+            "XLB.US": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -33.88,
+              "average_r": -0.8324324324324325,
+              "median_r": -0.8324324324324325,
+              "average_winner": null,
+              "average_loser": -33.88,
+              "largest_winner": null,
+              "largest_loser": -33.88,
+              "net_pnl": -33.88
+            },
+            "XLI.US": {
+              "trades": 1,
+              "win_rate": 1.0,
+              "profit_factor": null,
+              "expectancy": 3.98,
+              "average_r": 0.39019607843137255,
+              "median_r": 0.39019607843137255,
+              "average_winner": 3.98,
+              "average_loser": null,
+              "largest_winner": 3.98,
+              "largest_loser": null,
+              "net_pnl": 3.98
+            }
+          },
+          "momentum_percentile": {
+            "90": {
+              "trades": 5,
+              "win_rate": 0.6,
+              "profit_factor": 3.1509554140127385,
+              "expectancy": 27.016000000000002,
+              "average_r": 0.1637789331742593,
+              "median_r": 0.39019607843137255,
+              "average_winner": 65.96000000000001,
+              "average_loser": -31.400000000000002,
+              "largest_winner": 111.25,
+              "largest_loser": -33.88,
+              "net_pnl": 135.08
+            },
+            "0": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -55.36,
+              "average_r": -1.0962376237623763,
+              "median_r": -1.0962376237623763,
+              "average_winner": null,
+              "average_loser": -55.36,
+              "largest_winner": null,
+              "largest_loser": -55.36,
+              "net_pnl": -55.36
+            }
+          },
+          "confirmation_score": {
+            "10.0": {
+              "trades": 6,
+              "win_rate": 0.5,
+              "profit_factor": 1.6746784021665537,
+              "expectancy": 13.286666666666667,
+              "average_r": -0.04622382631517999,
+              "median_r": -0.22111817700052996,
+              "average_winner": 65.96000000000001,
+              "average_loser": -39.38666666666667,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 79.72
+            }
+          },
+          "volatility": {
+            "HIGH": {
+              "trades": 5,
+              "win_rate": 0.6,
+              "profit_factor": 2.2173913043478257,
+              "expectancy": 21.728,
+              "average_r": 0.170204447828729,
+              "median_r": 0.39019607843137255,
+              "average_winner": 65.96000000000001,
+              "average_loser": -44.620000000000005,
+              "largest_winner": 111.25,
+              "largest_loser": -55.36,
+              "net_pnl": 108.64
+            },
+            "NORMAL": {
+              "trades": 1,
+              "win_rate": 0.0,
+              "profit_factor": 0.0,
+              "expectancy": -28.92,
+              "average_r": -1.128365197034725,
+              "median_r": -1.128365197034725,
+              "average_winner": null,
+              "average_loser": -28.92,
+              "largest_winner": null,
+              "largest_loser": -28.92,
+              "net_pnl": -28.92
+            }
+          }
+        }
+      },
+      "entry_rejected": {
+        "CONFIRMATION_MISSING": 1596,
+        "DATA_MISSING": 11532,
+        "HTF_RANGE": 61428,
+        "LATE_SESSION": 1,
+        "LEVEL_INVALID": 31829,
+        "LEVEL_OVERTESTED": 184,
+        "MARKET_BEARISH": 7243,
+        "MARKET_BULLISH": 6779,
+        "RISK_TOO_HIGH": 2,
+        "RVOL_LOW": 48,
+        "SPREAD_TOO_WIDE": 8,
+        "WARMUP": 4086
+      },
+      "all_session_rejected": {
+        "CONFIRMATION_MISSING": 7165,
+        "DATA_MISSING": 24726,
+        "HTF_RANGE": 225137,
+        "LATE_SESSION": 61,
+        "LEVEL_INVALID": 116917,
+        "LEVEL_OVERTESTED": 1097,
+        "MARKET_BEARISH": 20756,
+        "MARKET_BULLISH": 17120,
+        "RISK_TOO_HIGH": 2,
+        "RVOL_LOW": 234,
+        "SPREAD_TOO_WIDE": 8,
+        "WARMUP": 4086
+      },
+      "sessions": 42,
+      "phases": {
+        "training": {
+          "start": "2026-07-01",
+          "end": "2026-07-15",
+          "sessions": 10,
+          "signals": 2,
+          "starting_equity": "100000",
+          "ending_equity": "100055.89",
+          "net_pnl_exact": "55.89",
+          "metrics": {
+            "trades": 2,
+            "win_rate": 0.5,
+            "profit_factor": 2.0095736994219653,
+            "expectancy": 27.945,
+            "average_r": 0.28596425904398803,
+            "median_r": 0.28596425904398803,
+            "average_winner": 111.25,
+            "average_loser": -55.36,
+            "largest_winner": 111.25,
+            "largest_loser": -55.36,
+            "net_pnl": 55.89,
+            "cagr": 0.014403322900364834,
+            "sharpe": 2.166890769909895,
+            "sortino": 5.079242626526711,
+            "max_drawdown": 0.0005891232740949937,
+            "calmar": 24.448741941983368,
+            "time_exposure": 0.02904884318766067,
+            "average_notional_exposure": 0.0009249374208671895,
+            "turnover": 0.16414431899321358,
+            "missing_equity_sessions": [],
+            "synthetic": true,
+            "alpha_verified": false,
+            "account_rounding_delta": "0.00",
+            "cohorts": {
+              "side": {
+                "LONG": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 111.25,
+                  "average_r": 1.6681661418503524,
+                  "median_r": 1.6681661418503524,
+                  "average_winner": 111.25,
+                  "average_loser": null,
+                  "largest_winner": 111.25,
+                  "largest_loser": null,
+                  "net_pnl": 111.25
+                },
+                "SHORT": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -55.36,
+                  "average_r": -1.0962376237623763,
+                  "median_r": -1.0962376237623763,
+                  "average_winner": null,
+                  "average_loser": -55.36,
+                  "largest_winner": null,
+                  "largest_loser": -55.36,
+                  "net_pnl": -55.36
+                }
+              },
+              "market_regime": {
+                "NEUTRAL": {
+                  "trades": 2,
+                  "win_rate": 0.5,
+                  "profit_factor": 2.0095736994219653,
+                  "expectancy": 27.945,
+                  "average_r": 0.28596425904398803,
+                  "median_r": 0.28596425904398803,
+                  "average_winner": 111.25,
+                  "average_loser": -55.36,
+                  "largest_winner": 111.25,
+                  "largest_loser": -55.36,
+                  "net_pnl": 55.89
+                }
+              },
+              "setup_type": {
+                "MOMENTUM_SLC_PULLBACK": {
+                  "trades": 2,
+                  "win_rate": 0.5,
+                  "profit_factor": 2.0095736994219653,
+                  "expectancy": 27.945,
+                  "average_r": 0.28596425904398803,
+                  "median_r": 0.28596425904398803,
+                  "average_winner": 111.25,
+                  "average_loser": -55.36,
+                  "largest_winner": 111.25,
+                  "largest_loser": -55.36,
+                  "net_pnl": 55.89
+                }
+              },
+              "time_of_day": {
+                "10:00": {
+                  "trades": 2,
+                  "win_rate": 0.5,
+                  "profit_factor": 2.0095736994219653,
+                  "expectancy": 27.945,
+                  "average_r": 0.28596425904398803,
+                  "median_r": 0.28596425904398803,
+                  "average_winner": 111.25,
+                  "average_loser": -55.36,
+                  "largest_winner": 111.25,
+                  "largest_loser": -55.36,
+                  "net_pnl": 55.89
+                }
+              },
+              "symbol": {
+                "AMD.US.LONGBRIDGE": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 111.25,
+                  "average_r": 1.6681661418503524,
+                  "median_r": 1.6681661418503524,
+                  "average_winner": 111.25,
+                  "average_loser": null,
+                  "largest_winner": 111.25,
+                  "largest_loser": null,
+                  "net_pnl": 111.25
+                },
+                "CRCL.US.LONGBRIDGE": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -55.36,
+                  "average_r": -1.0962376237623763,
+                  "median_r": -1.0962376237623763,
+                  "average_winner": null,
+                  "average_loser": -55.36,
+                  "largest_winner": null,
+                  "largest_loser": -55.36,
+                  "net_pnl": -55.36
+                }
+              },
+              "sector": {
+                "XLK.US": {
+                  "trades": 2,
+                  "win_rate": 0.5,
+                  "profit_factor": 2.0095736994219653,
+                  "expectancy": 27.945,
+                  "average_r": 0.28596425904398803,
+                  "median_r": 0.28596425904398803,
+                  "average_winner": 111.25,
+                  "average_loser": -55.36,
+                  "largest_winner": 111.25,
+                  "largest_loser": -55.36,
+                  "net_pnl": 55.89
+                }
+              },
+              "momentum_percentile": {
+                "90": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 111.25,
+                  "average_r": 1.6681661418503524,
+                  "median_r": 1.6681661418503524,
+                  "average_winner": 111.25,
+                  "average_loser": null,
+                  "largest_winner": 111.25,
+                  "largest_loser": null,
+                  "net_pnl": 111.25
+                },
+                "0": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -55.36,
+                  "average_r": -1.0962376237623763,
+                  "median_r": -1.0962376237623763,
+                  "average_winner": null,
+                  "average_loser": -55.36,
+                  "largest_winner": null,
+                  "largest_loser": -55.36,
+                  "net_pnl": -55.36
+                }
+              },
+              "confirmation_score": {
+                "10.0": {
+                  "trades": 2,
+                  "win_rate": 0.5,
+                  "profit_factor": 2.0095736994219653,
+                  "expectancy": 27.945,
+                  "average_r": 0.28596425904398803,
+                  "median_r": 0.28596425904398803,
+                  "average_winner": 111.25,
+                  "average_loser": -55.36,
+                  "largest_winner": 111.25,
+                  "largest_loser": -55.36,
+                  "net_pnl": 55.89
+                }
+              },
+              "volatility": {
+                "HIGH": {
+                  "trades": 2,
+                  "win_rate": 0.5,
+                  "profit_factor": 2.0095736994219653,
+                  "expectancy": 27.945,
+                  "average_r": 0.28596425904398803,
+                  "median_r": 0.28596425904398803,
+                  "average_winner": 111.25,
+                  "average_loser": -55.36,
+                  "largest_winner": 111.25,
+                  "largest_loser": -55.36,
+                  "net_pnl": 55.89
+                }
+              }
+            }
+          }
+        },
+        "validation": {
+          "start": "2026-07-16",
+          "end": "2026-07-31",
+          "sessions": 12,
+          "signals": 1,
+          "starting_equity": "100055.89",
+          "ending_equity": "100055.89",
+          "net_pnl_exact": "0.00",
+          "metrics": {
+            "trades": 0,
+            "win_rate": null,
+            "profit_factor": null,
+            "expectancy": null,
+            "average_r": null,
+            "median_r": null,
+            "average_winner": null,
+            "average_loser": null,
+            "largest_winner": null,
+            "largest_loser": null,
+            "net_pnl": 0,
+            "cagr": 0.0,
+            "sharpe": null,
+            "sortino": null,
+            "max_drawdown": 0.0,
+            "calmar": null,
+            "time_exposure": 0.0,
+            "average_notional_exposure": 0.0,
+            "turnover": 0.0,
+            "missing_equity_sessions": [],
+            "synthetic": true,
+            "alpha_verified": false,
+            "account_rounding_delta": "0.00",
+            "cohorts": {}
+          }
+        },
+        "test": {
+          "start": "2026-08-03",
+          "end": "2026-08-28",
+          "sessions": 20,
+          "signals": 6,
+          "starting_equity": "100055.89",
+          "ending_equity": "100079.71",
+          "net_pnl_exact": "23.82",
+          "metrics": {
+            "trades": 4,
+            "win_rate": 0.5,
+            "profit_factor": 1.3794585987261148,
+            "expectancy": 5.9575000000000005,
+            "average_r": -0.21231786899476401,
+            "median_r": -0.22111817700052996,
+            "average_winner": 43.315000000000005,
+            "average_loser": -31.400000000000002,
+            "largest_winner": 82.65,
+            "largest_loser": -33.88,
+            "net_pnl": 23.830000000000002,
+            "cagr": 0.003446397540572299,
+            "sharpe": 0.8483935153502512,
+            "sortino": 1.9010693002694676,
+            "max_drawdown": 0.000926782021528072,
+            "calmar": 3.718671122784516,
+            "time_exposure": 0.028149100257069407,
+            "average_notional_exposure": 0.0009864930293755957,
+            "turnover": 0.25515128554071537,
+            "missing_equity_sessions": [],
+            "synthetic": true,
+            "alpha_verified": false,
+            "account_rounding_delta": "-0.01",
+            "cohorts": {
+              "side": {
+                "LONG": {
+                  "trades": 4,
+                  "win_rate": 0.5,
+                  "profit_factor": 1.3794585987261148,
+                  "expectancy": 5.9575000000000005,
+                  "average_r": -0.21231786899476401,
+                  "median_r": -0.22111817700052996,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -31.400000000000002,
+                  "largest_winner": 82.65,
+                  "largest_loser": -33.88,
+                  "net_pnl": 23.830000000000002
+                }
+              },
+              "market_regime": {
+                "NEUTRAL": {
+                  "trades": 4,
+                  "win_rate": 0.5,
+                  "profit_factor": 1.3794585987261148,
+                  "expectancy": 5.9575000000000005,
+                  "average_r": -0.21231786899476401,
+                  "median_r": -0.22111817700052996,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -31.400000000000002,
+                  "largest_winner": 82.65,
+                  "largest_loser": -33.88,
+                  "net_pnl": 23.830000000000002
+                }
+              },
+              "setup_type": {
+                "MOMENTUM_SLC_PULLBACK": {
+                  "trades": 4,
+                  "win_rate": 0.5,
+                  "profit_factor": 1.3794585987261148,
+                  "expectancy": 5.9575000000000005,
+                  "average_r": -0.21231786899476401,
+                  "median_r": -0.22111817700052996,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -31.400000000000002,
+                  "largest_winner": 82.65,
+                  "largest_loser": -33.88,
+                  "net_pnl": 23.830000000000002
+                }
+              },
+              "time_of_day": {
+                "10:00": {
+                  "trades": 3,
+                  "win_rate": 0.6666666666666666,
+                  "profit_factor": 2.9955048409405256,
+                  "expectancy": 19.236666666666668,
+                  "average_r": -0.005613014515541174,
+                  "median_r": 0.39019607843137255,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -28.92,
+                  "largest_winner": 82.65,
+                  "largest_loser": -28.92,
+                  "net_pnl": 57.71
+                },
+                "11:00": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -33.88,
+                  "average_r": -0.8324324324324325,
+                  "median_r": -0.8324324324324325,
+                  "average_winner": null,
+                  "average_loser": -33.88,
+                  "largest_winner": null,
+                  "largest_loser": -33.88,
+                  "net_pnl": -33.88
+                }
+              },
+              "symbol": {
+                "EDU.US.LONGBRIDGE": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -28.92,
+                  "average_r": -1.128365197034725,
+                  "median_r": -1.128365197034725,
+                  "average_winner": null,
+                  "average_loser": -28.92,
+                  "largest_winner": null,
+                  "largest_loser": -28.92,
+                  "net_pnl": -28.92
+                },
+                "ERO.US.LONGBRIDGE": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -33.88,
+                  "average_r": -0.8324324324324325,
+                  "median_r": -0.8324324324324325,
+                  "average_winner": null,
+                  "average_loser": -33.88,
+                  "largest_winner": null,
+                  "largest_loser": -33.88,
+                  "net_pnl": -33.88
+                },
+                "CNXC.US.LONGBRIDGE": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 3.98,
+                  "average_r": 0.39019607843137255,
+                  "median_r": 0.39019607843137255,
+                  "average_winner": 3.98,
+                  "average_loser": null,
+                  "largest_winner": 3.98,
+                  "largest_loser": null,
+                  "net_pnl": 3.98
+                },
+                "CRCL.US.LONGBRIDGE": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 82.65,
+                  "average_r": 0.721330075056729,
+                  "median_r": 0.721330075056729,
+                  "average_winner": 82.65,
+                  "average_loser": null,
+                  "largest_winner": 82.65,
+                  "largest_loser": null,
+                  "net_pnl": 82.65
+                }
+              },
+              "sector": {
+                "XLY.US": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -28.92,
+                  "average_r": -1.128365197034725,
+                  "median_r": -1.128365197034725,
+                  "average_winner": null,
+                  "average_loser": -28.92,
+                  "largest_winner": null,
+                  "largest_loser": -28.92,
+                  "net_pnl": -28.92
+                },
+                "XLB.US": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -33.88,
+                  "average_r": -0.8324324324324325,
+                  "median_r": -0.8324324324324325,
+                  "average_winner": null,
+                  "average_loser": -33.88,
+                  "largest_winner": null,
+                  "largest_loser": -33.88,
+                  "net_pnl": -33.88
+                },
+                "XLI.US": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 3.98,
+                  "average_r": 0.39019607843137255,
+                  "median_r": 0.39019607843137255,
+                  "average_winner": 3.98,
+                  "average_loser": null,
+                  "largest_winner": 3.98,
+                  "largest_loser": null,
+                  "net_pnl": 3.98
+                },
+                "XLK.US": {
+                  "trades": 1,
+                  "win_rate": 1.0,
+                  "profit_factor": null,
+                  "expectancy": 82.65,
+                  "average_r": 0.721330075056729,
+                  "median_r": 0.721330075056729,
+                  "average_winner": 82.65,
+                  "average_loser": null,
+                  "largest_winner": 82.65,
+                  "largest_loser": null,
+                  "net_pnl": 82.65
+                }
+              },
+              "momentum_percentile": {
+                "90": {
+                  "trades": 4,
+                  "win_rate": 0.5,
+                  "profit_factor": 1.3794585987261148,
+                  "expectancy": 5.9575000000000005,
+                  "average_r": -0.21231786899476401,
+                  "median_r": -0.22111817700052996,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -31.400000000000002,
+                  "largest_winner": 82.65,
+                  "largest_loser": -33.88,
+                  "net_pnl": 23.830000000000002
+                }
+              },
+              "confirmation_score": {
+                "10.0": {
+                  "trades": 4,
+                  "win_rate": 0.5,
+                  "profit_factor": 1.3794585987261148,
+                  "expectancy": 5.9575000000000005,
+                  "average_r": -0.21231786899476401,
+                  "median_r": -0.22111817700052996,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -31.400000000000002,
+                  "largest_winner": 82.65,
+                  "largest_loser": -33.88,
+                  "net_pnl": 23.830000000000002
+                }
+              },
+              "volatility": {
+                "NORMAL": {
+                  "trades": 1,
+                  "win_rate": 0.0,
+                  "profit_factor": 0.0,
+                  "expectancy": -28.92,
+                  "average_r": -1.128365197034725,
+                  "median_r": -1.128365197034725,
+                  "average_winner": null,
+                  "average_loser": -28.92,
+                  "largest_winner": null,
+                  "largest_loser": -28.92,
+                  "net_pnl": -28.92
+                },
+                "HIGH": {
+                  "trades": 3,
+                  "win_rate": 0.6666666666666666,
+                  "profit_factor": 2.5569657615112162,
+                  "expectancy": 17.583333333333336,
+                  "average_r": 0.09303124035188969,
+                  "median_r": 0.39019607843137255,
+                  "average_winner": 43.315000000000005,
+                  "average_loser": -33.88,
+                  "largest_winner": 82.65,
+                  "largest_loser": -33.88,
+                  "net_pnl": 52.75
+                }
+              }
+            }
+          }
+        }
+      },
+      "complete_period": true,
+      "complete_minute_prices": false,
+      "missing_minutes": 572,
+      "configuration_sha256": "dcb89d76d3d5f31c475502afe266fc67d52ac74497542b7baf60e393d9824abf",
+      "strategy_parameters": {
+        "slc": {
+          "atr_period": 14,
+          "breadth_threshold": null,
+          "confirmation_mode": "STOCHASTIC_REENTRY",
+          "confirmation_threshold": 9.0,
+          "confirmation_weights": [
+            2.0,
+            2.0,
+            2.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0
+          ],
+          "confirmation_window_bars": 6,
+          "ema_fast": 20,
+          "ema_slow": 50,
+          "htf_minutes": 60,
+          "impulse_atr": 1.0,
+          "impulse_volume": 1.2,
+          "ltf_minutes": 5,
+          "max_level_age_bars": 24,
+          "max_level_breaks": 1,
+          "max_level_distance_atr": 1.0,
+          "max_level_tests": 1,
+          "min_level_score": 6.0,
+          "minimum_confirmation_volume": 1.2,
+          "minimum_intraday_return": 0.0,
+          "neutral_extra_score": 1.0,
+          "opening_range_minutes": 15,
+          "oversold": 30.0,
+          "reclaim_impulse_atr": 0.5,
+          "regime_momentum_minutes": 5,
+          "regime_votes": 2,
+          "require_htf_ema": true,
+          "require_intraday_trend": false,
+          "stochastic_d": 3,
+          "stochastic_k": 5,
+          "stochastic_smoothing": 1
+        },
+        "risk": {
+          "commission_rate": "0.0001",
+          "correlation_lookback": 20,
+          "correlation_penalty": "0.5",
+          "correlation_threshold": 0.8,
+          "max_consecutive_losses": 3,
+          "max_correlated_positions": 2,
+          "max_daily_loss": "0.01",
+          "max_notional": "100000",
+          "max_position_value": "5000",
+          "max_positions": 2,
+          "max_sector_exposure": "0.3",
+          "max_sector_positions": 1,
+          "max_sector_risk": "0.01",
+          "max_total_exposure": "0.8",
+          "max_total_risk": "0.02",
+          "minimum_stop_distance": "0.10",
+          "neutral_multiplier": "0.5",
+          "participation": "0.01",
+          "risk_per_trade": "0.0025",
+          "short_margin_ratio": "1.5",
+          "stop_buffer_atr": "0.2"
+        },
+        "momentum": {
+          "daily_only": true,
+          "intraday_weight": 1.0,
+          "lookbacks": [
+            1,
+            5,
+            10,
+            20
+          ],
+          "maximum_atr_fraction": 0.15,
+          "maximum_gap_fraction": 0.15,
+          "min_percentile": 90.0,
+          "minimum_atr_fraction": 0.01,
+          "minimum_average_dollar_volume": "20000000",
+          "minimum_coverage": 0.95,
+          "minimum_market_cap": "1000000000",
+          "minimum_price": "5",
+          "minimum_relative_volume": 0.5,
+          "minimum_universe_size": 500,
+          "qqq_weight": 1.0,
+          "refresh_minutes": 15,
+          "relative_strength_lookback": 5,
+          "relative_volume_weight": 1.0,
+          "return_weights": [
+            0.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "sector_weight": 1.0,
+          "spy_weight": 1.0
+        },
+        "regime_benchmarks": [
+          "SPY.US.LONGBRIDGE",
+          "IWM.US.LONGBRIDGE"
+        ],
+        "trading_windows": [
+          [
+            5,
+            120
+          ]
+        ],
+        "directions": [
+          "LONG",
+          "SHORT"
+        ],
+        "entry_mode": "LIMIT"
+      }
+    }
+  },
+  "validation": {
+    "slc_unit_tests": 48,
+    "native_example_tests": 14,
+    "python_integration_tests": 5,
+    "python_research_tests": 6,
+    "python_subtests": 4,
+    "matching_integration_passed": 252,
+    "matching_ignored": 1,
+    "matching_internal_passed": 44,
+    "execution_clippy": "passed",
+    "backtest_example_clippy": "passed",
+    "cash_and_event_time_audit": "passed"
+  },
+  "interpretation_limits": [
+    "Fixed quota-limited and availability-biased 1000-stock universe; not point-in-time market membership.",
+    "Current sector, corporate-action and shortability assumptions are not verified historical records.",
+    "Actual cached OHLC with modeled quotes, O-L-H-C intraminute path, spread, depth and slippage; not historical quote execution.",
+    "Available replay ends August 28; August 31 index minutes remain unavailable. No download attempted in this study.",
+    "572 missing candidate minutes; complete sessions do not imply complete prices.",
+    "Retrospective diagnosis and bounded sensitivity study, not a validated optimizer or evidence of incremental alpha. August data exposed the matching bug and was replayed after its fix, so it is not a pristine unseen holdout.",
+    "Rejection counts are repeated first-failure evaluations, not independent lost trades."
+  ]
+}

@@ -17,12 +17,27 @@
 
 pub mod composite_market_maker;
 pub mod delta_neutral_vol;
+pub mod dynamic_grid;
 pub mod ema_cross;
 pub mod grid_mm;
 pub mod hurst_vpin_directional;
+pub mod intraday_momentum;
+pub mod momentum_pullback;
+pub mod slc_momentum;
 
 pub use composite_market_maker::{CompositeMarketMaker, CompositeMarketMakerConfig};
 pub use delta_neutral_vol::{DeltaNeutralVol, DeltaNeutralVolConfig};
 pub use ema_cross::{EmaCross, EmaCrossConfig};
 pub use grid_mm::{GridMarketMaker, GridMarketMakerConfig};
 pub use hurst_vpin_directional::{HurstVpinDirectional, HurstVpinDirectionalConfig};
+pub use intraday_momentum::{
+    IntradayMomentumConfig, IntradayMomentumDecision, IntradayMomentumModel,
+    IntradayMomentumReport, IntradayMomentumSession, IntradayMomentumStrategy, PositionTarget,
+    SharedIntradayMomentumReport,
+};
+pub use momentum_pullback::{
+    EntryConfirmationMode, EntryOrderType, EntrySignal, MarketRegime, MomentumPullbackConfig,
+    MomentumPullbackReport, MomentumPullbackStrategy, MomentumSnapshot, PullbackSnapshot,
+    PullbackType, RiskSnapshot, ScoreWeights, SetupState, SharedMomentumPullbackReport,
+    TradeRecord, TrailingStopMode,
+};

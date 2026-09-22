@@ -22,7 +22,7 @@ live_risk_state_path = "../../../../target/longbridge-slc-live-risk-state.toml"
 market = "us"
 # 实盘标的池模式：fixed 使用本文件底部的 [[symbols]]；dynamic 读取盘前选择器生成的当日快照。
 # 回测始终使用固定 [[symbols]]，避免把某一天的动态池错误套用到历史区间。
-mode = "dynamic"
+mode = "fixed"
 # 动态池快照路径；相对路径以本配置文件目录为基准。动态模式下文件缺失、日期过期或方向不一致
 # 都会阻止交易节点启动，不会静默回退到固定池。
 dynamic_pool_path = "../../../../target/longbridge-slc-dynamic-pool.toml"
@@ -53,6 +53,44 @@ minimum_daily_amplitude_pct = "1.5"
 minimum_daily_change_pct = "0.5"
 maximum_daily_change_pct = "12"
 
+# 视频 Manipulation Strategy 的可回测量化定义；1 小时确认明显流动性摆动，5 分钟执行 sweep、
+# 反向 FVG 及 IFVG 收盘突破。仅由 longbridge-manipulation-* runner 使用。
+[manipulation]
+# 中心 K 线左右各需要两根完整 1 小时 K 线，确认后才成为流动性水平，避免 pivot 未来回写。
+liquidity_swing_bars = 2
+# 只保留最近 12 根 1 小时 K 线确认的流动性水平，每侧最多保留 8 个。
+liquidity_level_ttl_bars = 12
+max_liquidity_levels_per_side = 8
+# sweep 后最多 3 根 5 分钟 K 线内形成反向 FVG，形成后最多 6 根内完成 IFVG 收盘突破。
+fvg_search_bars = 3
+inverse_fvg_ttl_bars = 6
+# 用入场前 ATR 排除几乎不可见的 sweep，以及过小或过度扩张的 FVG。
+minimum_sweep_atr = 0.10
+minimum_fvg_atr = 0.15
+maximum_fvg_atr = 0.4
+# IFVG 收盘越过远端后最多允许继续延伸的 ATR，避免确认时追入已经扩张的行情。
+maximum_inversion_atr = 0.5
+
+# 独立跨日波段模型：日线过滤方向，4 小时确认流动性，1 小时形成 sweep/FVG，15 分钟收盘
+# 完成 IFVG 入场。止损、仓位、订单和账户风险仍复用统一执行链。
+[manipulation_swing]
+# 最近 20 根完整日线的收盘价同时位于均值和窗口起点同一侧，才允许对应方向 setup。
+daily_bias_bars = 20
+# 中心 K 线左右各两根完整 4 小时 K 线确认流动性水平；水平最多保留约 15 个交易日。
+liquidity_swing_bars = 2
+liquidity_level_ttl_bars = 30
+max_liquidity_levels_per_side = 8
+# Sweep 后三根 1 小时 K 线内形成反向 FVG；随后最多一个完整常规交易日完成反转突破。
+fvg_search_bars = 3
+inverse_fvg_ttl_bars = 26
+minimum_sweep_atr = 0.10
+minimum_fvg_atr = 0.10
+maximum_fvg_atr = 0.8
+maximum_inversion_atr = 0.5
+# 止盈止损可随时成交；无进展退出最早在第二个持仓交易日收盘，最晚第五日开盘后退出。
+minimum_holding_sessions = 2
+maximum_holding_sessions = 5
+
 [risk]
 # 单笔交易计划承担的最大初始风险，单位 USD；100 USD 为 100,000 USD 初始资金的 0.10%。
 risk_amount = "200"
@@ -81,7 +119,7 @@ level_selection = "all"
 # 同一根 5 分钟 K 线信号的归集等待时间，单位毫秒；归集后按无权重质量字段依次排序。
 batch_delay_ms = 2000
 # 固定止盈倍数，以初始风险 R 为单位；文档要求至少 2R。
-risk_reward = "2"
+risk_reward = "3"
 # 价格曾达到该浮盈 R 后启用利润保护；与下方保护线同时设为 0 可关闭。
 profit_protection_trigger_r = "1"
 # 价格达到首个触发档后，把券商端止损抬到的首个盈利 R；0.5R 保留回调空间。
@@ -89,7 +127,7 @@ profit_protection_floor_r = "0.5"
 # MFE 每继续增加该 R，再把利润保护线同幅抬高；当前形成 1R→0.5R、1.5R→1R 两档。
 profit_protection_step_r = "0.5"
 # 持仓达到该数量的已完成 5 分钟 Bar 后，开始判断交易是否始终没有启动；0 与下方阈值全为 0 时关闭。
-no_progress_exit_after_bars = 12
+no_progress_exit_after_bars = 9
 # 无进展退出要求持仓以来的最大有利波动严格小于该 R；0.5R 表示从未形成足够跟随。
 no_progress_max_mfe_r = "0.5"
 # 无进展退出同时要求当前完成 Bar 的收盘收益不高于该 R；0 表示只退出未盈利交易。
@@ -116,21 +154,27 @@ displacement_close_fraction = 0.3
 displacement_max_bars = 3
 # “recent level”最多保留一个美股常规交易时段（78 根 5 分钟 Bar），超时后删除。
 zone_ttl_bars = 78
-# 可首次交易的 Level 必须至少保持该数量 Bar 未触达；提前回访说明离开不充分，直接作废。
-minimum_fresh_level_age_bars = 6
+# 可首次交易的 Level 必须至少保持该数量 Bar 未触达；15 根约 75 分钟，用于过滤位移后很快
+# 回抽、尚未形成独立供需区的 setup。
+minimum_fresh_level_age_bars = 15
 # demand 和 supply 各自最多保留的 level 数，防止状态和扫描成本无界增长。
 max_zones_per_side = 8
-# 价格触达 level 后，允许等待随机指标回穿的 5 分钟 Bar 数；2 表示最多等待 10 分钟。 默认 2
+# 确认模型：level_response 验证价格是否立即拒绝 Level 或随后突破触达 K 线极值；
+# stochastic_reentry 保留为随机指标极值回穿的 A/B 基线。
+confirmation_model = "level_response"
+# 价格触达 level 后允许完成确认的 5 分钟 Bar 数；5 表示触达 Bar 加后续最多 5 根。
 confirmation_window_bars = 5
-# Stochastics %K 原始周期。
+# Level Response 确认 K 线的方向收盘位置下限；0.65 表示做多收在振幅上方 35% 内，做空镜像。
+minimum_confirmation_close_location = 0.65
+# Stochastics %K 原始周期；Level Response 模式下仅作为诊断和 A/B 基线。
 stochastic_k_period = 5
 # Stochastics %K 平滑周期。
 stochastic_k_smoothing = 3
 # Stochastics %D 周期；当前信号使用 %K 阈值，但保留完整指标初始化。
 stochastic_d_period = 3
-# 多头确认要求 %K 曾低于该超卖阈值。
+# Stochastic Reentry 模式下，多头确认要求 %K 曾低于该超卖阈值。
 oversold = 20.0
-# 空头确认要求 %K 曾高于该超买阈值。
+# Stochastic Reentry 模式下，空头确认要求 %K 曾高于该超买阈值。
 overbought = 80.0
 # 距离强制平仓至少保留的潜在运行时间；晚于该边界不再开仓，单位分钟。
 minimum_target_time_minutes = 60
@@ -138,8 +182,14 @@ minimum_target_time_minutes = 60
 [warmup]
 # 启动前加载的已完成 5 分钟 Bar 数，用于初始化 ATR、随机指标和近期位移窗口。
 five_minute_bars = 50
-# 启动前加载的已完成 1 小时 Bar 数；结构判断始终只消费最近四根。
+# 波段模型的 15 分钟近期区间和 IFVG 触发预热。
+fifteen_minute_bars = 40
+# 启动前加载的已完成 1 小时 Bar 数；仅用于对照滚动 4x1h 诊断，不参与交易授权。
 one_hour_bars = 60
+# 启动前加载的已完成原生 4 小时 Bar 数；最后两根以 HH/HL 或 LH/LL 判定交易方向。
+four_hour_bars = 30
+# 波段模型使用 20 日方向窗口，额外历史为新样本边界提供稳定余量。
+daily_bars = 30
 
 [session]
 # 允许提交新入场的最早纽约时间，格式 HH:MM，不能早于 09:30。
@@ -152,11 +202,11 @@ flatten_before_close_minutes = 10
 max_trades_per_day = 10
 
 [backtest]
-# 回测样本起点和终点，必须使用 UTC 时间戳且 start < end；当前回归 2026 年 8 月。
-start = "2025-11-01T00:00:00Z"
-end = "2025-11-30T23:59:59Z"
+# 回测样本起点和终点，必须使用 UTC 时间戳且 start < end。
+start = "2026-07-01T00:00:00Z"
+end = "2026-07-31T23:59:59Z"
 # 同一数据和止损规则下比较文档原始 2R 与扩展 3R，避免只看单一目标误判退出质量。
-risk_rewards = ["2"]
+risk_rewards = ["2", "3"]
 # 回测组合初始资金；用于收益率、Sharpe、回撤和 Calmar 计算。
 starting_balance = "100_000 USD"
 # 下载全部历史数据允许的总超时秒数；一年多标的数据需为限流留足时间。

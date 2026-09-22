@@ -1,0 +1,170 @@
+{
+  "recorded_at_utc": "2026-09-15T04:05:00.069120+00:00",
+  "status": "ENGINEERING_CHECKS_PASSED; CONNECTED_ORDER_ACCEPTANCE_NOT_RUN",
+  "pipeline": [
+    "3000-stock universe",
+    "global eligible top 5-10%",
+    "SPY/QQQ/IWM regime",
+    "HTF structure",
+    "5m demand/pullback",
+    "SLC confirmation",
+    "VWAP/volume",
+    "quote freshness and portfolio risk",
+    "native execution"
+  ],
+  "connected_read_only": {
+    "universe_audit": {
+      "excluded_counter_ids": [
+        "ETF/US/BNY",
+        "ETF/US/BXSL",
+        "ETF/US/CII",
+        "ETF/US/DIGI",
+        "ETF/US/EU",
+        "ETF/US/HERZ",
+        "ETF/US/MATH",
+        "ETF/US/MFIC",
+        "ETF/US/MMV",
+        "ETF/US/NXDT",
+        "ETF/US/OZ",
+        "ETF/US/PMN",
+        "ETF/US/PSHZF",
+        "ETF/US/SOR",
+        "WT/US/DNMRW"
+      ],
+      "historical_membership": false,
+      "known_at": 1789441024611675000,
+      "orders_submitted": 0,
+      "screener_listings": 8254,
+      "sector_proxy": "SPY only for UNMAPPED; sector ranking weight must be zero",
+      "selected": 3000,
+      "selection": "USMain USD equities, descending observed market capitalization",
+      "source": "Longbridge screener + static_info + exact calc_indexes TotalMarketValue",
+      "unmapped_industries": []
+    },
+    "history_audit": {
+      "cached_symbols": 2999,
+      "daily_bars": 203026,
+      "daily_cutoff": 1789416000000000000,
+      "latest_quote_event": 1789416001000000000,
+      "missing_or_unaligned_history": [
+        "AAPGV.US.LONGBRIDGE",
+        "ATUS.US.LONGBRIDGE",
+        "AUXX.US.LONGBRIDGE",
+        "BALY.T.US.LONGBRIDGE",
+        "BGNE.US.LONGBRIDGE",
+        "BSIG.US.LONGBRIDGE",
+        "CEIX.US.LONGBRIDGE",
+        "CLDR.US.LONGBRIDGE",
+        "COMM.US.LONGBRIDGE",
+        "FOIL.US.LONGBRIDGE",
+        "JBT.US.LONGBRIDGE",
+        "LYNX.US.LONGBRIDGE",
+        "MMC.US.LONGBRIDGE",
+        "NEP.US.LONGBRIDGE",
+        "PLAN.US.LONGBRIDGE",
+        "PX.US.LONGBRIDGE",
+        "SGLD.US.LONGBRIDGE",
+        "SQ.US.LONGBRIDGE",
+        "VVI.US.LONGBRIDGE"
+      ],
+      "normal_quote_symbols": 2946,
+      "note": "History readiness only; liquidity, live quote coverage, regime and SLC gates still apply.",
+      "observed_at": 1789443403205219000,
+      "orders_submitted": 0,
+      "required_sessions": 21
+    },
+    "sector_counts": {
+      "XLB.US": 199,
+      "XLC.US": 148,
+      "XLE.US": 183,
+      "XLF.US": 538,
+      "XLI.US": 443,
+      "XLK.US": 386,
+      "XLP.US": 122,
+      "XLRE.US": 134,
+      "XLU.US": 90,
+      "XLV.US": 450,
+      "XLY.US": 307
+    },
+    "cache_json_bytes": 41927122,
+    "prepared_config_sha256": "b7baf6eb5fba5c547d10cc4e2187b9076257ad65c748cf737a71be13897e0342",
+    "current_regular_session_ranking_verified": false,
+    "orders_submitted": 0
+  },
+  "tests": {
+    "trading_library": 510,
+    "slc_cases": 39,
+    "longbridge_library": 23,
+    "scanner": 2,
+    "native_date_cli": 13,
+    "native_pipeline_tests": 2,
+    "native_pipeline_runs": 4,
+    "native_pipeline_data": "Invented selection packets and candles; not historical returns or broker fills",
+    "assertions": [
+      "3000-history ranker selects 300/150 globally and rejects future/stale/incomplete observations",
+      "held symbol leaving pool keeps protective exit and finishes flat",
+      "expired selection prevents otherwise identical signals/trades",
+      "pending native stop order cancels on rotation before another symbol quote",
+      "unchanged candidate membership allows the same pending order to fill",
+      "missing current-session minute blocks regime/confirmation"
+    ],
+    "clippy": {
+      "backtest_example": "PASS",
+      "longbridge_example": "PASS",
+      "trading_library": "12 pre-existing momentum_pullback diagnostics; none in slc_momentum"
+    },
+    "format": "Affected Rust rustfmt and Python Ruff checks passed",
+    "log_sha256": {
+      "trading": "f9a23077a8c5389c99ee0127556fbe6cf85072d4e7c966e88b9fe9ab87d9d196",
+      "adapter": "6f6791fe7bd14a01d32f3bb3d30169cf20b299dc4cadcf91f02da3db51b74e43",
+      "date_cli": "d851e931e831bbcc6411d159b7759e2399c9555170d2c0cc0e788805a92644c8",
+      "native_pipeline": "d3d11d7ef4c8005af6b973d7ed20dd51af96e6a866e35d4b81fe48e7f80a5d02",
+      "trading_clippy": "d31899d9060e8799d7a2dc7c03134a967d899e81a8a7f9935358314a9b67dcf9",
+      "adapter_clippy": "d096fc1437d8da1dfe03aa6d319a7b6e7d9a54cae36361365c9370c329499326",
+      "backtest_clippy": "16ed7c30cf3c142a8b95532a9fd8d37e6974826ffa76f93ef87822dcfcb72a5e"
+    }
+  },
+  "research": {
+    "historical_backtest": "NOT_RUN_WITH_VERIFIED_POINT_IN_TIME_FULL_MARKET_DATA",
+    "current_full_market_ablation": "NOT_RUN",
+    "current_full_market_walk_forward": "NOT_RUN",
+    "momentum_contribution": null,
+    "slc_contribution": null,
+    "incremental_alpha": null,
+    "vwap_increment": null,
+    "stochastic_increment": null,
+    "regime_drawdown_reduction": null,
+    "earlier_artifacts": "Archived synthetic results predate this full-market integration"
+  },
+  "known_limitations": [
+    "Current provider listings and explicit industry mappings are not a certified historical security master",
+    "Corporate-action ingestion and verified historical quotes/membership/sectors remain required",
+    "Native synthetic depth replenishes on matching passes; connected partial-fill/cancel races remain unverified",
+    "Additional native one-tick stress can breach a limit boundary; strategy fill-price risk guard halts",
+    "Flat isolated simulated account required; no paper or live-order session started during validation",
+    "No profitability or incremental-factor claim follows from invented regression data"
+  ],
+  "source_sha256": {
+    "crates/adapters/longbridge/examples/node_slc_momentum.rs": "9c1a960b90ec25babd9e004ce64ccdc722a567625d317291849cbfb3ecf20144",
+    "crates/adapters/longbridge/examples/slc_momentum_market.example.json": "82b5225c2ba839f31f494a014f837a055b76cd515e253485a0392549b7b6a512",
+    "crates/adapters/longbridge/examples/slc_momentum_market.rs": "40d226e95c94d6e88bb55ee4468cfd271cca3c4088b7d4d73cf40a559902f909",
+    "crates/adapters/longbridge/src/data.rs": "77dc0f24cb5c8aedc0a93d4c23895df0c61e86472c02ce6261589c3ccd16f812",
+    "crates/adapters/longbridge/src/factories.rs": "f22c2bb6d138605d28acb0522d23294952916b0310fb6e107fbde1940074a36c",
+    "crates/backtest/examples/slc_momentum.rs": "bcd8f080675a6fb440419842a43e77e75e1e16e66cac81432bd6fd2cf36d6888",
+    "crates/trading/src/examples/strategies/slc_momentum/config.rs": "b8f4409c3d9728c69cfc073f774701fbcffab4cd4d0c8b38ee4c9e15eaf1da09",
+    "crates/trading/src/examples/strategies/slc_momentum/data.rs": "36eff72baf9e9420e2249038ec51dc1e22341346c3152d1249ac97ed986fa614",
+    "crates/trading/src/examples/strategies/slc_momentum/market.rs": "befa9bc0faa8a0a27677d62609dfc0d75d347e68dc8dd31a6d64403225357e27",
+    "crates/trading/src/examples/strategies/slc_momentum/mod.rs": "723641c3ba2b06136018024e8955631b2627df5a715bf9555f0a64790c70e86f",
+    "crates/trading/src/examples/strategies/slc_momentum/risk.rs": "e33bb36be0d46546c6230ddd22ace660053c9b785fe0055d5e65aff130be49a4",
+    "crates/trading/src/examples/strategies/slc_momentum/selection.rs": "14776718fd0d141ff402fe15dd47bdf030199364852666ef8531c6c734100f0b",
+    "crates/trading/src/examples/strategies/slc_momentum/signal.rs": "dc545953670ed5fd1e78248658b0f531b437ac93656c7b78b9195ec9739e3d1a",
+    "crates/trading/src/examples/strategies/slc_momentum/strategy.rs": "b9596ab72c38de74a46b1d638465487bda1d80e0448d231dd2b17ba3974d9aa3",
+    "crates/trading/src/examples/strategies/slc_momentum/tests.rs": "e781074dc230d76a241333cff154f363e1fc9103563c7b3a1efdc7caac08563a",
+    "docs/integrations/slc_momentum.md": "4b21a28da5b1f597f901916193fe714a5f8f111b46a5fe556b4f7a6604333c82",
+    "examples/backtest/test_slc_momentum_market.py": "e204c1dd6d65758217847413c553685d04aeb56c33fab9b73dd96f9c6ac274a7"
+  },
+  "binary_sha256": {
+    "slc-momentum": "1b3a8824990a6d6e77ef0e538f9b88a05e9c2a4d68314e90bb6610d9357c9f2c",
+    "longbridge-slc-momentum": "8880fb8e685eeaad036a3536037998913f4151a1d76fd366aaa69e1f557dd170"
+  }
+}

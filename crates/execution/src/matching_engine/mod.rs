@@ -4686,6 +4686,13 @@ impl OrderMatchingEngine {
                 fill_px = match order.order_side().as_specified() {
                     OrderSideSpecified::Buy => fill_px.add(self.instrument.price_increment()),
                     OrderSideSpecified::Sell => fill_px.sub(self.instrument.price_increment()),
+                };
+                // Adverse slippage may consume price improvement, but cannot exceed a limit
+                if let Some(limit) = order.price() {
+                    fill_px = match order.order_side().as_specified() {
+                        OrderSideSpecified::Buy => fill_px.min(limit),
+                        OrderSideSpecified::Sell => fill_px.max(limit),
+                    };
                 }
             }
 

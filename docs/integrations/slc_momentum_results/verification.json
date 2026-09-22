@@ -1,0 +1,457 @@
+{
+  "synthetic": true,
+  "alpha_verified": false,
+  "research_binary_sha256": "42c87a483651a11cc81e6fd35ae5144ac23c9e9d7b8a56041176e573d772c738",
+  "fixture_events_sha256": "b57a1cf77cb1cd9f39928924f5a47fb5939e1222faea10aa948147ee87a7ea35",
+  "native_runs": [
+    {
+      "label": "A",
+      "trades": 40,
+      "signals": 200,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "B",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "C",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "D",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "E",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "F",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "SLC_ONLY",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "WITHOUT_REGIME",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "WITHOUT_STOCHASTIC",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "cost_2",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "cost_3",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_confirmation_threshold_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_confirmation_threshold_1",
+      "trades": 0,
+      "signals": 0,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_lookbacks_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_lookbacks_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_max_level_age_bars_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_max_level_age_bars_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_max_level_tests_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_max_level_tests_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_minimum_confirmation_volume_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_minimum_confirmation_volume_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_return_weights_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_return_weights_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_risk_per_trade_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_risk_per_trade_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_stochastic_d_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_stochastic_d_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_stochastic_k_0",
+      "trades": 0,
+      "signals": 0,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_stochastic_k_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_stop_buffer_atr_0",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_stop_buffer_atr_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_window_0",
+      "trades": 0,
+      "signals": 0,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_window_1",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "sensitivity_window_2",
+      "trades": 10,
+      "signals": 10,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_test",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_train_base",
+      "trades": 3,
+      "signals": 3,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_train_lookbacks_0",
+      "trades": 3,
+      "signals": 3,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_train_lookbacks_1",
+      "trades": 3,
+      "signals": 3,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_validation_base",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_validation_lookbacks_0",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf0_validation_lookbacks_1",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_test",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_train_base",
+      "trades": 3,
+      "signals": 3,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_train_lookbacks_0",
+      "trades": 3,
+      "signals": 3,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_train_lookbacks_1",
+      "trades": 3,
+      "signals": 3,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_validation_base",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_validation_lookbacks_0",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    },
+    {
+      "label": "wf1_validation_lookbacks_1",
+      "trades": 2,
+      "signals": 2,
+      "remaining_orders": 0,
+      "remaining_positions": 0,
+      "errors": [],
+      "cash_and_event_time_audit": "PASS"
+    }
+  ],
+  "offline_dry_run": {
+    "signals": 2,
+    "trades": 0,
+    "orders_remaining": 0,
+    "positions_remaining": 0,
+    "errors": []
+  },
+  "historical_alpha_questions": {
+    "momentum_contribution": "UNESTABLISHED",
+    "slc_contribution": "UNESTABLISHED",
+    "combined_incremental_alpha": "UNESTABLISHED",
+    "vwap_incremental_value": "UNESTABLISHED",
+    "stochastic_incremental_value": "UNESTABLISHED",
+    "regime_drawdown_reduction": "UNESTABLISHED"
+  },
+  "market_period_tests": "NOT_RUN_NO_VERIFIED_HISTORICAL_DATA",
+  "connected_paper_execution": "NOT_RUN"
+}

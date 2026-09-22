@@ -70,7 +70,9 @@ displacement_max_bars = 3
 zone_ttl_bars = 78
 minimum_fresh_level_age_bars = 6
 max_zones_per_side = 8
+confirmation_model = "level_response"
 confirmation_window_bars = 4
+minimum_confirmation_close_location = 0.65
 stochastic_k_period = 5
 stochastic_k_smoothing = 3
 stochastic_d_period = 3
@@ -81,8 +83,10 @@ minimum_target_time_minutes = 30
 
 [warmup]
 five_minute_bars = 500
-# 加载已完成的 1 小时 Bar；结构判断始终只消费最近四根。
+# 加载已完成的 1 小时 Bar；仅用于滚动 4x1h 诊断。
 one_hour_bars = 60
+# 加载已完成的原生 4 小时 Bar；最后两根决定交易结构方向。
+four_hour_bars = 30
 
 [session]
 # 时间均为香港时间。策略自动排除午休，并在午休前使用同一平仓缓冲。

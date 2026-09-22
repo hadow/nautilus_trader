@@ -1,0 +1,44 @@
+trader_id = "INTRADAY-MOMENTUM-001"
+account_id = "LONGBRIDGE-001"
+node_name = "LONGBRIDGE-INTRADAY-MOMENTUM-001"
+papertrading = false
+max_notional_per_order = "400000"
+warmup_batches = 8
+instruments = [
+  "SPY.US.LONGBRIDGE",
+  "TTWO.US.LONGBRIDGE",
+  "APP.US.LONGBRIDGE",
+  "NVDA.US.LONGBRIDGE",
+  "MCHP.US.LONGBRIDGE",
+  "BA.US.LONGBRIDGE",
+  "U.US.LONGBRIDGE",
+  "NFLX.US.LONGBRIDGE",
+]
+
+# Optional: key each instrument by its New York ex-dividend date.
+# [dividends."SPY.US.LONGBRIDGE"]
+# "2026-03-20" = "1.80"
+[dividends]
+
+[instrument_price_increments]
+"SPY.US.LONGBRIDGE" = "0.01"
+"TTWO.US.LONGBRIDGE" = "0.01"
+"APP.US.LONGBRIDGE" = "0.01"
+"NVDA.US.LONGBRIDGE" = "0.01"
+"MCHP.US.LONGBRIDGE" = "0.01"
+"BA.US.LONGBRIDGE" = "0.01"
+"U.US.LONGBRIDGE" = "0.01"
+"NFLX.US.LONGBRIDGE" = "0.01"
+
+[strategy]
+lookback_days = 14
+volatility_multiplier = "1"
+relative_volume_threshold = "1"
+target_daily_volatility = 0.02
+max_leverage = "4"
+capital_fraction = "0.125"
+decision_interval_minutes = 30
+
+# The paper exits at 16:00. Live market orders use 15:59 to avoid an unfillable closing order.
+flatten_before_close_minutes = 1
+bars_are_final = false

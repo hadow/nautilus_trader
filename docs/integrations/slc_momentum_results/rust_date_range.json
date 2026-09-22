@@ -1,0 +1,208 @@
+{
+  "revision": "Supplied DOCX SLC fresh and once-broken level mechanisms; native inclusive date CLI",
+  "synthetic": true,
+  "alpha_verified": false,
+  "source_document": "/Users/hadow/Downloads/slc.docx",
+  "source_document_sha256": "8aaa9e2016615ac777c622ac4006d1dc34073d4c7a8f6c59406b973a3ee640a3",
+  "video_transcript_verified": false,
+  "binary_sha256": "40823a3d4c18b3ca74a89a9f26800a63e55c108ba4423a0763ec8e81dfe55f3b",
+  "fixture_events_sha256": "b57a1cf77cb1cd9f39928924f5a47fb5939e1222faea10aa948147ee87a7ea35",
+  "source_sha256": {
+    "crates/backtest/examples/slc_momentum.rs": "1839c61e3c4827f5622261216c069a8ac59b3b182f32c6d182f35a8baac8e519",
+    "crates/trading/src/examples/strategies/slc_momentum/config.rs": "1a29ce7617e3b41b3a00805406ddfd71d11cf1aece02fb1c7bcd8213371dd14d",
+    "crates/trading/src/examples/strategies/slc_momentum/data.rs": "6df8ae20894ceb23f060ebb78fb35acec1bfdd433c175d7ed8e8f8dcd293aa21",
+    "crates/trading/src/examples/strategies/slc_momentum/mod.rs": "3f78fb775926b33b9edd8fbc6b085168eaf0c9048a8cdc06036d6f4f22d9ece2",
+    "crates/trading/src/examples/strategies/slc_momentum/risk.rs": "e33bb36be0d46546c6230ddd22ace660053c9b785fe0055d5e65aff130be49a4",
+    "crates/trading/src/examples/strategies/slc_momentum/selection.rs": "7832af051372b1319f9d15b467648983ebee44dc1f3a65e1bfff1fdd82004560",
+    "crates/trading/src/examples/strategies/slc_momentum/signal.rs": "08c4b85e6d63316af02e03fce76dbaecc2cf451f9e021cc4456d4c87308eab70",
+    "crates/trading/src/examples/strategies/slc_momentum/strategy.rs": "a93e0e51a7604eb58d6cdf1b26b71d1f8052c3eece26f8c9c0e7ec78016d2ec0",
+    "crates/trading/src/examples/strategies/slc_momentum/tests.rs": "6d539fddad63b05fd7323d3b3b24b68afb4938ae7e12ab23280720b8861d3ccc"
+  },
+  "command": "target/debug/examples/slc-momentum INPUT.json OUTPUT.json --start 2025-02-18 --end 2025-02-19",
+  "requested_dates": {
+    "end": "2025-02-19",
+    "start": "2025-02-18"
+  },
+  "timezone": "America/New_York",
+  "effective_start": 1739889000000000000,
+  "effective_end": 1739998800000000000,
+  "warmup_bars": 21339,
+  "replay_events": 35118,
+  "signals": 2,
+  "trades": 2,
+  "net_pnl": "-187.72",
+  "native_booked_pnl": "-187.70",
+  "setups": {
+    "MOMENTUM_SLC_PULLBACK": 2
+  },
+  "remaining_positions": 0,
+  "remaining_orders": 0,
+  "errors": [],
+  "checks": {
+    "cash_and_event_time_audit": "PASS",
+    "entries_and_exits_within_selected_dates": "PASS",
+    "legacy_nanosecond_configuration_same_complete_report": "PASS",
+    "removing_all_events_after_end_same_complete_report": "PASS"
+  },
+  "limitations": [
+    "Invented paths, not historical returns or evidence of incremental alpha.",
+    "Both replay trades use fresh demand; the once-broken supply/demand branch is verified by deterministic unit tests.",
+    "Prior 48-run matrix and walk-forward results predate this revision and were not rerun for this date-CLI check."
+  ],
+  "metrics": {
+    "trades": 2,
+    "win_rate": 0.0,
+    "profit_factor": 0.0,
+    "expectancy": -93.86,
+    "average_r": -0.6387206532834298,
+    "median_r": -0.6387206532834298,
+    "average_winner": null,
+    "average_loser": -93.86,
+    "largest_winner": null,
+    "largest_loser": -93.87,
+    "net_pnl": -187.72,
+    "cagr": -0.4172372881170431,
+    "sharpe": -19488.704529371833,
+    "sortino": -15.87450523324258,
+    "max_drawdown": 0.0026852238945557216,
+    "calmar": -155.3826811101263,
+    "time_exposure": 0.12360515021459227,
+    "average_notional_exposure": 0.026092284331210174,
+    "turnover": 0.8424029671045288,
+    "missing_equity_sessions": [],
+    "synthetic": true,
+    "alpha_verified": false,
+    "account_rounding_delta": "0.02",
+    "cohorts": {
+      "market_regime": {
+        "NEUTRAL": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "setup_type": {
+        "MOMENTUM_SLC_PULLBACK": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "time_of_day": {
+        "11:00": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "symbol": {
+        "EEE.SIM": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "sector": {
+        "SYNTHETIC_TECH": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "momentum_percentile": {
+        "100": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "confirmation_score": {
+        "10.0": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      },
+      "volatility": {
+        "NORMAL": {
+          "trades": 2,
+          "win_rate": 0.0,
+          "profit_factor": 0.0,
+          "expectancy": -93.86,
+          "average_r": -0.6387206532834298,
+          "median_r": -0.6387206532834298,
+          "average_winner": null,
+          "average_loser": -93.86,
+          "largest_winner": null,
+          "largest_loser": -93.87,
+          "net_pnl": -187.72
+        }
+      }
+    }
+  },
+  "raw_report_sha256": "9feafdf0f91866f472d15fdadabc6bec56def8d0afa31c2e32ee80daa7c0fbb3",
+  "tests": {
+    "trading_library_passed": 505,
+    "slc_cases_in_library": 34,
+    "native_date_cli_passed": 13,
+    "backtest_example_clippy": "PASS (-D warnings)",
+    "formatting": "PASS",
+    "trading_library_clippy": "BLOCKED: 12 pre-existing momentum_pullback diagnostics; no slc_momentum diagnostics"
+  }
+}

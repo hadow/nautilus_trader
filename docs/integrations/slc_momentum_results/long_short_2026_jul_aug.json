@@ -1,0 +1,179 @@
+{
+  "status": "BLOCKED_DATA_QUOTA",
+  "observed_at": "2026-09-15T07:50:58.286705+00:00",
+  "requested_period": {
+    "start": "2026-07-01",
+    "end": "2026-08-31",
+    "timezone": "America/New_York",
+    "trading_sessions": 43
+  },
+  "strategy": {
+    "runtime": "native Rust NautilusTrader; no PyO3",
+    "directions": [
+      "LONG",
+      "SHORT"
+    ],
+    "long_selection": "strongest eligible 10%",
+    "short_selection": "weakest eligible 10%",
+    "confirmation": "HTF structure and current-session trend aligned; demand pullback or supply rally; SLC reentry, VWAP and volume",
+    "orders_submitted_to_broker": 0
+  },
+  "download_policy": {
+    "daily": "reuse existing cache and fetch only missing ranking warmup",
+    "minute": "only historical daily candidates, HTF warmup and required benchmarks",
+    "history_limit": "60 requests per 30.5 seconds with at least 510 ms spacing; common quote limit also applies",
+    "workers": 4,
+    "minimum_free_disk_gib": 3,
+    "monthly_symbol_quota_retried": false
+  },
+  "data": {
+    "universe_size": 3000,
+    "gap_response_files": 1000,
+    "gap_bars": 4904,
+    "empty_gap_responses": 19,
+    "minute_files": 0,
+    "days_with_ranking": 38,
+    "missing_ranking_dates": [
+      "2026-07-01",
+      "2026-07-02",
+      "2026-07-06",
+      "2026-07-07",
+      "2026-07-08"
+    ],
+    "daily_candidates_min": 312,
+    "daily_candidates_max": 396,
+    "candidate_and_benchmark_union": 1899,
+    "plan_sha256": "e45e6f010898f9ee496b10e3bd411d5e7248a738eb9801d29016cb59bd6ecb33",
+    "cache_root": "test_data/local/slc_momentum/2026-jul-aug",
+    "source_daily_cache": "test_data/local/slc_momentum/market-cache"
+  },
+  "api_error": {
+    "error": "response error: 7: detail:Some(WsResponseErrorDetail { code: 301607, msg: \"history candlestick symbol count out of limit, requested:1000/limit:1000\" })",
+    "observed_at": "2026-09-15T07:28:52.594351Z",
+    "request_index": 1000,
+    "symbol": "FBRT.US.LONGBRIDGE"
+  },
+  "backtest_attempt": {
+    "command": [
+      "target/debug/examples/slc-momentum",
+      "--history",
+      "test_data/local/slc_momentum/2026-jul-aug",
+      "test_data/local/slc_momentum/2026-jul-aug/result.json",
+      "--start",
+      "2026-07-01",
+      "--end",
+      "2026-08-31"
+    ],
+    "exit_code": 1,
+    "stdout": "",
+    "stderr": "Error: candidate history incomplete: A.US.LONGBRIDGE\n\nCaused by:\n    No such file or directory (os error 2)\n"
+  },
+  "backtest_complete": false,
+  "full_period_metrics": null,
+  "ablation_results": null,
+  "walk_forward_results": null,
+  "alpha_attribution": {
+    "momentum": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "slc": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "momentum_plus_slc_increment": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "vwap_increment": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "stochastic_increment": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "regime_drawdown_reduction": "NOT_ESTIMABLE_WITH_CURRENT_DATA",
+    "short_side_increment": "NOT_ESTIMABLE_WITH_CURRENT_DATA"
+  },
+  "execution_assumptions": {
+    "starting_equity": "100000",
+    "spread_bps": "4",
+    "opening_spread_multiplier": "2",
+    "quote_depth": "100",
+    "slippage_probability": 1.0
+  },
+  "limitations": [
+    "Current September security master, market capitalization and sector assignments are frozen across the requested history; this is not a point-in-time or survivorship-free universe.",
+    "Original API receipt timestamps remain in cache. Exploratory replay explicitly models historical daily availability at close; current-session opening price is assumed available at the open.",
+    "Historical ranking is frozen daily; live scanner defaults to 15-minute refresh. Their signal opportunities can differ.",
+    "No historical bid/ask, queue position or borrow/locate and recall records were obtained. OHLC-path quotes and fixed displayed depth are execution assumptions, not observed quotes.",
+    "No-adjust bars can cross corporate actions. Historical adjustment knowledge and sector classification have not been verified.",
+    "Intraday-flat borrow interest is modeled as zero; fees, margin requirements and short permissions depend on the account.",
+    "Passing synthetic engineering checks does not establish profitability or incremental alpha."
+  ],
+  "checks": {
+    "trading_library": {
+      "passed": 515,
+      "log": "/tmp/slc-dual-final-trading-tests.log"
+    },
+    "slc_final_revision": {
+      "passed": 44,
+      "log": "/tmp/slc-dual-final-slc-tests.log"
+    },
+    "longbridge_library": {
+      "passed": 25,
+      "log": "/tmp/slc-dual-final-adapter-tests.log"
+    },
+    "longbridge_example": {
+      "passed": 2,
+      "log": "/tmp/slc-dual-final-adapter-tests.log"
+    },
+    "native_backtest_date_tests": {
+      "passed": 13,
+      "log": "/tmp/slc-dual-backtest-tests.log"
+    },
+    "native_engine_and_research_integration": {
+      "passed": 11,
+      "subtests_passed": 4,
+      "log": "/tmp/slc-dual-final-integration.log",
+      "data": "invented fixtures; includes native long/short execution, four short entry modes, pending-order rotation cancellation, history CLI and missing-data refusal"
+    },
+    "clippy_longbridge": {
+      "status": "passed",
+      "log": "/tmp/slc-dual-adapter-clippy.log"
+    },
+    "clippy_native_backtest": {
+      "status": "passed",
+      "log": "/tmp/slc-dual-backtest-clippy.log"
+    },
+    "clippy_trading": {
+      "status": "blocked_by_existing_unrelated_findings",
+      "existing_momentum_pullback_errors": 12,
+      "slc_findings": 0,
+      "log": "/tmp/slc-dual-final-trading-clippy.log"
+    },
+    "rustfmt_changed_rust_files": "passed",
+    "markdown_tables": "passed",
+    "git_diff_check": "passed"
+  },
+  "disk": {
+    "free_gib": 9.1,
+    "removed_own_synthetic_scratch_mib": 64,
+    "source_daily_and_gap_cache_preserved": true
+  },
+  "resume": "Resolve available monthly historical-symbol quota first. Then resume --history-fill-ranking, regenerate --history-plan-exploratory, download --history-minutes, and run the recorded native --history command. Cached successful files are reused. Do not repeatedly retry the current quota error.",
+  "paper_next_step": "Use the updated dual-direction template to prepare a dated configuration and run --dry-run with no order submission. Verify short-capacity rejection/cancel and protective buy-to-cover with the appropriate sandbox account before enabling paper orders. Existing configurations without directions remain LONG-only.",
+  "changed_files": [
+    "crates/trading/src/examples/strategies/slc_momentum/config.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/mod.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/market.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/selection.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/signal.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/risk.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/strategy.rs",
+    "crates/trading/src/examples/strategies/slc_momentum/tests.rs",
+    "crates/adapters/longbridge/src/common/rate_limit.rs",
+    "crates/adapters/longbridge/src/data.rs",
+    "crates/adapters/longbridge/src/execution.rs",
+    "crates/adapters/longbridge/examples/node_slc_momentum.rs",
+    "crates/adapters/longbridge/examples/slc_momentum_history.rs",
+    "crates/adapters/longbridge/examples/slc_momentum_market.example.json",
+    "crates/adapters/longbridge/examples/slc_momentum_paper.example.json",
+    "crates/adapters/longbridge/Cargo.toml",
+    "Cargo.lock",
+    "crates/backtest/examples/slc_momentum.rs",
+    "crates/backtest/examples/slc_momentum_history.rs",
+    "examples/backtest/slc_momentum_research.py",
+    "examples/backtest/test_slc_momentum_market.py",
+    "docs/integrations/slc_momentum.md",
+    "docs/integrations/slc_momentum.zh-CN.md",
+    "docs/integrations/slc_momentum_results/long_short_2026_jul_aug.json"
+  ],
+  "workspace_note": "List covers this extension; the workspace already contained other modified and untracked strategy and adapter files. No commits or remote changes were made."
+}
