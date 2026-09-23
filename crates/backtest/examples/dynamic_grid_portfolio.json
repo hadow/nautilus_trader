@@ -10,7 +10,7 @@
     "kill_switch": false,
     "risk_policy": "Hold",
     "capital": "100000",
-    "max_instrument_allocation": "0.20",
+    "max_instrument_allocation": "0.30",
     "max_total_exposure": "0.70",
     "max_total_grid_exposure": "0.70",
     "max_total_equity_exposure": "0.70",
