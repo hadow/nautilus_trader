@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Passive per-instrument research observations; never used for order or risk decisions.
+//! 单标的被动研究观测；绝不参与订单或风险决策。
 
 use std::collections::BTreeMap;
 
@@ -26,48 +26,48 @@ use super::{
     regime::RegimeDetector,
 };
 
-/// Instrument diagnostics retained by the existing report/checkpoint, not a second trading ledger.
+/// 随既有报告与检查点保存的单标的诊断数据，不构成第二套交易账本。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GridDiagnostics {
-    /// Completed bar callbacks observed by the strategy.
+    /// 策略收到的已完成 K 线回调次数。
     pub bar_events: u64,
-    /// Valid quote callbacks observed by the strategy.
+    /// 策略收到的有效 Quote Tick 回调次数。
     pub quote_events: u64,
-    /// Native order lifecycle callbacks, including fills and rejects.
+    /// 原生订单生命周期回调次数，包含成交与拒单。
     pub order_events: u64,
-    /// Portfolio watchdog callbacks; one callback may inspect several instruments.
+    /// 组合 watchdog 回调次数；一次回调可能检查多个标的。
     pub timer_events: u64,
-    /// One sample per initialized completed bar, even while entries are disabled.
+    /// 每根指标已预热的完成 K 线记录一个样本，即使当时禁止入场。
     pub spacing: Vec<SpacingObservation>,
-    /// Number of initialized bars for which diagnostic spacing could not be calculated.
+    /// 指标已预热但无法计算诊断间距的 K 线数量。
     pub spacing_errors: u64,
-    /// Immutable grid plans at creation, including prices and lot-rounded zero quantities.
+    /// 网格创建时的不可变计划，包含价格及按 lot 取整后为零的数量。
     pub grids: Vec<GridEngine>,
-    /// Completed resets only, after the cancellation reconciliation barrier.
+    /// 仅记录通过撤单对账屏障后的已完成重置。
     pub resets: Vec<ResetObservation>,
-    /// Dispatched cancellation requests, not confirmed cancellations or hypothetical fills.
+    /// 已发送的撤单请求，不代表撤单确认，也不虚构成交。
     pub cancellations: Vec<CancelObservation>,
-    /// Actual rejection/denial observations keyed by stable client order identity.
+    /// 以稳定客户端订单标识为键的真实拒单/否决观测。
     pub rejections: BTreeMap<String, RejectionObservation>,
-    /// Broker cancellation failures, distinct from order rejections.
+    /// 券商撤单失败次数，与订单提交拒绝分开统计。
     pub cancel_rejections: BTreeMap<String, RejectionObservation>,
-    /// First observed timestamp per instrument hard-stop reason; legacy history is not invented.
+    /// 各单标的硬停原因首次出现的时间戳；不虚构旧版本缺失历史。
     pub risk_stops: BTreeMap<String, u64>,
-    /// Completed bars blocked by the first applicable entry filter, not elapsed time.
+    /// 被首个适用入场过滤器阻止的已完成 K 线数，而非自然流逝时间。
     pub blocked_bars: BTreeMap<String, ObservationCount>,
-    /// Sizing/admission attempts reduced to zero, not broker rejections or unique signals.
+    /// 被仓位计算或准入缩减为零的尝试次数，不等同于券商拒单或独立信号数。
     pub zero_admissions: BTreeMap<String, ObservationCount>,
 }
 
-/// Counts observations without pretending consecutive bars are independent trade opportunities.
+/// 统计观测次数，不把连续 K 线错误当作相互独立的交易机会。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ObservationCount {
-    /// Number of observations.
+    /// 观测次数。
     pub count: u64,
-    /// First observed timestamp.
+    /// 首次观测时间戳。
     pub first_ns: u64,
-    /// Last observed timestamp.
+    /// 最近一次观测时间戳。
     pub last_ns: u64,
 }
 
@@ -82,73 +82,73 @@ impl ObservationCount {
     }
 }
 
-/// Prospective spacing and frozen active spacing are deliberately separate.
+/// 有意将前瞻候选间距与当前网格冻结间距分开记录。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpacingObservation {
-    /// Completed signal bar timestamp.
+    /// 已完成信号 K 线时间戳。
     pub ts_ns: u64,
-    /// ATR known at that timestamp, before any future bar.
+    /// 该时刻已经可知的 ATR，不包含未来 K 线。
     pub atr: Decimal,
-    /// Completed bar close used for this diagnostic calculation.
+    /// 本次诊断计算使用的已完成 K 线收盘价。
     pub price: Decimal,
-    /// Spacing before the min/max/cost clamps, including the configured trend multiplier.
+    /// 应用最小/最大/成本约束前的间距，已包含趋势倍数。
     pub raw: Decimal,
-    /// Prospective spacing after all clamps; this does not move an existing grid.
+    /// 应用全部约束后的候选间距；该值不会移动现有网格。
     pub effective: Decimal,
-    /// Frozen spacing of the active grid after this bar; None if no grid exists.
+    /// 处理本 K 线后有效网格的冻结间距；没有网格时为 None。
     pub active: Option<Decimal>,
 }
 
-/// A reconciled reset and its original generation's actual acquisition history.
+/// 一次已对账重置及其原网格代次的真实买入历史。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResetObservation {
-    /// Completion timestamp, which may be later than the original reset signal.
+    /// 重置完成时间戳，可能晚于原始重置信号。
     pub ts_ns: u64,
-    /// Retired generation.
+    /// 已退出的网格代次。
     pub grid_id: u64,
-    /// Original selected trigger; priority remains up, down, regime, then volatility.
+    /// 原始触发原因；优先级依次为向上突破、向下突破、状态变化、波动率变化。
     pub reason: String,
-    /// Fresh mark at reset completion.
+    /// 重置完成时的新鲜估值价格。
     pub price: Decimal,
-    /// Distinct buy orders with any actual fill, including partial fills and seed inventory.
+    /// 至少有一次真实成交的独立买单数，包含部分成交与种子库存。
     pub entry_orders_with_fills: usize,
-    /// Subset on negative levels, excluding positive-level seed acquisitions.
+    /// 其中位于负层级的数量，不包含正层级种子库存买入。
     pub lower_entry_orders_with_fills: usize,
 }
 
-/// One dispatched cancellation, with causal (possibly stale) market context.
+/// 一笔已发送撤单及其因果市场上下文；行情可能已经过期。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CancelObservation {
-    /// Dispatch timestamp.
+    /// 撤单发送时间戳。
     pub ts_ns: u64,
-    /// Stable native client order identity.
+    /// 稳定的原生客户端订单标识。
     pub order_id: String,
-    /// Generation owning the order, not necessarily the current grid.
+    /// 订单所属网格代次，不一定是当前网格。
     pub grid_id: u64,
-    /// Signed level index.
+    /// 有符号层级索引。
     pub level: i32,
-    /// Whether the order acquires inventory.
+    /// 该订单是否用于新增库存。
     pub buy: bool,
-    /// Caller-provided cancellation cause, not inferred from later state.
+    /// 调用方当时提供的撤单原因，不从后续状态倒推。
     pub reason: String,
-    /// Quantity already filled when requesting cancellation.
+    /// 请求撤单时已经成交的数量。
     pub filled: Decimal,
-    /// Last available market mark.
+    /// 当时最近可用的市场估值价格。
     pub price: Option<Decimal>,
-    /// Timestamp of that mark; do not treat an overnight watchdog mark as a fresh quote.
+    /// 该估值时间戳；不能把隔夜 watchdog 使用的旧价格当作新鲜报价。
     pub mark_ns: u64,
-    /// Highest-priced negative entry level, only for the matching active generation.
+    /// 匹配有效网格代次时，价格最高的负层级入场价。
     pub first_buy_level: Option<Decimal>,
-    /// (Mark - first buy level) / first buy level; negative means already below it.
+    /// `(市价 - 首个买入层) / 首个买入层`；负值表示价格已经低于该层。
     pub first_buy_distance_pct: Option<Decimal>,
 }
 
-/// The first real rejection observed for an order identity.
+/// 每个订单标识观测到的第一条真实拒绝记录。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RejectionObservation {
-    /// Local observation timestamp.
+    /// 本地观测时间戳。
     pub ts_ns: u64,
-    /// Native engine/broker reason, retaining the rejection-versus-denial prefix.
+    /// 原生执行引擎或券商返回的原因，并保留 rejection/denial 类型前缀。
     pub reason: String,
 }
 

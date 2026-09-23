@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Causal completed-bar regime detection with a bounded, recoverable observation window.
+//! 仅使用已完成 K 线的因果市场状态识别，并保留有界历史以支持精确恢复。
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -28,78 +28,78 @@ use serde::{Deserialize, Serialize};
 
 use super::config::{GridConfig, RegimeAverage, TrendPolicy};
 
-/// Market state used by the grid policy.
+/// 网格策略使用的市场状态。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MarketRegime {
-    /// Low directional strength and bounded volatility.
+    /// 方向性较弱，且波动率处于允许范围。
     Range,
-    /// Strong positive slope.
+    /// 方向强度和正斜率均达到上升趋势阈值。
     TrendUp,
-    /// Strong negative slope.
+    /// 方向强度和负斜率均达到下降趋势阈值。
     TrendDown,
-    /// ATR, bandwidth or realized volatility exceeds its limit.
+    /// ATR、布林带宽度或已实现波动率超过上限。
     HighVolatility,
-    /// Indicators are warm, but ATR/price is below the configured entry threshold.
+    /// 指标已预热，但 ATR/价格低于允许入场的下限。
     LowVolatility,
-    /// Warm-up, ambiguous regime or a risk restriction.
+    /// 指标预热中、状态无法明确分类，或风险条件禁止交易。
     #[default]
     Disabled,
 }
 
-/// Completed OHLC observation. Timestamps identify bar close, not bar open.
+/// 已完成的 OHLC 观测；时间戳表示 K 线收盘而非开盘时刻。
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Observation {
-    /// Close timestamp in nanoseconds.
+    /// 收盘时间戳，单位为纳秒。
     pub ts_ns: u64,
-    /// Observed high.
+    /// 已观测最高价。
     pub high: f64,
-    /// Observed low.
+    /// 已观测最低价。
     pub low: f64,
-    /// Observed close.
+    /// 已观测收盘价。
     pub close: f64,
 }
 
-/// Signals based only on completed observations.
+/// 完全基于已完成观测生成的市场状态快照。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RegimeSnapshot {
-    /// Most recent completed timestamp.
+    /// 最近一根已完成 K 线的时间戳。
     pub ts_ns: u64,
-    /// Whether every indicator is warm.
+    /// 所有指标是否均已完成预热。
     pub initialized: bool,
-    /// Current classification.
+    /// 当前市场状态分类。
     pub regime: MarketRegime,
-    /// ATR in price units.
+    /// 以价格单位表示的 ATR。
     pub atr: f64,
-    /// ADX on a 0..100 scale.
+    /// 取值范围为 0–100 的 ADX。
     pub adx: f64,
-    /// (Upper - lower) / middle Bollinger bandwidth.
+    /// 布林带宽度，即 `(上轨 - 下轨) / 中轨`。
     pub bollinger_width: f64,
-    /// MA fractional change per bar over the slope window.
+    /// 斜率窗口内，移动平均每根 K 线的比例变化。
     pub ma_slope: f64,
-    /// Selected native moving average, replayed from the bounded completed-bar window.
+    /// 从有界已完成 K 线窗口重放得到的移动平均值。
     #[serde(default)]
     pub moving_average: f64,
-    /// Current completed close / moving average minus one.
+    /// 当前已完成收盘价相对移动平均的偏离比例。
     #[serde(default)]
     pub price_ma_distance: f64,
-    /// Standard deviation of completed-bar log returns, not annualized.
+    /// 已完成 K 线对数收益率的标准差，不做年化。
     pub realized_volatility: f64,
 }
 
-/// Bounded replay makes recovered indicator values identical to uninterrupted values.
+/// 通过有界历史重放，使恢复后的指标值与未中断运行保持一致。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RegimeDetector {
     observations: VecDeque<Observation>,
-    /// Latest causal signal snapshot.
+    /// 最近一次因果信号快照。
     pub snapshot: RegimeSnapshot,
 }
 
 impl RegimeDetector {
-    /// Recomputes persisted indicators from their completed-bar history before recovery.
+    /// 恢复前使用持久化的已完成 K 线历史重新计算指标。
     ///
     /// # Errors
     ///
-    /// Rejects invalid observations, excessive history or a snapshot inconsistent with its inputs.
+    /// 观测无效、历史超出上限，或快照与输入历史不一致时拒绝恢复。
     pub(super) fn validate(&self, config: &GridConfig) -> anyhow::Result<()> {
         let capacity = 5 * (config.atr_period + config.adx_period)
             + config.ma_period
@@ -130,7 +130,7 @@ impl RegimeDetector {
             (actual.price_ma_distance, expected.price_ma_distance),
             (actual.realized_volatility, expected.realized_volatility),
         ] {
-            // JSON may round floating-point indicator inputs by one ULP; prices/orders stay Decimal.
+            // JSON 可能使浮点指标输入产生一个 ULP 的舍入误差；价格和订单金额仍使用 Decimal。
             anyhow::ensure!(
                 a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-10 * b.abs().max(1.0),
                 "Recovered indicator differs from completed observations"
@@ -139,7 +139,7 @@ impl RegimeDetector {
         Ok(())
     }
 
-    /// Applies the same trend restriction to outstanding orders and new intents.
+    /// 对未完成订单和新订单意图应用同一套趋势限制。
     #[must_use]
     pub fn permits_order(&self, config: &GridConfig, buy: bool, level: i32) -> bool {
         let policy = self.policy(config);
@@ -160,11 +160,11 @@ impl RegimeDetector {
         true
     }
 
-    /// Updates on a strictly later completed bar.
+    /// 只接受时间戳严格递增的已完成 K 线。
     ///
     /// # Errors
     ///
-    /// Returns an error on nonfinite/invalid OHLC or out-of-order observations.
+    /// OHLC 非有限、价格关系无效或观测乱序时返回错误。
     pub fn update(
         &mut self,
         config: &GridConfig,
@@ -193,8 +193,8 @@ impl RegimeDetector {
             self.observations.pop_front();
         }
 
-        // ponytail: bounded O(window) replay preserves exact restart parity without changing
-        // shared indicator types; add serializable indicator checkpoints if profiling requires it.
+        // ponytail: 有界 O(window) 重放无需修改共享指标类型即可保证重启一致性；
+        // 只有性能采样证明这里成为瓶颈时，才增加可序列化的指标检查点。
         let mut atr = AverageTrueRange::new(
             config.atr_period,
             Some(MovingAverageType::Wilder),
@@ -313,7 +313,7 @@ impl RegimeDetector {
         Ok(&self.snapshot)
     }
 
-    /// Effective directional policy for the most recent signal.
+    /// 最近一次信号对应的实际趋势策略。
     #[must_use]
     pub fn policy(&self, config: &GridConfig) -> TrendPolicy {
         match self.snapshot.regime {

@@ -1,7 +1,9 @@
-# Dynamic Adaptive Grid：实现与验收说明
+# Stock Adaptive Dynamic Grid（SADG）：实现与验收说明
 
-本策略现已扩展为单实例多标的组合；最新配置、共享风险和 version 2 恢复说明见
-[Multi-Asset Dynamic Grid](dynamic_grid_portfolio.zh-CN.md)。本文的单股票历史结果保留为之前的基线，不代表组合表现。
+本策略在保留 Legacy DGT 动态重建基准的同时，增加适用于美股的 SADG 模式。SADG 使用常规交易时段、
+跳空/流动性过滤、ATR 总宽度、突破确认、Core + Grid 目标仓位和共享组合风控；未引入 Fibonacci。
+最新配置、共享风险和 version 6 恢复说明见
+[Multi-Asset Dynamic Grid](dynamic_grid_portfolio.zh-CN.md)。本文后面的旧单股票结果仅保留为历史基线。
 
 ## 1. 交付边界
 
@@ -36,8 +38,8 @@
 ## 3. 架构和当前 API
 
 ```text
-已完成 Bar -> RegimeDetector + ATR/波动率 -> GridEngine
-Tick/Bar -> DynamicGridStrategy -> OrderManager + RiskManager
+已完成 Bar -> Session/Gap/Liquidity -> RegimeDetector + ATR/波动率 -> GridEngine
+Tick/Bar -> TargetPosition(Core + Grid) -> OrderManager + RiskManager
                                  -> 原生 Strategy Order API
                                     -> Nautilus Risk / Execution / Account / Position
                                        -> Backtest / Sandbox / Longbridge
@@ -49,7 +51,8 @@ Tick/Bar -> DynamicGridStrategy -> OrderManager + RiskManager
 使用已有 ATR、DirectionalMovement、Wilder MA、SMA、Bollinger 指标；不重复建立指标或订单框架。
 
 状态：Initializing → Recovering → WaitingForRange → GridActive。
-重建时 GridActive → GridResetting → GridActive/WaitingForRange。
+股票适配路径可进入 BreakoutPending / Paused；重建时
+GridActive → BreakoutPending → GridResetting → GridActive/WaitingForRange。
 风险时进入 RiskOff，Flatten 策略先进入 RiskReducing；未知/不一致状态进入 Recovering。
 停止只撤销本策略订单，不自动卖出全部账户资产。
 
@@ -74,7 +77,8 @@ Tick/Bar -> DynamicGridStrategy -> OrderManager + RiskManager
 间距：
 
 - Percentage：spacing_pct。
-- Atr：ATR/current_price*atr_multiplier。
+- LegacyDgt 的 Atr：相邻层间距为 ATR/current_price*atr_multiplier。
+- StockAdaptive 的 Atr：先计算总宽度 ATR*atr_multiplier，再除以 grid_levels 得到相邻层间距。
 - WiderGrid：在允许重建时增加趋势间距。
 - 所有模式受 min/max spacing 和成本下界约束。
 
@@ -148,7 +152,7 @@ Submitted != Filled；部分成交来自当前 API 的 OrderFilled.last_qty，�
 (order_id,trade_id) 去重；重复确认不能倒退终态；撤单请求不能提前释放资金/库存。
 每个 cycle 输出 entry_price、exit_price、quantity、gross_pnl、execution_pnl、fees、slippage、net_pnl、holding_ns。
 
-checkpoint 使用独占文件锁、临时文件写入、fsync、原子 rename、目录 fsync。
+checkpoint version 6 使用独占文件锁、临时文件写入、fsync、原子 rename、目录 fsync。
 每个完成 Bar 保存指标/风险状态，新的权益高水位和日边界也立即保存，避免重启遗忘已观察到的风险基准。
 提交前先保存意图和原生初始化订单；账户/原生持仓/订单依然由 Nautilus 管理。
 runner 在 broker reconciliation 前恢复原生 cache，启动后重放缺失的已知成交并验证 filled_qty、库存和归属。
@@ -171,9 +175,9 @@ Nautilus 在组件停止后不再分发策略回调；runner 排空停机事件�
 当前 Longbridge 成交事件无法提供完整实际费用时，按配置的保守费率估计，报告 estimated_fee_fills。
 因此远端报告不能代替券商交割单；平台费、最低佣金、税费、币种转换尚未逐项对账。
 
-`gross_pnl` 定义为意图价格的毛收益，`slippage` 是带符号 execution shortfall，价格改善可为负；
-`execution_pnl` 是实际成交价差，`net_pnl=gross_pnl-fees-slippage=execution_pnl-fees`，不重复扣滑点。
-总收益使用终端 cash+mark-to-market inventory，完整 cycle 的已实现收益单独展示。
+`gross_pnl` 定义为已实现成交的意图价格毛收益，`slippage` 是带符号 execution shortfall；
+另输出非负 `slippage_cost` 和 `price_improvement`，避免把价格改善误称为负成本。
+已实现账本满足 `realized=gross-fees-slippage`；总 `net_pnl` 还包含期末按市值计价的未实现 PnL。
 
 报告包括用户要求的 Return、CAGR/annualized return、Sharpe、Sortino、MDD、Calmar、win rate、
 profit factor、交易/网格周期数、平均持有期、费用、滑点、资金利用率、最大敞口/持仓/reset、
@@ -230,6 +234,7 @@ Monte Carlo 固定 seed：
 | --- | --- |
 | grid_levels / position_sizing | 10 每侧 / Equal |
 | spacing_mode / atr_period / atr_multiplier | Atr / 14 / 0.75 |
+| strategy_mode / core_target_pct / grid_max_pct | LegacyDgt / 0.40 / 0.60 |
 | min_spacing_pct / max_spacing_pct | 0.005 / 0.03 |
 | capital / capital_allocation | 100000 / 0.20 |
 | max_position / max_position_pct | 1000 股 / 0.20 |
@@ -238,10 +243,12 @@ Monte Carlo 固定 seed：
 | max_drawdown / max_daily_loss / max_unrealized_loss | 0.10 / 0.03 / 0.08 |
 | max_consecutive_resets / max_orders / max_grid_levels | 5 / 40 / 30 |
 | minimum_reset_distance / minimum_reset_interval_secs | 0.01 / 300 |
+| breakout_confirmation_bars / regime_confirmation_bars | 2 / 3 |
 | adx_range_max / adx_trend_min | 20 / 25 |
 | trend_up_policy / trend_down_policy | ReduceGrid / Disable |
 | enable_dynamic_reset / enable_trend_filter / enable_volatility_filter | true / true / true |
 | initial_inventory_fraction / risk_policy | 0 / Hold |
+| regular_session_only / max_gap_pct / gap_recovery_bars | true / 0.08 / 5 |
 | maker_fee / taker_fee / commission / slippage | 0.0008 / 0.001 / 0 / 0.0005 |
 | minimum_profit_margin / order_timeout_secs / max_signal_age_secs | 0.0005 / 30 / 180 |
 
@@ -298,6 +305,13 @@ Paper 验收顺序：核对账户/资金/标的与费用 → 空账户、小预�
 不要通过删除 checkpoint、换新 ID 或自动解锁 RiskOff 来绕过恢复失败。
 
 ## 12. 分阶段验证与实际结果
+
+当前 SADG 回归：dynamic_grid 单元测试 85/85 通过，原生集成测试 75/75 通过；另有 4 项显式忽略的
+性能回归检查已单独运行通过。SADG 相关 crate 严格 Clippy 通过，backtest 目标在 `--no-deps -D warnings`
+下通过；全 workspace/all-targets 仍被未改动的 `momentum_pullback` 既有 lint 阻挡。
+最新 AAPL+MSFT 组合比较与负向研究结论见组合文档。
+
+以下阶段计数和 AAPL 表格是早期 Legacy DGT 交付记录，不代表当前 SADG 配置：
 
 阶段 1 检查仓库/API/Longbridge 和基线（旧 grid_mm 25 tests）；阶段 2 形成上述架构。
 阶段 3–6 逐步构建并测试 grid、regime、risk、orders；阶段 7 接入原生 Strategy；

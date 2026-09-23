@@ -76,6 +76,27 @@ pub enum Benchmark {
     BuyHold,
 }
 
+pub(super) fn set_strategy_mode_preserving_atr_spacing(
+    config: &mut GridConfig,
+    mode: StrategyMode,
+) -> anyhow::Result<()> {
+    if config.spacing_mode == SpacingMode::Atr && config.strategy_mode != mode {
+        let levels = Decimal::from(config.grid_levels);
+        config.atr_multiplier = match (config.strategy_mode, mode) {
+            (StrategyMode::LegacyDgt, StrategyMode::StockAdaptive) => config
+                .atr_multiplier
+                .checked_mul(levels)
+                .ok_or_else(|| anyhow::anyhow!("ATR multiplier overflow"))?,
+            (StrategyMode::StockAdaptive, StrategyMode::LegacyDgt) => {
+                config.atr_multiplier / levels
+            }
+            _ => config.atr_multiplier,
+        };
+    }
+    config.strategy_mode = mode;
+    Ok(())
+}
+
 /// Explicit market metadata and economics for a research run.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -330,11 +351,17 @@ pub fn run_grid_backtest(
             strategy_config.tick_execution = !quotes.is_empty();
             match benchmark {
                 Benchmark::LegacyDgt => {
-                    strategy_config.grid.strategy_mode = StrategyMode::LegacyDgt;
+                    set_strategy_mode_preserving_atr_spacing(
+                        &mut strategy_config.grid,
+                        StrategyMode::LegacyDgt,
+                    )?;
                     strategy_config.grid.enable_dynamic_reset = true;
                 }
                 Benchmark::Sadg => {
-                    strategy_config.grid.strategy_mode = StrategyMode::StockAdaptive;
+                    set_strategy_mode_preserving_atr_spacing(
+                        &mut strategy_config.grid,
+                        StrategyMode::StockAdaptive,
+                    )?;
                     strategy_config.grid.enable_dynamic_reset = true;
                 }
                 Benchmark::Fixed => {

@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Native Nautilus strategy; execution mode is selected by the runner, never by signal logic.
+//! NautilusTrader 原生动态网格策略；运行环境由 runner 选择，信号逻辑不区分回测或实盘。
 
 use std::{cell::RefCell, collections::BTreeSet, path::PathBuf, rc::Rc};
 
@@ -49,34 +49,34 @@ use super::{
 };
 use crate::strategy::{Strategy, StrategyConfig, StrategyNative};
 
-/// Runtime wiring shared by historical, sandbox, paper and live runners.
+/// 历史回测、sandbox、模拟盘和实盘 runner 共用的运行配置。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicGridConfig {
-    /// Nautilus identity and order ownership.
+    /// NautilusTrader 策略身份与订单所有权配置。
     pub base: StrategyConfig,
-    /// Single exclusively owned spot/equity instrument.
+    /// 由本引擎独占管理的单个现货或股票标的。
     pub instrument_id: InstrumentId,
-    /// Completed signal bars.
+    /// 产生因果信号的已完成 K 线类型。
     pub bar_type: BarType,
-    /// Economic and risk configuration.
+    /// 网格经济参数与单标的风险配置。
     #[serde(default)]
     pub grid: GridConfig,
-    /// True when the data source publishes confirmed `BarWithVwap` instead of final ordinary bars.
+    /// 数据源发布已确认 `BarWithVwap` 而非普通最终 K 线时设为 true。
     #[serde(default)]
     pub confirmed_custom_bars: bool,
-    /// Execute on quotes/trades using the latest completed-bar regime.
+    /// 是否用最新已完成 K 线状态，在 Quote/Trade Tick 上触发执行判断。
     #[serde(default)]
     pub tick_execution: bool,
-    /// Optional durable checkpoint. Required by the supplied paper/live runner.
+    /// 可选持久化检查点；随附的模拟盘与实盘 runner 必须配置。
     pub state_path: Option<PathBuf>,
-    /// Runner-owned account/environment identity, preventing cross-account checkpoint reuse.
+    /// 由 runner 提供的账户/环境身份，防止跨账户误用检查点。
     #[serde(default)]
     pub recovery_context: Option<String>,
 }
 
 impl DynamicGridConfig {
-    /// Conservative preset with explicit instrument and completed-bar type.
+    /// 使用明确标的和已完成 K 线类型创建保守默认配置。
     #[must_use]
     pub fn new(instrument_id: InstrumentId, bar_type: BarType) -> Self {
         Self {
@@ -98,49 +98,66 @@ impl DynamicGridConfig {
     }
 }
 
-/// Explicit strategy lifecycle.
+/// 显式策略状态机；状态迁移代替相互冲突的布尔开关。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyState {
-    /// Runtime has not supplied accounts/instruments yet.
+    /// 运行时尚未提供账户或标的信息。
     Initializing,
-    /// Indicators or regime do not permit opening inventory.
+    /// 指标未预热或市场状态不允许新增库存。
     WaitingForRange,
-    /// A boundary was crossed but the configured completed-close count is not yet satisfied.
+    /// 已越过网格边界，但连续收盘确认数量尚未满足。
     BreakoutPending,
-    /// Stock-specific conditions forbid new grid inventory while exits remain available.
+    /// 股票时段、跳空或流动性条件禁止新增网格库存，但仍允许减仓卖出。
     Paused,
-    /// A current grid may trade.
+    /// 当前网格可以正常交易。
     GridActive,
-    /// Old orders must become terminal before rebuilding.
+    /// 正在撤销旧网格订单；全部终结前不得建立新网格。
     GridResetting,
-    /// Waiting for cancellation before a covered liquidation.
+    /// 风险减仓中，等待撤单确认后再执行有库存覆盖的卖出。
     RiskReducing,
-    /// New buys are forbidden by a latched risk failure.
+    /// 已锁存风险失败，禁止新增买单。
     RiskOff,
-    /// Broker/cache and durable state must agree before trading.
+    /// 交易前必须使券商、Nautilus 缓存与持久化状态一致。
     Recovering,
-    /// No new orders are allowed.
+    /// 策略已停止，不允许产生新订单。
     Stopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct GridState {
+    /// 当前策略状态机节点。
     pub(super) state: StrategyState,
+    /// 当前有效网格；重置或等待状态下可以为空。
     pub(super) grid: Option<GridEngine>,
+    /// 仅由已完成 K 线更新、可重放恢复的市场状态检测器。
     pub(super) regime: RegimeDetector,
+    /// 订单、库存批次与周期盈亏的唯一策略账本。
     pub(super) orders: OrderManager,
+    /// 单标的风险高水位、日损失和重置预算。
     pub(super) risk: RiskManager,
+    /// 单调递增的网格代次，用于隔离旧网格订单。
     pub(super) generation: u64,
+    /// 创建当前网格时的市场状态，不随每根 K 线漂移。
     pub(super) grid_regime: MarketRegime,
+    /// 当前等待执行或最近完成的重置原因。
     pub(super) reset_reason: Option<String>,
+    /// 最近可用市场价格。
     pub(super) last_price: Option<Decimal>,
+    /// 最近市场事件时间戳，用于行情新鲜度判断。
     pub(super) last_market_ns: u64,
     #[serde(default)]
+    /// 最近一次 Tick 驱动决策的事件时间戳，用于事件去重。
     pub(super) last_tick_event_ns: u64,
+    /// 已经纳入风险连续重置判断的完成周期数量。
     pub(super) completed_cycles: usize,
     #[serde(default)]
+    /// 当前核心仓、网格仓及合计目标仓位。
     pub(super) position_target: PositionTarget,
     #[serde(default)]
+    /// 当前市场状态连续稳定的已完成 K 线数量。
+    pub(super) regime_confirmation_bars: u32,
+    #[serde(default)]
+    /// 美股时段、跳空、流动性与突破确认状态。
     pub(super) stock: StockMarketState,
 }
 
@@ -169,6 +186,7 @@ impl GridStrategyEngine {
                 last_tick_event_ns: 0,
                 completed_cycles: 0,
                 position_target: PositionTarget::default(),
+                regime_confirmation_bars: 0,
                 stock: StockMarketState::default(),
             },
             config,
@@ -177,11 +195,11 @@ impl GridStrategyEngine {
         }
     }
 
-    /// Resets a latched risk state only after an operator has reconciled all orders and inventory.
+    /// 仅在操作员完成订单与库存对账后，显式解除已锁存的风险状态。
     ///
     /// # Errors
     ///
-    /// Returns an error while orders are unresolved, no mark exists, or current limits still fail.
+    /// 仍有未终结订单、缺少市场价格，或当前暴露仍违反限制时返回错误。
     pub(super) fn reset_risk(
         &mut self,
         runtime: &mut MultiAssetGridStrategy,
@@ -240,7 +258,7 @@ impl GridStrategyEngine {
         if let Err(e) = runtime.persist_engine(self, None) {
             log::error!("Checkpoint failed: {e}");
         }
-        // Cancellation reduces exposure even if durable storage has failed
+        // 即使持久化失败也先执行撤单，以立即降低潜在风险暴露。
         for id in self.state.orders.active_ids() {
             if !self.state.orders.orders()[&id].buy {
                 continue;
@@ -280,7 +298,7 @@ impl GridStrategyEngine {
             .ok_or_else(|| anyhow::anyhow!("Instrument unavailable"))?;
         let currency = instrument.quote_currency();
 
-        // Read current values without cloning the account's growing event history
+        // 只读取账户当前值，避免复制持续增长的账户事件历史。
         let (account_id, free) = {
             let cache = runtime.strategy_core().cache_ref();
             let account = cache
@@ -421,7 +439,7 @@ impl GridStrategyEngine {
         self.submit(runtime, &intent)
     }
 
-    /// Moves filled inventory toward a lower regime target without ever selling an unfilled lot.
+    /// 将真实成交库存降至更低的市场状态目标，绝不卖出尚未成交的数量。
     fn reduce_component_to(
         &mut self,
         runtime: &mut MultiAssetGridStrategy,
@@ -502,7 +520,7 @@ impl GridStrategyEngine {
         lot_size: Decimal,
         now: u64,
     ) -> anyhow::Result<bool> {
-        // Tactical inventory is reduced before the long-lived core sleeve.
+        // 降低目标仓位时先卖战术网格仓，最后才触及长期核心仓。
         let grid = self.reduce_component_to(
             runtime,
             PositionComponent::Grid,
@@ -679,7 +697,7 @@ impl GridStrategyEngine {
                 "FINAL_ORDER_GATE",
                 runtime.clock().timestamp_ns().as_u64(),
             );
-            // No native order exists yet: defer without retaining an empty inventory lot
+            // 原生订单尚未创建：延后处理，并删除没有成交的空库存批次。
             if let Some(grid) = &mut self.state.grid {
                 for level in &mut grid.levels {
                     if level.entry_order_id.as_deref() == Some(&intent.id) {
@@ -1017,7 +1035,10 @@ impl GridStrategyEngine {
             }
         }
         // 这是行情准入而非最终下单许可，单标的风控、组合风控和原生 RiskEngine 仍可否决
+        let regime_confirmed = config.strategy_mode != StrategyMode::StockAdaptive
+            || self.state.regime_confirmation_bars >= config.regime_confirmation_bars;
         let can_buy = !stale
+            && regime_confirmed
             && !matches!(
                 regime,
                 MarketRegime::Disabled | MarketRegime::HighVolatility
@@ -1111,8 +1132,8 @@ impl GridStrategyEngine {
             if !self.state.orders.active_ids().is_empty() || stale {
                 return Ok(());
             }
-            // Retain the already-confirmed reset event during cancellation. The new anchor must
-            // use a fresh price, but a retracement does not erase the earlier boundary crossing.
+            // 撤单期间保留已确认的重置事件。新锚点必须使用新鲜价格，但价格回撤不能抹掉
+            // 先前已经确认的边界突破。
             if let Some(reason) = self.state.risk.reset_limit(&config) {
                 self.state.risk.trip(reason);
                 return self.drive(runtime, price, now);
@@ -1468,15 +1489,24 @@ impl GridStrategyEngine {
         }
         let prior_atr =
             Decimal::from_f64_retain(self.state.regime.snapshot.atr).unwrap_or(Decimal::ZERO);
-        let stock_bar = stock_adaptive
-            && self.state.stock.observe_bar(
+        let (stock_bar, opening_gap) = if stock_adaptive {
+            self.state.stock.observe_bar(
                 &self.config.grid,
                 bar.ts_event.as_u64(),
                 bar.open.as_decimal(),
                 bar.close.as_decimal(),
                 bar.volume.as_decimal(),
                 prior_atr,
-            );
+            )
+        } else {
+            (false, None)
+        };
+        if let Some(change) = opening_gap {
+            let pnl = self.state.orders.inventory() * change;
+            let mut report = self.report.borrow_mut();
+            report.metrics.gap_pnl += pnl;
+            report.metrics.gap_loss += (-pnl).max(Decimal::ZERO);
+        }
         let previous = self.state.regime.snapshot.regime;
         // 只消费已结束且时间递增的信号 K 线，Tick 模式同样不使用未收盘指标
         self.state.regime.update(
@@ -1493,7 +1523,11 @@ impl GridStrategyEngine {
             bar.ts_event.as_u64(),
             bar.close.as_decimal(),
         );
-        if previous != self.state.regime.snapshot.regime {
+        if previous == self.state.regime.snapshot.regime {
+            self.state.regime_confirmation_bars =
+                self.state.regime_confirmation_bars.saturating_add(1);
+        } else {
+            self.state.regime_confirmation_bars = 1;
             log::info!(
                 "REGIME_CHANGED timestamp_ns={now} symbol={} from={previous:?} to={:?}",
                 self.config.instrument_id,
@@ -1540,6 +1574,10 @@ impl GridStrategyEngine {
             Some(gate.reason().to_string())
         } else if !self.state.regime.snapshot.initialized {
             Some("SIGNAL_WARMUP".to_string())
+        } else if stock_adaptive
+            && self.state.regime_confirmation_bars < self.config.grid.regime_confirmation_bars
+        {
+            Some("REGIME_CONFIRMATION".to_string())
         } else if !is_fresh(
             self.state.regime.snapshot.ts_ns,
             now,
@@ -1788,6 +1826,22 @@ impl GridStrategyEngine {
             self.cancel(runtime, true, "STALE_MARK")?;
         }
         Ok(())
+    }
+
+    pub(super) fn watchdog_required(&self, now: u64) -> bool {
+        self.state
+            .orders
+            .timed_out(self.config.grid.order_timeout_secs, now)
+            || (!is_fresh(
+                self.state.last_market_ns,
+                now,
+                self.config.grid.max_signal_age_secs,
+            ) && self
+                .state
+                .orders
+                .active_ids()
+                .iter()
+                .any(|id| self.state.orders.orders()[id].buy))
     }
 
     pub(super) fn on_socket_state(

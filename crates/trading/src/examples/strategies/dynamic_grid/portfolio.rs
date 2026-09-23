@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Shared-capital order admission, causal correlation and throttled instrument budgets.
+//! 共享资金订单准入、因果相关性控制与带节流的单标的动态预算。
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,57 +29,57 @@ use super::{
 
 const DAY_NS: u64 = 86_400_000_000_000;
 
-/// Account-level fractions apply to current marked equity, not each instrument's virtual cash.
+/// 账户级比例以当前组合权益为分母，而不是各标的虚拟现金。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PortfolioConfig {
-    /// Initial shared capital; external deposits require an audited restart/migration.
+    /// 共享初始资金；外部入金必须通过可审计的重启或迁移流程处理。
     pub capital: Decimal,
-    /// Maximum per-order cost including reservations; also enforced by native execution risk.
+    /// 单笔订单最大成本，包含预留；原生执行风控也会再次检查。
     pub max_order_value: Decimal,
-    /// Native submission throttle per rolling minute, covering buys and sells.
+    /// 滚动一分钟内的原生订单提交上限，买卖订单均计入。
     pub max_orders_per_minute: usize,
-    /// Maximum symbols with filled inventory or unresolved acquisitions.
+    /// 同时存在真实库存或未终结买单的最大标的数量。
     pub max_concurrent_symbols: usize,
-    /// Operator-configured latched stop for new inventory.
+    /// 由操作员配置、触发后锁存的新增库存停止开关。
     pub kill_switch: bool,
-    /// Portfolio hard-limit action; recovery uncertainty always takes priority.
+    /// 组合硬性限制的处置方式；恢复状态不确定时始终优先保证安全。
     pub risk_policy: RiskPolicy,
-    /// Largest initial fraction assigned to one instrument.
+    /// 单标的允许配置的最大初始资金比例。
     pub max_instrument_allocation: Decimal,
-    /// Inventory plus all unresolved buy costs, as a fraction of equity.
+    /// 库存与全部未终结买单成本占组合权益的最大比例。
     pub max_total_exposure: Decimal,
-    /// Total grid inventory and pending buy costs / equity.
+    /// 全部网格仓库存与待买成本占组合权益的最大比例。
     pub max_total_grid_exposure: Decimal,
-    /// Filled equity inventory / equity; also reserved before new buys.
+    /// 已成交股票库存占组合权益的最大比例；新买入前也会预留容量。
     pub max_total_equity_exposure: Decimal,
-    /// Cash unavailable for new orders / equity.
+    /// 不可被新订单占用的最低现金储备占权益比例。
     pub min_cash_reserve: Decimal,
-    /// Portfolio peak-to-trough loss fraction.
+    /// 组合权益从高水位到低点的最大亏损比例。
     pub max_portfolio_drawdown: Decimal,
-    /// Loss since the preceding UTC day's final mark.
+    /// 相对前一 UTC 日最终权益的最大日内亏损。
     pub max_portfolio_daily_loss: Decimal,
-    /// Sector inventory and unresolved buys / equity. Missing sectors share an Unknown bucket.
+    /// 同行业库存与未终结买单占权益的上限；缺失行业统一归入 Unknown。
     pub max_sector_exposure: Decimal,
-    /// Connected correlated cluster inventory and unresolved buys / equity.
+    /// 相关性连通簇的库存与未终结买单占权益的上限。
     pub max_correlated_exposure: Decimal,
-    /// Positive Pearson correlation threshold for a cluster edge.
+    /// 构成相关性连通边的正 Pearson 相关系数阈值。
     pub correlation_threshold: f64,
-    /// Maximum trailing completed UTC days retained for daily-return correlations.
+    /// 日收益相关性保留的最大滚动已完成 UTC 日数。
     pub correlation_lookback_days: usize,
-    /// Minimum aligned one-day return pairs; unknown correlation is conservatively treated as one.
+    /// 计算相关性所需的最少对齐日收益样本；样本不足时保守按完全相关处理。
     pub correlation_min_observations: usize,
-    /// Minimum time between voluntary allocation changes.
+    /// 两次主动调整资金预算之间的最短时间。
     pub min_reallocation_interval_secs: u64,
-    /// Minimum absolute allocation change as a fraction of portfolio equity.
+    /// 触发预算调整所需的最小绝对比例变化。
     pub min_allocation_change_pct: Decimal,
-    /// Bounded reduction in the base budget during an up trend.
+    /// 上升趋势中对基础预算使用的受限缩减系数。
     pub trend_up_allocation_factor: Decimal,
-    /// Bounded reduction in the base budget during a down trend.
+    /// 下降趋势中对基础预算使用的受限缩减系数。
     pub trend_down_allocation_factor: Decimal,
-    /// ATR/price at which volatility starts reducing the budget.
+    /// 开始因波动率缩减预算的 ATR/价格目标值。
     pub allocation_volatility_target: Decimal,
-    /// Budget response to cumulative marked sleeve returns, capped at the initial allocation.
+    /// 预算对单标的累计按市值收益的响应强度，最终不超过初始分配。
     pub allocation_pnl_weight: Decimal,
 }
 
@@ -115,11 +115,11 @@ impl Default for PortfolioConfig {
 }
 
 impl PortfolioConfig {
-    /// Validates finite ratios, time bounds and a nonempty correlation window.
+    /// 校验比例有限性、时间边界及非空相关性窗口。
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid limits or an unrepresentable interval.
+    /// 限制无效或时间间隔无法表示时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.capital > Decimal::ZERO
@@ -173,7 +173,7 @@ impl PortfolioConfig {
     }
 }
 
-/// Current independent sleeve, including orders whose outcome is still unknown.
+/// 单标的当前独立暴露快照，包含结果仍未知的订单。
 #[derive(Clone, Debug)]
 pub(super) struct InstrumentExposure {
     pub id: InstrumentId,
@@ -192,39 +192,39 @@ pub(super) struct InstrumentExposure {
     pub max_age_secs: u64,
 }
 
-/// Admission result for a proposed acquisition. Covered reductions bypass acquisition limits.
+/// 新增库存订单的组合准入结果；有库存覆盖的减仓不受新增风险限制。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderDecision {
-    /// Full requested quantity fits every portfolio constraint.
+    /// 全部请求数量均满足组合约束。
     Allow,
-    /// A smaller whole-lot quantity fits.
+    /// 仅较小的整 lot 数量满足约束。
     Reduce,
-    /// Transient lack of cash, capacity or fresh marks prevents submission.
+    /// 因暂时缺少现金、风险容量或新鲜行情而延后提交。
     Defer,
-    /// A latched portfolio failure or disabled instrument forbids submission.
+    /// 组合风险已锁存或标的已禁用，拒绝提交。
     Reject,
 }
 
-/// Durable portfolio risk, budget and correlation history. No order has an independent cash pool.
+/// 可持久化的组合风险、预算与相关性历史；任何订单都没有独立现金池。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortfolioRiskManager {
-    /// Equity high-water mark, retained across process restarts.
+    /// 组合权益高水位，进程重启后继续保留。
     pub peak_equity: Decimal,
-    /// Previous observation, including the prior day's close.
+    /// 最近一次权益观测，包含前一交易日收盘。
     pub last_equity: Decimal,
-    /// Equity immediately before the current UTC day.
+    /// 当前 UTC 日开始前的组合权益。
     pub day_start_equity: Decimal,
-    /// Current UTC day.
+    /// 当前 UTC 日期。
     pub day: Option<u64>,
-    /// A portfolio halt cannot be cleared by an instrument reset.
+    /// 组合级停机原因不能被单标的重置清除。
     pub risk_off_reason: Option<String>,
-    /// Current permitted budget fractions, independent of held inventory.
+    /// 当前允许的单标的预算比例，与已持库存分开记录。
     pub allocations: BTreeMap<InstrumentId, Decimal>,
-    /// Last actual budget change for each instrument.
+    /// 各标的最近一次实际预算变更时间。
     pub last_reallocation_ns: BTreeMap<InstrumentId, u64>,
-    /// Causal daily closes, including the incomplete current day which is excluded from correlation.
+    /// 因果日收盘历史；包含但不使用尚未完成的当前日计算相关性。
     closes: BTreeMap<InstrumentId, BTreeMap<u64, Decimal>>,
-    /// Number of each gate outcome for operational inspection.
+    /// 各类准入结果的累计次数，供运行监控与审计。
     pub decisions: [u64; 4],
     #[serde(skip)]
     matrix_day: Option<u64>,
@@ -233,7 +233,7 @@ pub struct PortfolioRiskManager {
 }
 
 impl PortfolioRiskManager {
-    /// Initializes a single funded account risk baseline.
+    /// 使用单一账户初始资金建立组合风险基线。
     #[must_use]
     pub fn new(capital: Decimal) -> Self {
         Self {
@@ -297,7 +297,7 @@ impl PortfolioRiskManager {
         }
     }
 
-    /// Returns Pearson correlation using only aligned completed daily-return intervals.
+    /// 仅使用相互对齐且已经完成的日收益区间计算 Pearson 相关系数。
     #[must_use]
     pub fn correlation(
         &self,
@@ -393,8 +393,8 @@ impl PortfolioRiskManager {
         }
     }
 
-    // ponytail: O(n^3) cluster expansion is bounded by the small configured stock universe;
-    // replace with cached union-find if hundreds of simultaneous instruments are required.
+    // ponytail: 当前配置的股票池很小，O(n^3) 相关簇扩展有明确上界；
+    // 只有需要同时管理数百个标的时，才改用缓存的并查集。
     fn cluster(
         &mut self,
         c: &PortfolioConfig,

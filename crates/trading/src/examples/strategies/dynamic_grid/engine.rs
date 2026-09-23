@@ -13,75 +13,75 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Exact adaptive geometric levels and reset guards; execution belongs to Nautilus.
+//! 动态网格的精确价格几何与重置条件；订单执行统一交给 NautilusTrader。
 
 use nautilus_model::enums::OrderSide;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::config::{GridConfig, PositionSizing, SpacingMode};
+use super::config::{GridConfig, PositionSizing, SpacingMode, StrategyMode};
 
-/// Grid level lifecycle.
+/// 单个网格层级的生命周期。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LevelStatus {
-    /// No entry has been submitted.
+    /// 尚未提交入场订单。
     Pending,
-    /// At least one entry or exit is outstanding.
+    /// 至少存在一笔未终结的入场或出场订单。
     Active,
-    /// Filled inventory is waiting for its exit.
+    /// 已持有成交库存，正在等待对应出场。
     Filled,
-    /// Retired by cancellation/reset.
+    /// 因撤单或网格重置而退出本代网格。
     Cancelled,
-    /// All entry inventory has been sold.
+    /// 该层级买入的库存已全部卖出。
     Completed,
 }
 
-/// One adjacent buy/sell pair and its lifetime identity.
+/// 一组相邻买卖价及其跨越整个生命周期的稳定标识。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GridLevel {
-    /// Signed level relative to center; negative levels are ordinary entries.
+    /// 相对中心价的有符号层级；负数层级是常规回落买入层。
     pub level_index: i32,
-    /// Buy limit price, rounded down to the venue tick.
+    /// 买入限价，按交易场所最小价位向下取整。
     pub price: Decimal,
-    /// Entry side; every sell is backed by this pair's filled long inventory.
+    /// 入场方向；任何卖单都必须由本层级真实成交的多头库存覆盖。
     pub side: OrderSide,
-    /// Adjacent exit price, rounded up to the venue tick.
+    /// 相邻出场价，按交易场所最小价位向上取整。
     pub exit_price: Decimal,
-    /// Planned quantity rounded down to the lot size.
+    /// 计划数量，按最小交易单位向下取整。
     pub quantity: Decimal,
-    /// Current lifecycle status.
+    /// 当前生命周期状态。
     pub status: LevelStatus,
-    /// Latest entry identity.
+    /// 最近一次入场订单标识。
     pub entry_order_id: Option<String>,
-    /// Latest exit identity.
+    /// 最近一次出场订单标识。
     pub exit_order_id: Option<String>,
 }
 
-/// Immutable geometry within a generation.
+/// 单代网格内保持不变的价格几何。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GridEngine {
-    /// Monotonically increasing grid identity.
+    /// 单调递增的网格代号。
     pub grid_id: u64,
-    /// Center observed at creation.
+    /// 创建网格时已观测到的中心价。
     pub center: Decimal,
-    /// Effective spacing fraction.
+    /// 经过波动率、上下限和成本约束后的实际相邻间距比例。
     pub spacing: Decimal,
-    /// Lowest entry boundary.
+    /// 最低入场边界。
     pub lower_bound: Decimal,
-    /// Highest exit boundary.
+    /// 最高出场边界。
     pub upper_bound: Decimal,
-    /// Creation timestamp in nanoseconds.
+    /// 创建时间戳，单位为纳秒。
     pub created_ns: u64,
-    /// Adjacent pairs below and above the center.
+    /// 中心价上下两侧的相邻买卖对。
     pub levels: Vec<GridLevel>,
 }
 
 impl GridEngine {
-    /// Builds multiplicative pairs above and below the center.
+    /// 围绕中心价构建上下对称的乘法网格买卖对。
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid inputs, decimal overflow or tick-collapsed levels.
+    /// 输入无效、十进制定点数溢出，或价格按 tick 取整后层级重合时返回错误。
     #[allow(
         clippy::too_many_arguments,
         reason = "Explicit geometry, venue increments and generation identity"
@@ -180,7 +180,7 @@ impl GridEngine {
         })
     }
 
-    /// Whether time, anchor distance and current ATR overshoot permit re-centering.
+    /// 同时检查最短间隔、相对中心位移和 ATR 越界距离，判断是否允许重置中心。
     #[must_use]
     pub fn can_reset(&self, config: &GridConfig, price: Decimal, atr: Decimal, now: u64) -> bool {
         if price <= Decimal::ZERO || atr < Decimal::ZERO || self.center <= Decimal::ZERO {
@@ -200,7 +200,7 @@ impl GridEngine {
                 .is_some_and(|minimum| distance >= minimum)
     }
 
-    /// Crossed levels in execution order; equality triggers only on first arrival.
+    /// 返回本次价格路径穿越的全部层级，并按真实穿越顺序排列；首次到达等价于穿越。
     #[must_use]
     pub fn crossed(&self, previous: Decimal, price: Decimal) -> Vec<i32> {
         let mut crossed: Vec<_> = self
@@ -225,11 +225,11 @@ impl GridEngine {
     }
 }
 
-/// Calculates fee-aware spacing from current, already-observed ATR.
+/// 使用当前已经完成的数据计算 ATR 自适应间距，并纳入交易成本下限。
 ///
 /// # Errors
 ///
-/// Returns an error if the inputs or resulting cost floor are invalid.
+/// 波动率输入无效，或成本下限与配置矛盾时返回错误。
 pub fn spacing(
     config: &GridConfig,
     atr: Decimal,
@@ -251,10 +251,17 @@ pub(super) fn spacing_components(
     );
     let raw = match config.spacing_mode {
         SpacingMode::Percentage => config.spacing_pct,
-        SpacingMode::Atr => atr
-            .checked_div(price)
-            .and_then(|value| value.checked_mul(config.atr_multiplier))
-            .ok_or_else(|| anyhow::anyhow!("ATR grid width overflow"))?,
+        SpacingMode::Atr => {
+            let width = atr
+                .checked_div(price)
+                .and_then(|value| value.checked_mul(config.atr_multiplier))
+                .ok_or_else(|| anyhow::anyhow!("ATR grid width overflow"))?;
+            if config.strategy_mode == StrategyMode::StockAdaptive {
+                width / Decimal::from(config.grid_levels)
+            } else {
+                width
+            }
+        }
     }
     .checked_mul(multiplier)
     .ok_or_else(|| anyhow::anyhow!("Trend grid width overflow"))?;

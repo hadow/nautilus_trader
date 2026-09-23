@@ -5,7 +5,7 @@
     "test_days": 10,
     "validation_finalists": 2,
     "drawdown_penalty": 1.0,
-    "sensitivity_atr_multipliers": ["2", "4", "6"],
+    "sensitivity_atr_multipliers": ["6", "8", "10"],
     "sensitivity_reset_distances": ["0.01", "0.015", "0.02"],
     "parameter_cliff_threshold": 0.02,
     "simulations": 1000,
@@ -24,7 +24,7 @@
         "regime_average": "Exponential",
         "require_price_ma_confirmation": true,
         "minimum_reset_atr_multiple": "0.25",
-      "atr_multiplier": "4",
+        "atr_multiplier": "8",
         "spacing_pct": "0.02",
         "min_spacing_pct": "0.02"
       },
@@ -37,7 +37,7 @@
         "regime_average": "Exponential",
         "require_price_ma_confirmation": true,
         "minimum_reset_atr_multiple": "0.25",
-      "atr_multiplier": "4",
+        "atr_multiplier": "8",
         "spacing_pct": "0.025",
         "min_spacing_pct": "0.025"
       },
@@ -50,7 +50,7 @@
         "regime_average": "Exponential",
         "require_price_ma_confirmation": true,
         "minimum_reset_atr_multiple": "0.25",
-      "atr_multiplier": "4",
+        "atr_multiplier": "8",
         "spacing_pct": "0.03",
         "min_spacing_pct": "0.03"
       },

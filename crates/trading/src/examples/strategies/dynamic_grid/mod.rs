@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Dynamic adaptive long-only grid using the native Strategy API.
+//! 使用 NautilusTrader 原生 Strategy API 的动态自适应多头网格策略。
 
 pub mod analytics;
 pub mod config;

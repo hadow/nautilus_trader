@@ -1,5 +1,15 @@
 # Multi-Asset Dynamic Grid：组合实现与验收
 
+## 2026-09-22 SADG 更新
+
+当前主组合启用 AAPL 与 MSFT；目录仍保留其余股票配置供显式加入，策略不会扫描目录自动启用标的。
+两只股票均使用 `StockAdaptive`：ATR 乘数表示整个单边网格宽度，相邻层间距再除以层数；
+Legacy DGT 基准仍保留旧的“ATR 乘数即相邻层间距”语义。比较入口会换算乘数，保持每层几何间距可比。
+
+SADG 增加 Core + Grid 目标仓位、常规交易时段、跳空/流动性 gate、突破与 regime 连续确认、
+Downtrend 下暂停加仓，并继续复用同一订单、持仓、账户、风险和 Longbridge execution 基础设施。
+Fibonacci 已完全移除。checkpoint 当前为 version 6，旧版本不会静默加载。
+
 ## 范围
 
 本实现使用一个 `MultiAssetGridStrategy` 和一个原生 `StrategyCore`，不是为每只股票建立一个 Strategy。
@@ -111,16 +121,12 @@ crates/backtest/examples/
     └── META.json
 ```
 
-主文件保留组合风控、回测时间范围和标的文件引用：
+主文件保留组合风控、回测时间范围和启用标的文件引用；当前内容为：
 
 ```json
 "instruments": {
-  "AAPL.SIM": "instuments/AAPL.json",
-  "MSFT.SIM": "instuments/MSFT.json",
-  "NVDA.SIM": "instuments/NVDA.json",
-  "TSLA.SIM": "instuments/TSLA.json",
-  "AMZN.SIM": "instuments/AMZN.json",
-  "META.SIM": "instuments/META.json"
+    "AAPL.SIM": "instuments/AAPL.json",
+    "MSFT.SIM": "instuments/MSFT.json"
 }
 ```
 
@@ -132,8 +138,8 @@ crates/backtest/examples/
 Paper 通过 `portfolio_config` 引用此主文件，复用全部组合风控和逐标的参数；不再维护独立参数副本。
 Sandbox 样例保留原有保守内联配置，runner 继续兼容旧内联格式。
 
-当前六股票共享文件采用进取型工程预设；组合回撤阈值按用户选择设为 25%，Paper 同步使用。
-Rust `Default`、单股票/WFA 候选及 Sandbox 样例保持不变。
+标的文件采用进取型工程预设；组合回撤阈值按用户选择设为 25%，Paper 复用同一组合配置。
+Rust `Default` 仍为 LegacyDgt 基准语义；Sandbox 的 SADG ATR 乘数已做等价语义迁移。
 参数在本轮历史比较前固定，不依据这一季度的收益挑选参数；更高风险预算不保证更高收益。
 
 | 股票 | 分配比例（旧 → 新） | 组合权益口径持仓上限（旧 → 新） |
@@ -170,13 +176,13 @@ Rust `Default`、单股票/WFA 候选及 Sandbox 样例保持不变。
 增加重置间隔/距离用于减少反复移网格；30 次无盈利周期的连续重置仍会锁定 RiskOff，不会自动恢复。
 局部亏损阈值使用股票自身账本资金口径，因此可能先于组合 25% 阈值停买。
 
-保留 Equal 仓位、原 ATR/网格层数、趋势/波动过滤、下跌趋势禁买及手续费/滑点假设。
-MSFT 使用用户调整后的 2.5%–5% ATR 间距范围，备用 `spacing_pct` 同步为 2.5%，满足既有配置校验；
-其余五只股票仍使用 0.5%–3% 范围。备用固定间距不参与当前 ATR 模式的间距计算。
+保留 Equal 权重、原网格层数、趋势/波动过滤、下跌趋势禁买及手续费/滑点假设。
+当前所有标的的相邻间距边界为 0.5%–3%，备用 `spacing_pct` 为 0.5%；
+AAPL/MSFT 的总宽度 ATR 乘数分别为 8/7。备用固定间距不参与当前 ATR 模式的实际计算。
 没有增加杠杆、倍增加仓或关闭风控；这些取舍也符合
 [Grid Trading Strategy Guide](https://blog.traderspost.io/article/grid-trading-strategy-guide) 对成本、趋势与储备资金的约束。
 
-网格 JSON 样例显式列出全部 54 个 `GridConfig` 字段；组合样例也列出全部 19 个 `PortfolioConfig` 字段。
+网格与组合 JSON 样例显式列出当前配置字段；集成测试防止新增字段退回隐藏默认值。
 股票差异配置和上述进取型覆盖均显式写入文件；其余值展开自 Rust 默认值。
 单股票和 Walk-forward 候选 JSON 同样完整列出字段，研究参数不再依赖隐藏默认值。
 拆分后的标的文件中字段位于 `strategy.grid`；内联格式仍为 `instruments[InstrumentId].strategy.grid`。
@@ -200,7 +206,7 @@ target/release/dynamic-grid-backtest --portfolio crates/backtest/examples/dynami
 Bar 时间必须表示完成时间；Tick 模式需要每股票真实 quotes，不能从一只股票的数据生成其他股票。
 事件按 timestamp、Bar/Quote 类型、InstrumentId 稳定排序；同时间戳的资金优先级因此可复现，并非随机公平分配。
 
-Longbridge 六股票配置：
+Longbridge 多股票配置：
 
 Paper 配置文件只保留环境字段及显式映射，例如：
 
@@ -210,11 +216,7 @@ Paper 配置文件只保留环境字段及显式映射，例如：
   "portfolio_config": "../../../backtest/examples/dynamic_grid_portfolio.json",
   "instrument_mapping": {
     "AAPL.SIM": "AAPL.US.LONGBRIDGE",
-    "MSFT.SIM": "MSFT.US.LONGBRIDGE",
-    "NVDA.SIM": "NVDA.US.LONGBRIDGE",
-    "TSLA.SIM": "TSLA.US.LONGBRIDGE",
-    "AMZN.SIM": "AMZN.US.LONGBRIDGE",
-    "META.SIM": "META.US.LONGBRIDGE"
+    "MSFT.SIM": "MSFT.US.LONGBRIDGE"
   },
   "trader_id": "GRID-001",
   "account_id": "LONGBRIDGE-001",
@@ -258,18 +260,18 @@ broker reconciliation 前先恢复完整原生 cache；所有股票对账通过�
 恢复验证完整 instrument 集合、订单命名空间、sequence、库存关系、broker ownership 和环境/账户身份。
 未知活动订单、外部持仓、部分丢失的快照或股票状态互换均不能静默继续。
 
-状态格式升级到 version 2；原单标的 version 1 不能直接加载。
+状态格式升级到 version 6；早期 checkpoint 不能直接加载。
 如果已有真实 Paper/Live 库存，必须停机审计并迁移状态，不能删除文件、换新 ID 或使用新账户初始余额假装恢复。
 样例采用新的 `multi-grid-*-state.json` 路径，避免覆盖原文件；新路径不绕过 broker 中已有仓位/订单的检查。
 同一账户须专供本组合使用；部署层仍需防止多个进程使用不同 checkpoint 同时交易该账户。
 
 ## 指标与基准
 
-每股票输出 realized/unrealized/net PnL、费用、滑点、cycles、持仓、reset 和独立曲线。
+每股票输出 realized/unrealized/net PnL、费用、带符号滑点、非负不利滑点、价格改善、cycles、持仓、reset 和独立曲线。
 组合收益、Sharpe、Sortino、MDD、Calmar、敞口和利用率由组合现金加全部已知库存的时间序列计算，
 不平均股票 Sharpe，也不把每股票初始资金重复相加。费用、成交额和周期 PnL 按 Decimal 汇总。
-组合没有可相加的“股票数量”，通用指标中的组合 maximum_position 为零；使用 maximum_exposure 比较不同股票。
-组合没有单一 regime，通用组合 `trend_exposure` 暂为零；趋势敞口应查看每股票报告，不能将该零值理解为没有趋势风险。
+组合 `maximum_position` / `average_inventory` 统计各标的股数之和，仅用于运行诊断；跨股票比较仍应使用金额敞口。
+组合 regime PnL 为各标的精确归因之和；组合本身仍没有单一 regime 标签。
 `grid_turnover` 表示实际成交额 / 初始资金，`capital_utilization` 包含待成交买单预留。
 
 Equal Weight Buy & Hold 使用同一个原生账户、一个策略实例，按全部配置标的等分初始资金，
@@ -278,6 +280,83 @@ Equal Weight Buy & Hold 使用同一个原生账户、一个策略实例，按�
 费用与滑点仍通过原生撮合产生。比较必须同时查看敞口、现金利用率和换手，不能只看收益。
 
 ## 验证与历史结果
+
+### 当前 SADG 公平比较（AAPL + MSFT，2025 Q1）
+
+当前 debug 二进制回放 2025-01-02 至 2025-03-31，共 46,800 根 1 分钟 Bar、无 Quote，
+初始资金 USD 100,000，seed=42。四组使用同一数据、资金、交易成本、组合限制和原生撮合；
+Legacy/SADG 的 ATR 乘数按语义换算以保持相邻层间距可比。报告：
+`reports/sadg-comparison-aapl-msft-2025-q1-debug.json`。
+
+| 指标 | Buy & Hold | Fixed Grid | Original DGT | SADG |
+| --- | ---: | ---: | ---: | ---: |
+| Total Return | -11.2486% | -0.3767% | -0.0819% | -1.3439% |
+| CAGR | -38.9825% | -1.5501% | -0.3387% | -5.4470% |
+| Sharpe | -2.0796 | -1.2158 | -0.1379 | -1.6381 |
+| Sortino | -2.5798 | -1.5578 | -0.1874 | -2.0983 |
+| MDD | 14.2915% | 0.7508% | 1.1818% | 2.0934% |
+| Calmar | -2.7277 | -2.0644 | -0.2866 | -2.6020 |
+| Net PnL / USD | -11,248.61 | -376.65 | -81.91 | -1,343.85 |
+| Fees / adverse slippage / USD | 99.65 / 6.36 | 53.59 / 0.20 | 201.40 / 0.66 | 209.68 / 8.74 |
+| 成交 / 完整网格周期 | 6 / 0 | 61 / 24 | 305 / 140 | 421 / 105 |
+| 平均资金利用率 | 99.7146% | 7.0463% | 12.9476% | 16.2252% |
+
+SADG 的 Grid sleeve 已实现 +230.95 美元，但 40% Core target 产生 -1,321.38 美元已实现亏损，
+期末未实现亏损为 -253.42 美元；AAPL/MSFT 分别净亏 -524.32 / -819.53 美元。
+`gap_loss` 为 4,123.17 美元，表示持仓跨 session 的负向 mark 变动归因，不应与最终净亏简单相加。
+本季度两只股票整体下行，固定的 40% Core sleeve 把方向暴露引入了原本更轻仓的 DGT。
+
+因此当前数据不支持“股票适配层提供增量收益”：SADG 的风险调整收益、绝对收益和 MDD 都差于 Original DGT。
+已证明的只是目标仓位、下跌限仓、跳空归因和组合 gate 按设计执行；Core 比例、入场条件和 gap 后去风险策略
+需要在 walk-forward 中作为独立变量验证，不能根据这一个季度直接调参后再称为样本外结果。
+
+同机 debug 比较总耗时 474.02 秒，其中 SADG 事件回放 135.45 秒；此前相同 SADG 回放为 202.69 秒，
+本轮又下降约 33.2%。相对最初 311.33 秒累计下降约 56.5%。收益结果不依赖这项性能优化。
+
+### 当前消融结果（同一 in-sample 季度）
+
+报告：`reports/sadg-ablation-aapl-msft-2025-q1-debug.json`。消融按 DGT → ATR → Regime →
+Target Position → Gap → Liquidity 累加；Portfolio Risk 组是对 Original DGT 的单独对照。它不是参数选择或 OOS 验证。
+
+| 变体 | Return | Sharpe | MDD | Fees / USD | Trades | Utilization | Churn |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original DGT | -1.0872% | -1.1119 | 2.2346% | 318.06 | 587 | 26.5537% | 1,878 |
+| + ATR Grid | -0.5478% | -0.8307 | 1.5354% | 120.62 | 210 | 27.2309% | 2,859 |
+| + Regime Filter | -0.3964% | -0.7605 | 1.2503% | 73.26 | 134 | 12.7537% | 19,724 |
+| + Target Position | -1.3436% | -1.6378 | 2.0934% | 209.74 | 421 | 16.9007% | 12,207 |
+| + Gap / Session | -1.3439% | -1.6381 | 2.0934% | 209.68 | 421 | 16.2252% | 12,174 |
+| + Liquidity | -1.3439% | -1.6381 | 2.0934% | 209.68 | 421 | 16.2252% | 12,174 |
+| Original + Portfolio Risk | -1.0872% | -1.1119 | 2.2346% | 318.06 | 587 | 26.5537% | 1,878 |
+| Full SADG | -1.3439% | -1.6381 | 2.0934% | 209.68 | 421 | 16.2252% | 12,174 |
+
+ATR 与 Regime 层在本样本降低亏损、MDD、成交和费用；但 Regime 层把撤单 churn 提高约 6.9 倍，且 47.5%
+的 reset 在旧网格没有入口成交，下一项工程工作应减少分类抖动和无成交 reset，而不是关闭风控。
+Target Position 的仓位上限行为通过测试，但固定 40% Core 暴露在本下跌季度吞没网格利润，是当前首要研究问题。
+Gap/Session 与 Target 结果近似相同；Liquidity 与 Gap 完全相同，因为输入没有 Quote spread，且两只股票都通过
+Bar dollar-volume 阈值。Portfolio Risk 在本规模没有成为约束；这些模块的增量价值均未由本季度证明。
+
+### Walk-forward、敏感性与 Monte Carlo
+
+报告：`reports/sadg-research-aapl-msft-2025-q1-debug.json`，运行 694.31 秒。使用 30/10/10 个观测交易日、
+3 个预先声明的间距候选；每个分区从空仓独立暖机，不跨 fold 携带库存。两个 fold 都在训练/验证后选择
+第三个候选（相邻间距下限 3%），但所有训练和验证 score 都为负。
+
+| OOS fold | Test 窗口（UTC） | Return | Sharpe | Sortino | MDD | Net PnL | Trades / cycles |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 2025-03-04 → 2025-03-17 | -0.5413% | -3.5966 | -4.3304 | 1.2462% | -541.32 | 21 / 0 |
+| 1 | 2025-03-18 → 2025-03-31 | +0.0921% | 0.7844 | 1.0456 | 0.7390% | +92.13 | 21 / 1 |
+
+两个独立 OOS 回报几何拼接约 -0.4497%；第一折没有完整网格周期，第二折只有一个，不能建立 OOS alpha。
+Return Bootstrap 1000 次的 5%/50%/95% 回报为 -1.9564% / -0.4416% / +0.9949%，
+亏损概率 68.4%、ruin（权益低于 50%）为 0%。Return Shuffle 的回报恒为 -0.4497%、亏损概率 100%；
+Trade Shuffle 也为负且忽略未售库存，因此不能用其较小 MDD 淡化库存风险。
+
+3×3 敏感性使用 ATR 总宽度乘数 6/8/10 和 reset distance 1%/1.5%/2%。同一 reset distance 下，
+三个 ATR 结果完全一致；原因是敏感性基准候选的 2% `min_spacing_pct` 把 ATR 结果全部截断，并非稳健参数区。
+三个 reset distance 的训练段回报约 -0.2806% / -0.3072% / -0.3170%，均无 cliff 标记；
+“无 cliff”不能覆盖“参数被 clamp 后无效”。下一轮必须把 ATR multiplier 与 spacing clamp 分开做单因素实验。
+
+### 此前性能优化与历史记录
 
 ### 历史状态查询与回测进度优化
 
@@ -301,11 +380,11 @@ Equal Weight Buy & Hold 使用同一个原生账户、一个策略实例，按�
 修复前账户历史 1 条和 10,000 条分别耗时 0.45 毫秒、102.81 毫秒；修复后分别约 0.25 毫秒、0.25 毫秒。
 这是特定查询路径的性能验证，不代表完整季度加速倍数或策略收益改善。
 
-两个 runner 的 Release 构建通过。实际 CLI 使用冻结的当前六股票配置，回放 2025-01-02 的 2,340 根 Bar，
+两个 runner 的 Release 构建通过。实际 CLI 使用当时冻结的六股票配置，回放 2025-01-02 的 2,340 根 Bar，
 包含读取数据、动态网格、等权基准和完整 JSON 写入；`/usr/bin/time -p` 测得优化前两次为 10.46 / 11.27 秒，
 优化后两次为 2.78 / 2.70 秒，约快 4 倍。四份完整 JSON 报告深度比较相等，不只是最终收益相等。
 这是单日端到端样本，不外推季度运行时间。2025-01-02 至 2025-01-03 的 4,680 根 Bar 回放也完成，耗时 3.98 秒。
-进度输出覆盖动态网格和等权基准；当前没有重新运行整季度回测。
+进度输出覆盖动态网格和等权基准；该阶段尚未重新运行整季度回测，最新季度结果见上文。
 新版 Paper runner 的只读配置输出与优化前逐字节一致，未联网、发送订单或创建交易状态文件。
 Rust 格式检查通过；Clippy 保留已有的 12 项其他策略告警及测试文件原有的 2 项分号告警，本次未新增告警。
 
@@ -318,8 +397,8 @@ CARGO_INCREMENTAL=0 cargo test -p nautilus-trading --features examples --lib ris
 Paper 配置统一后，网格核心单元测试 **43/43**、集成测试 **54/54** 通过。
 其中新增 21 项直接测试 Longbridge runner 的生产配置模块，覆盖全部参数一致性、共享文件更新、
 相对路径、不读取历史数据、旧内联格式、映射冲突及配置文件覆盖保护。
-使用当前共享参数的一天六股票 CLI 回放通过，共 2,340 根 Bar；该检查只验证加载和执行链路，不证明收益有效性。
-两个 runner 的最终 Release 构建通过；Paper 实际程序输出的六股票参数与共享配置逐字段一致，
+使用当时共享参数的一天六股票 CLI 回放通过，共 2,340 根 Bar；该检查只验证加载和执行链路，不证明收益有效性。
+两个 runner 的最终 Release 构建通过；Paper 实际程序输出的当时六股票参数与共享配置逐字段一致，
 从不同工作目录读取引用也通过，Sandbox 配置未改变，未联网或写入交易状态。
 Rust 格式检查通过；Clippy 未新增告警，保留其他策略已有的 12 项告警。
 Markdown 检查与修改前均有 136 项既有表格对齐问题，本次不改动无关表格。
@@ -395,11 +474,11 @@ MSFT/META 完全没有成交；组合自身回撤/日损失锁未触发。期末
 ### 进取型预设的验证状态
 
 截至 2026-09-21 本轮配置交付，43 项网格核心单元测试和 33 项集成测试通过，Release 构建成功。
-相同六股票在 2025-01-02 的单日诊断回放共 2,340 根 Bar：旧配置 8.79 秒、新配置 9.83 秒，均正常完成。
+当时六股票在 2025-01-02 的单日诊断回放共 2,340 根 Bar：旧配置 8.79 秒、新配置 9.83 秒，均正常完成。
 两次等权 Buy & Hold 输出完全一致，组合与股票 PnL/费用精确求和一致，完整周期的费用/滑点恒等式通过。
 该单日回放仅验证执行与配置，不用于收益结论或重新选择参数。
 
-先前启动的进取型完整季度回测已按用户要求终止，未生成完整结果，原保守基线未覆盖。
+先前启动的六股票进取型完整季度回测已按用户要求终止；当前 AAPL+MSFT 的 SADG 公平比较已完成，见上文。
 本轮性能验证不会自动重启季度任务，不能宣称利用率、收益或风险调整收益已经改善。
 后续需重新运行并核对完整季度结果，再做独立样本外和压力测试；共享 Paper 配置验证不等于远端交易验收。
 

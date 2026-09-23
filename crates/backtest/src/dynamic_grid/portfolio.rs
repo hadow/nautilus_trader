@@ -57,7 +57,7 @@ use nautilus_trading::{
 };
 use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 
-use super::{GridBacktestConfig, load_bars, load_quotes};
+use super::{GridBacktestConfig, load_bars, load_quotes, set_strategy_mode_preserving_atr_spacing};
 use crate::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
@@ -125,11 +125,17 @@ pub fn portfolio_benchmark_config(
     for asset in effective.instruments.values_mut() {
         match benchmark {
             PortfolioBenchmark::LegacyDgt => {
-                asset.strategy.grid.strategy_mode = StrategyMode::LegacyDgt;
+                set_strategy_mode_preserving_atr_spacing(
+                    &mut asset.strategy.grid,
+                    StrategyMode::LegacyDgt,
+                )?;
                 asset.strategy.grid.enable_dynamic_reset = true;
             }
             PortfolioBenchmark::Sadg => {
-                asset.strategy.grid.strategy_mode = StrategyMode::StockAdaptive;
+                set_strategy_mode_preserving_atr_spacing(
+                    &mut asset.strategy.grid,
+                    StrategyMode::StockAdaptive,
+                )?;
                 asset.strategy.grid.enable_dynamic_reset = true;
             }
             PortfolioBenchmark::Fixed => {
@@ -423,12 +429,14 @@ impl PortfolioBuyHold {
         let mut total_equity =
             self.config.portfolio.capital - share * Decimal::from(self.orders.len());
         let mut total_exposure = Decimal::ZERO;
+        let mut total_position = Decimal::ZERO;
         for (id, orders) in &self.orders {
             let price = self.marks.get(id).copied().unwrap_or(Decimal::ZERO);
             let exposure = orders.inventory() * price;
             let equity = orders.cash + exposure;
             total_equity += equity;
             total_exposure += exposure;
+            total_position += orders.inventory();
             let report = self.reports.get_mut(id).expect("Configured report");
             if report.equity.last().is_some_and(|p| p.ts_ns == now) {
                 report.equity.pop();
@@ -455,7 +463,7 @@ impl PortfolioBuyHold {
             self.config.portfolio.capital,
             total_equity,
             total_exposure,
-            Decimal::ZERO,
+            total_position,
             now,
         );
         if report.equity.last().is_some_and(|p| p.ts_ns == now) {
@@ -469,7 +477,7 @@ impl PortfolioBuyHold {
             price: Decimal::ONE,
             equity: total_equity,
             exposure: total_exposure,
-            position: Decimal::ZERO,
+            position: total_position,
             utilization: if total_equity > Decimal::ZERO {
                 (total_exposure / total_equity).to_f64().unwrap_or(0.0)
             } else {
@@ -575,10 +583,14 @@ impl DataActor for PortfolioBuyHold {
             .iter()
             .map(|(id, o)| (o, &self.risk[id]))
             .collect();
+        let instrument_reports: Vec<_> = self.reports.values().collect();
         let mut report = self.report.borrow_mut();
-        report
-            .portfolio
-            .finish_portfolio(self.config.portfolio.capital, &ledgers, None);
+        report.portfolio.finish_portfolio(
+            self.config.portfolio.capital,
+            &ledgers,
+            &instrument_reports,
+            None,
+        );
         report.instruments = self.reports.clone();
         Ok(())
     }

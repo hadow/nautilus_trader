@@ -13,232 +13,234 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Validated configuration shared by every execution mode.
+//! 回测、模拟盘和实盘共用的强校验策略配置。
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-/// Position semantics used by the shared strategy and execution path.
+/// 核心策略与执行链路共用的仓位语义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyMode {
-    /// Original paper-style grid inventory, retained only as a research baseline.
+    /// 论文式原始 DGT 库存模型，仅保留作研究基准。
     LegacyDgt,
-    /// Stock-adapted target position with separate core and grid sleeves.
+    /// 股票自适应目标仓位模型，将核心仓与网格仓分开管理。
     StockAdaptive,
 }
 
-/// Grid spacing calculation.
+/// 网格间距计算方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpacingMode {
-    /// Fixed percentage between adjacent levels.
+    /// 相邻层级使用固定百分比。
     Percentage,
-    /// ATR divided by current price, clamped to configured bounds.
+    /// 使用 ATR/当前价格，并限制在配置的最小与最大间距之间。
     Atr,
 }
 
-/// Native moving average used for slope and price confirmation.
+/// 趋势斜率与价格确认使用的移动平均类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegimeAverage {
-    /// Retains the original rolling simple-average rule.
+    /// 使用原始滚动简单移动平均规则。
     Simple,
-    /// Exponentially weighted average of completed closes.
+    /// 使用已完成收盘价的指数加权平均。
     Exponential,
 }
 
-/// Capital weights for successive levels.
+/// 各层级之间的资金权重方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionSizing {
-    /// Equal capital per level.
+    /// 每层使用相同资金。
     Equal,
-    /// Larger allocations further from the center.
+    /// 离中心越远，分配越大。
     Progressive,
-    /// Larger allocations near the center.
+    /// 越靠近中心，分配越大。
     Inverse,
-    /// Equal level budgets, reduced by target ATR/price divided by observed ATR/price.
+    /// 层级预算相等，再按目标波动率与实际波动率之比缩减。
     VolatilityAdjusted,
 }
 
-/// Behavior while a directional trend is detected.
+/// 检测到方向性趋势时的网格行为。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrendPolicy {
-    /// No new inventory; existing exits remain available.
+    /// 停止新增库存，但保留已有库存的卖出通道。
     Disable,
-    /// Reduce the number of active entry/exit levels in the trend direction.
+    /// 减少趋势方向上的有效买卖层数。
     ReduceGrid,
-    /// Expand spacing at the next permitted reset.
+    /// 在下一次允许重置时扩大网格间距。
     WiderGrid,
-    /// Accumulate long inventory without ordinary profit-taking in up trends.
+    /// 上升趋势中允许积累多头库存，不执行普通网格止盈。
     LongOnly,
-    /// Continue the normal grid.
+    /// 继续执行普通网格。
     Continue,
 }
 
-/// Action after a hard risk limit.
+/// 触发硬性风险限制后的处置方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RiskPolicy {
-    /// Cancel entries and retain inventory with profit-taking exits.
+    /// 撤销入场单，保留库存及其止盈卖单。
     Hold,
-    /// Cancel everything, wait for confirmation, then liquidate filled inventory.
+    /// 撤销全部订单，等待确认后再平掉已成交库存。
     Flatten,
 }
 
-/// Strategy parameters. Ratios use fractions (0.01 means one percent).
+/// 策略参数。所有比例均使用小数表示，例如 `0.01` 表示 1%。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GridConfig {
-    /// Research baseline or stock-adapted production behavior.
+    /// 选择研究基准行为或股票自适应生产行为。
     pub strategy_mode: StrategyMode,
-    /// Number of levels on each side of center.
+    /// 中心价每一侧的网格层数。
     pub grid_levels: usize,
-    /// Percentage or ATR spacing.
+    /// 使用固定百分比或 ATR 计算间距。
     pub spacing_mode: SpacingMode,
-    /// Fixed percentage spacing.
+    /// 固定百分比模式下的相邻间距。
     pub spacing_pct: Decimal,
-    /// Multiplier applied to ATR/price.
+    /// 应用于 ATR/价格的宽度倍数。
     pub atr_multiplier: Decimal,
-    /// Minimum adjacent-spacing fraction.
+    /// 相邻层级的最小间距比例。
     pub min_spacing_pct: Decimal,
-    /// Maximum adjacent-spacing fraction.
+    /// 相邻层级的最大间距比例。
     pub max_spacing_pct: Decimal,
-    /// Initial total strategy capital, never an implicit deposit on reset.
+    /// 策略初始总资金；重置网格不会隐式追加资金。
     pub capital: Decimal,
-    /// Fraction allocated to a grid before account and exposure limits.
+    /// 账户与暴露约束前，分配给该标的的资金比例。
     pub capital_allocation: Decimal,
-    /// Fraction of grid capital used to seed upper sell levels.
+    /// 用于预先建立上方可卖库存的网格资金比例。
     pub initial_inventory_fraction: Decimal,
-    /// Long-lived fraction of the instrument allocation.
+    /// 标的分配资金中长期核心仓的目标比例。
     pub core_target_pct: Decimal,
-    /// Maximum tactical grid fraction of the instrument allocation.
+    /// 标的分配资金中战术网格仓的最大比例。
     pub grid_max_pct: Decimal,
-    /// Core target multiplier while an up trend is confirmed.
+    /// 确认上升趋势后，核心仓目标的乘数。
     pub trend_up_core_multiplier: Decimal,
-    /// Grid target multiplier while an up trend is confirmed.
+    /// 确认上升趋势后，网格仓目标的乘数。
     pub trend_up_grid_multiplier: Decimal,
-    /// Core target multiplier while a down trend is confirmed.
+    /// 确认下降趋势后，核心仓目标的乘数。
     pub trend_down_core_multiplier: Decimal,
-    /// Grid target multiplier while a down trend is confirmed.
+    /// 确认下降趋势后，网格仓目标的乘数；设为零可禁止逆势加仓。
     pub trend_down_grid_multiplier: Decimal,
-    /// Position multiplier during high volatility; entries remain disabled.
+    /// 高波动状态下的目标仓位乘数；该状态仍禁止新增网格入场。
     pub high_volatility_position_multiplier: Decimal,
-    /// Capital sizing weights.
+    /// 层级资金权重方式。
     pub position_sizing: PositionSizing,
-    /// ATR/price target for volatility sizing; the multiplier is capped at one.
+    /// 波动率调整仓位的目标 ATR/价格；最终放大倍数不会超过 1。
     pub position_volatility_target: Decimal,
-    /// Absolute maximum quantity, including unresolved buys.
+    /// 绝对最大数量，包含结果尚未明确的买单。
     pub max_position: Decimal,
-    /// Maximum marked inventory / strategy equity.
+    /// 按市值计价库存占策略权益的最大比例。
     pub max_position_pct: Decimal,
-    /// Maximum marked inventory and pending notional.
+    /// 已持仓市值与待成交名义金额之和的上限。
     pub max_notional: Decimal,
-    /// Maximum capital reserved by this grid and retained inventory.
+    /// 当前网格及遗留库存最多可占用的资金。
     pub max_grid_exposure: Decimal,
-    /// Maximum inventory / broker equity for this instrument.
+    /// 单标的库存市值占券商账户权益的最大比例。
     pub max_asset_ratio: Decimal,
-    /// Maximum inventory and pending buy notional / strategy equity.
+    /// 库存与待买名义金额占策略权益的最大比例。
     pub max_capital_utilization: Decimal,
-    /// Drawdown from the strategy equity high-water mark.
+    /// 相对策略权益历史高水位的最大回撤。
     pub max_drawdown: Decimal,
-    /// Loss relative to equity at the start of a UTC day.
+    /// 相对 UTC 日初权益的最大日内亏损。
     pub max_daily_loss: Decimal,
-    /// Maximum unrealized loss / initial capital.
+    /// 未实现亏损占初始资金的最大比例。
     pub max_unrealized_loss: Decimal,
-    /// Maximum resets without a completed profitable cycle.
+    /// 未完成盈利周期时允许的最大连续重置次数。
     pub max_consecutive_resets: u32,
-    /// Maximum completed resets per UTC day, independently of profitable cycles.
+    /// 每个 UTC 日允许完成的最大重置次数，与盈利周期独立统计。
     pub maximum_resets_per_day: u32,
-    /// Maximum outstanding orders including unknown outcomes.
+    /// 最大未终结订单数，包含结果未知的订单。
     pub max_orders: usize,
-    /// Maximum configured levels per side.
+    /// 每侧允许配置的最大层数。
     pub max_grid_levels: usize,
-    /// Reserve fraction unavailable to buys.
+    /// 买入不可占用的现金保留比例。
     pub reserve_capital: Decimal,
-    /// Reset minimum distance from the previous center.
+    /// 相对上一中心价的最小重置距离。
     pub minimum_reset_distance: Decimal,
-    /// Breakout overshoot in current ATR units; in-range resets use distance from the anchor.
+    /// 突破边界后要求的 ATR 超出倍数；区间内重置则按离锚点距离计算。
     pub minimum_reset_atr_multiple: Decimal,
-    /// Completed closes required outside the grid before a stock-adaptive reset.
+    /// 股票自适应模式重置前，要求连续收在网格外的已完成 K 线数。
     pub breakout_confirmation_bars: u32,
-    /// Reset minimum interval in seconds.
+    /// 股票自适应模式恢复入场前，市场状态需连续稳定的已完成 K 线数。
+    pub regime_confirmation_bars: u32,
+    /// 两次网格重置之间的最短秒数。
     pub minimum_reset_interval_secs: u64,
-    /// Relative spacing change which requests a volatility reset.
+    /// 触发波动率重置所需的相对间距变化。
     pub volatility_reset_ratio: Decimal,
-    /// Whether boundary breaks reset instead of terminating.
+    /// 突破边界后是否动态重置，而不是终止网格。
     pub enable_dynamic_reset: bool,
-    /// Whether trend policies apply.
+    /// 是否启用趋势策略。
     pub enable_trend_filter: bool,
-    /// Whether volatility thresholds apply.
+    /// 是否启用波动率阈值。
     pub enable_volatility_filter: bool,
-    /// Up trend policy.
+    /// 上升趋势策略。
     pub trend_up_policy: TrendPolicy,
-    /// Down trend policy.
+    /// 下降趋势策略。
     pub trend_down_policy: TrendPolicy,
-    /// Remaining fraction of levels for `ReduceGrid`.
+    /// `ReduceGrid` 模式保留的有效层级比例。
     pub trend_level_fraction: Decimal,
-    /// Spacing multiplier for `WiderGrid`.
+    /// `WiderGrid` 模式使用的间距倍数。
     pub trend_spacing_multiplier: Decimal,
-    /// ATR and directional-movement period.
+    /// ATR 与方向运动指标的计算周期。
     pub atr_period: usize,
-    /// ADX smoothing period after directional movement is warm.
+    /// 方向运动指标预热完成后的 ADX 平滑周期。
     pub adx_period: usize,
-    /// Bollinger and moving-average window.
+    /// 布林带与移动平均窗口。
     pub ma_period: usize,
-    /// Native average implementation for directional classification.
+    /// 市场方向分类所用的移动平均实现。
     pub regime_average: RegimeAverage,
-    /// Require price to be on the trend side of the selected moving average.
+    /// 是否要求价格位于移动平均的趋势方向一侧。
     pub require_price_ma_confirmation: bool,
-    /// Minimum fractional price/average distance when confirmation is enabled.
+    /// 启用价格确认后，价格偏离均线所需的最小比例。
     pub price_ma_confirmation_pct: f64,
-    /// Number of completed bars for slope calculation.
+    /// 计算均线斜率使用的已完成 K 线数。
     pub slope_period: usize,
-    /// Realized log-return volatility window.
+    /// 已实现对数收益波动率窗口。
     pub volatility_period: usize,
-    /// Bollinger standard deviation multiplier.
+    /// 布林带标准差倍数。
     pub bollinger_k: f64,
-    /// Upper ADX bound for ranging markets.
+    /// 震荡市场允许的 ADX 上限。
     pub adx_range_max: f64,
-    /// Lower ADX bound for trends.
+    /// 趋势市场要求的 ADX 下限。
     pub adx_trend_min: f64,
-    /// Absolute normalized MA slope threshold per bar.
+    /// 单根 K 线归一化均线斜率的绝对阈值。
     pub ma_slope_threshold: f64,
-    /// Minimum ATR/price needed to open a grid.
+    /// 允许创建网格所需的最小 ATR/价格。
     pub atr_pct_min: f64,
-    /// Maximum ATR/price.
+    /// 允许交易的最大 ATR/价格。
     pub atr_pct_max: f64,
-    /// Maximum Bollinger bandwidth / middle.
+    /// 布林带宽度/中轨的最大值。
     pub bollinger_width_max: f64,
-    /// Maximum log-return volatility per bar (not annualized).
+    /// 单根 K 线对数收益波动率上限，不进行年化。
     pub realized_volatility_max: f64,
-    /// Restrict stock-adaptive entry execution to 09:30-16:00 `America/New_York`.
+    /// 将股票自适应模式的入场限制在纽约时间 09:30–16:00 常规交易时段。
     pub regular_session_only: bool,
-    /// Absolute overnight gap fraction which pauses new entries.
+    /// 触发暂停新增仓位的隔夜跳空绝对比例。
     pub max_gap_pct: Decimal,
-    /// Absolute overnight gap in prior completed-bar ATR units which pauses new entries.
+    /// 以前一根已完成 K 线 ATR 衡量、触发暂停入场的隔夜跳空倍数。
     pub max_gap_atr_multiple: Decimal,
-    /// Number of completed regular-session bars paused after a large gap.
+    /// 大幅跳空后暂停入场的常规时段已完成 K 线数。
     pub gap_recovery_bars: u32,
-    /// Rolling completed-bar window used by the dollar-volume gate.
+    /// 成交额流动性门槛使用的已完成 K 线滚动窗口。
     pub liquidity_lookback_bars: usize,
-    /// Minimum rolling average `close * volume`; zero disables this gate.
+    /// `收盘价 × 成交量` 的最小滚动均值；零表示关闭该门槛。
     pub minimum_average_dollar_volume: Decimal,
-    /// Maximum observed bid/ask spread in basis points; zero disables this gate.
+    /// 允许的最大买卖价差，单位为基点；零表示关闭该门槛。
     pub maximum_spread_bps: Decimal,
-    /// Minimum executable stock price; zero disables this gate.
+    /// 允许执行的最低股票价格；零表示关闭该门槛。
     pub minimum_price: Decimal,
-    /// Conservative maker fee fraction for spacing and reservations.
+    /// 计算间距和资金预留时使用的保守 maker 费率。
     pub maker_fee: Decimal,
-    /// Conservative taker fee fraction for spacing and reservations.
+    /// 计算间距和资金预留时使用的保守 taker 费率。
     pub taker_fee: Decimal,
-    /// Additional commission fraction, added to maker/taker rate.
+    /// 在 maker/taker 费率之外额外计入的佣金比例。
     pub commission: Decimal,
-    /// Estimated one-way slippage fraction used before submission.
+    /// 提交订单前估计的单边滑点比例。
     pub slippage: Decimal,
-    /// Minimum expected net cycle profit as a fraction of entry notional.
+    /// 单个周期预期净利润占入场名义金额的最低比例。
     pub minimum_profit_margin: Decimal,
-    /// Hard-limit response.
+    /// 触发硬性风险限制后的处置策略。
     pub risk_policy: RiskPolicy,
-    /// Maximum time for an unresolved submission or cancellation.
+    /// 订单提交或撤销结果未知时允许等待的最长秒数。
     pub order_timeout_secs: u64,
-    /// Maximum age of a completed signal bar for tick trading.
+    /// Tick 驱动交易可使用的已完成信号 K 线最大年龄。
     pub max_signal_age_secs: u64,
 }
 
@@ -281,6 +283,7 @@ impl Default for GridConfig {
             minimum_reset_distance: Decimal::new(1, 2),
             minimum_reset_atr_multiple: Decimal::ZERO,
             breakout_confirmation_bars: 2,
+            regime_confirmation_bars: 3,
             minimum_reset_interval_secs: 300,
             volatility_reset_ratio: Decimal::new(5, 1),
             enable_dynamic_reset: true,
@@ -327,11 +330,11 @@ impl Default for GridConfig {
 }
 
 impl GridConfig {
-    /// Validates limits before creating indicators, grids or orders.
+    /// 在创建指标、网格或订单前统一校验配置约束。
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid periods, nonfinite signals or inconsistent risk/cost bounds.
+    /// 周期无效、信号参数非有限值，或风险/成本边界相互矛盾时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.grid_levels > 0
@@ -344,6 +347,7 @@ impl GridConfig {
                 && self.max_consecutive_resets > 0
                 && self.maximum_resets_per_day > 0
                 && self.breakout_confirmation_bars > 0
+                && self.regime_confirmation_bars > 0
                 && self.liquidity_lookback_bars > 0,
             "Order/reset limits must be positive"
         );
@@ -480,7 +484,7 @@ impl GridConfig {
         Ok(())
     }
 
-    /// Conservative round-trip cost and profit-margin floor, including exit notional fees.
+    /// 保守的双边交易成本与最低利润安全边际，包含出场名义金额对应的费用。
     #[must_use]
     pub fn cost_floor(&self) -> Decimal {
         let cost = self.maker_fee.max(self.taker_fee) + self.commission + self.slippage;

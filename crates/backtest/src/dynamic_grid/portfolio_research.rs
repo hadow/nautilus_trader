@@ -132,7 +132,7 @@ impl Default for PortfolioResearchConfig {
             test_days: 10,
             validation_finalists: 2,
             drawdown_penalty: 1.0,
-            sensitivity_atr_multipliers: [2, 4, 6].into_iter().map(Decimal::from).collect(),
+            sensitivity_atr_multipliers: [6, 8, 10].into_iter().map(Decimal::from).collect(),
             sensitivity_reset_distances: [10, 15, 20]
                 .into_iter()
                 .map(|n| Decimal::new(n, 3))

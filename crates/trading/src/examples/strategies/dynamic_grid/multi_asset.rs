@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! One native strategy owns isolated instrument engines and a mandatory shared order gate.
+//! 一个原生策略持有相互隔离的标的引擎，并由强制共享的组合风控门统一准入订单。
 
 use std::{
     cell::RefCell,
@@ -63,46 +63,46 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-/// Independent signal and sizing configuration; allocation is a fraction of initial shared capital.
+/// 单标的独立信号与仓位配置；资金分配为共享初始资金的比例。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstrumentConfig {
-    /// Disabled instruments remain recoverable and may reduce existing inventory.
+    /// 禁用标的仍参与恢复，并允许卖出已有库存。
     pub enabled: bool,
-    /// Fixed ceiling for this sleeve; unused or reduced budgets remain shared cash reserve.
+    /// 该标的资金上限；未使用或动态缩减的预算继续保留为共享现金。
     pub capital_allocation: Decimal,
-    /// Maximum instrument inventory and pending buys / total portfolio equity.
+    /// 单标的库存与待买金额占组合总权益的最大比例。
     #[serde(default = "default_position_fraction")]
     pub max_position_pct: Decimal,
-    /// Explicit sector label; None belongs to the common Unknown sector.
+    /// 显式行业标签；None 统一归入 Unknown 行业。
     pub sector: Option<String>,
-    /// This instrument's completed signal stream.
+    /// 该标的独立的已完成 K 线信号流。
     pub bar_type: BarType,
-    /// Local grid and risk parameters. Capital is supplied by the portfolio at construction.
+    /// 单标的网格与风险参数；实际资金在构建时由组合分配。
     #[serde(default)]
     pub grid: GridConfig,
-    /// Whether the adapter publishes confirmed custom bars.
+    /// Adapter 是否发布已确认的自定义 K 线。
     #[serde(default)]
     pub confirmed_custom_bars: bool,
-    /// Whether quotes/trades, rather than bars, trigger execution decisions.
+    /// 是否由 Quote/Trade Tick 而非 K 线触发执行判断。
     #[serde(default)]
     pub tick_execution: bool,
 }
 
-/// A single account/quote-currency portfolio, with one native strategy identity.
+/// 使用单一账户和报价币种、且只有一个原生策略身份的多标的组合。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MultiAssetGridConfig {
-    /// Native identity, ownership and execution settings.
+    /// 原生策略身份、订单归属与执行设置。
     pub base: StrategyConfig,
-    /// Stable instrument keys; no signal, grid or order ledger is shared between these entries.
+    /// 稳定的标的键；各标的之间不共享信号、网格或订单账本。
     pub instruments: BTreeMap<InstrumentId, InstrumentConfig>,
-    /// Mandatory portfolio admission limits.
+    /// 每笔新增风险订单都必须经过的组合级限制。
     #[serde(default)]
     pub portfolio: PortfolioConfig,
-    /// One atomic checkpoint for every instrument and the shared risk state.
+    /// 覆盖全部标的和共享风险状态的单一原子检查点。
     pub state_path: Option<PathBuf>,
-    /// Runner-owned environment/account identity.
+    /// 由 runner 提供的环境/账户身份。
     pub recovery_context: Option<String>,
 }
 
@@ -111,11 +111,11 @@ fn default_position_fraction() -> Decimal {
 }
 
 impl MultiAssetGridConfig {
-    /// Validates ownership, instrument keys, cash allocations and both risk layers.
+    /// 校验订单归属、标的键、现金分配及单标的/组合两层风险配置。
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid budgets, inconsistent bar keys, multiple venues or unsafe lifecycle settings.
+    /// 预算无效、K 线标的不一致、混用多个交易场所或生命周期设置不安全时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         self.base.validate()?;
         self.portfolio.validate()?;
@@ -211,16 +211,16 @@ impl From<DynamicGridConfig> for MultiAssetGridConfig {
     }
 }
 
-/// Portfolio and instrument PnL remain separately inspectable, without summing instrument Sharpe ratios.
+/// 组合与单标的盈亏分别可审计；不会错误地把各标的 Sharpe 相加。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PortfolioReport {
-    /// Statistics computed from the shared marked-equity path.
+    /// 从共享组合权益曲线计算的统计结果。
     pub portfolio: PerformanceTracker,
-    /// Independently funded attribution sleeves, including their open inventory.
+    /// 各标的独立归因结果，包含尚未卖出的库存。
     pub instruments: BTreeMap<InstrumentId, PerformanceTracker>,
-    /// Shared loss limits, budget decisions and correlation history.
+    /// 共享亏损限制、预算决策与相关性历史。
     pub risk: PortfolioRiskManager,
-    /// Trailing completed-day Pearson matrix; None means insufficient aligned observations.
+    /// 使用已完成交易日计算的滚动 Pearson 相关矩阵；None 表示对齐样本不足。
     pub correlations: BTreeMap<InstrumentId, BTreeMap<InstrumentId, Option<f64>>>,
 }
 
@@ -241,7 +241,7 @@ struct Checkpoint {
     positions: Vec<Position>,
 }
 
-/// One native `StrategyCore`; instrument engines are state machines, never nested Strategy instances.
+/// 全组合只使用一个原生 `StrategyCore`；单标的引擎只是状态机，不嵌套 Strategy 实例。
 #[derive(Debug)]
 pub struct MultiAssetGridStrategy {
     core: StrategyCore,
@@ -259,11 +259,11 @@ pub struct MultiAssetGridStrategy {
 }
 
 impl MultiAssetGridStrategy {
-    /// Builds all independent engines and locks their single atomic recovery file.
+    /// 构建全部独立标的引擎，并独占锁定统一的原子恢复文件。
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid configuration, incompatible/corrupt state or another checkpoint writer.
+    /// 配置无效、状态不兼容/损坏，或已有其他进程写入检查点时返回错误。
     pub fn new(config: impl Into<MultiAssetGridConfig>) -> anyhow::Result<Self> {
         let config = config.into();
         config.validate()?;
@@ -334,11 +334,11 @@ impl MultiAssetGridStrategy {
         })
     }
 
-    /// Returns the legacy single-instrument report handle.
+    /// 返回兼容旧接口的单标的报告句柄。
     ///
     /// # Panics
     ///
-    /// Panics for a portfolio; callers must use `portfolio_report_handle` or `instrument_report_handle`.
+    /// 多标的组合调用会 panic；此时必须使用 `portfolio_report_handle` 或 `instrument_report_handle`。
     #[must_use]
     pub fn report_handle(&self) -> Rc<RefCell<PerformanceTracker>> {
         assert_eq!(
@@ -356,7 +356,7 @@ impl MultiAssetGridStrategy {
         )
     }
 
-    /// Returns one instrument's independent report without changing active instrument context.
+    /// 返回指定标的的独立报告，不改变当前事件处理上下文。
     #[must_use]
     pub fn instrument_report_handle(
         &self,
@@ -365,13 +365,13 @@ impl MultiAssetGridStrategy {
         self.engines.get(&id).map(|e| Rc::clone(&e.report))
     }
 
-    /// Returns the complete shared report, finalized after the native stop/drain.
+    /// 返回完整共享报告；原生停止并排空事件后才会完成最终统计。
     #[must_use]
     pub fn portfolio_report_handle(&self) -> Rc<RefCell<PortfolioReport>> {
         Rc::clone(&self.report)
     }
 
-    /// Returns the portfolio lifecycle barrier or the single-instrument compatibility state.
+    /// 返回组合生命周期屏障状态，单标的模式则返回兼容状态。
     #[must_use]
     pub fn state(&self) -> StrategyState {
         if self.stopped {
@@ -396,17 +396,17 @@ impl MultiAssetGridStrategy {
         }
     }
 
-    /// Returns one engine's lifecycle; another instrument cannot overwrite it.
+    /// 返回指定标的引擎状态；其他标的事件不能覆盖它。
     #[must_use]
     pub fn instrument_state(&self, id: InstrumentId) -> Option<StrategyState> {
         self.engines.get(&id).map(|e| e.state.state)
     }
 
-    /// Restores all native orders and positions before broker reconciliation begins.
+    /// 在券商对账开始前恢复全部 Nautilus 原生订单与持仓。
     ///
     /// # Errors
     ///
-    /// Returns an error if the destination is not empty or the native cache rejects a snapshot.
+    /// 目标缓存非空或 Nautilus 缓存拒绝快照时返回错误。
     pub fn restore_cache(&self, cache: &mut Cache) -> anyhow::Result<()> {
         if let Some(saved) = &self.loaded {
             for order in &saved.orders {
@@ -478,7 +478,7 @@ impl MultiAssetGridStrategy {
     fn account_capacity(&self, current: &GridStrategyEngine) -> anyhow::Result<(Decimal, Decimal)> {
         let sid = self.config.base.strategy_id.expect("Validated identity");
 
-        // Scoped native reads preserve all ownership checks without copying event histories
+        // 在限定作用域内读取原生状态，既保留所有权检查，也避免复制不断增长的事件历史。
         let cache = self.core.cache_ref();
         for position in cache.positions_open_refs(None, None, None, None, None) {
             anyhow::ensure!(
@@ -600,7 +600,7 @@ impl MultiAssetGridStrategy {
         let c = &current.config.grid;
         let unit = limit.unwrap_or(reference.max(current.state.last_price.unwrap_or(reference)))
             * (Decimal::ONE + c.maker_fee.max(c.taker_fee) + c.commission + c.slippage);
-        // This just-created intent is included in the ledger; exclude only itself from prior reservations
+        // 刚创建的意图已经进入账本；计算既有预留时只排除它自身。
         let view = views
             .iter_mut()
             .find(|v| v.id == current.config.instrument_id)
@@ -660,11 +660,11 @@ impl MultiAssetGridStrategy {
             && self.config.portfolio.risk_policy == super::config::RiskPolicy::Flatten
     }
 
-    /// Latches an operator halt and immediately requests cancellation of acquisition orders.
+    /// 锁存操作员停机指令，并立即请求撤销所有新增库存订单。
     ///
     /// # Errors
     ///
-    /// Returns an error if cancellation or durable state persistence fails; the halt stays latched.
+    /// 撤单或持久化失败时返回错误，但停机状态仍保持锁存。
     pub fn kill_switch(&mut self, reason: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             !reason.trim().is_empty(),
@@ -738,7 +738,7 @@ impl MultiAssetGridStrategy {
             })
             .collect();
         Checkpoint {
-            version: 5,
+            version: 6,
             config: self.config.clone(),
             instruments,
             portfolio_risk: self.portfolio_risk.clone(),
@@ -795,6 +795,11 @@ impl MultiAssetGridStrategy {
         let cash =
             self.config.portfolio.capital + views.iter().map(|v| v.cash_delta).sum::<Decimal>();
         let exposure = views.iter().map(|v| v.exposure).sum::<Decimal>();
+        let position = self
+            .engines
+            .values()
+            .map(|engine| engine.state.orders.inventory())
+            .sum();
         let equity = cash + exposure;
         let account = self
             .engines
@@ -814,7 +819,7 @@ impl MultiAssetGridStrategy {
             self.config.portfolio.capital,
             equity,
             exposure,
-            Decimal::ZERO,
+            position,
             now,
         );
         if record {
@@ -835,7 +840,7 @@ impl MultiAssetGridStrategy {
                 price: Decimal::ONE,
                 equity,
                 exposure,
-                position: Decimal::ZERO,
+                position,
                 utilization: if equity > Decimal::ZERO {
                     number((exposure + pending) / equity)
                 } else {
@@ -853,7 +858,7 @@ impl MultiAssetGridStrategy {
             }
             self.portfolio_performance.equity.push(point);
         }
-        // Shrinking budgets cancels entries only; cancellation uncertainty keeps every reservation
+        // 预算缩减只撤销新增库存订单；撤单结果未确认前仍保留全部资金占用。
         let pending: Decimal = views.iter().map(|v| v.pending).sum();
         let global_limit = self
             .config
@@ -964,9 +969,11 @@ impl MultiAssetGridStrategy {
             .values()
             .map(|e| (&e.state.orders, &e.state.risk))
             .collect();
+        let instrument_reports: Vec<_> = instruments.values().collect();
         self.portfolio_performance.finish_portfolio(
             self.config.portfolio.capital,
             &ledgers,
+            &instrument_reports,
             self.portfolio_risk.risk_off_reason.clone(),
         );
         let views = self.exposures(None);
@@ -982,11 +989,11 @@ impl MultiAssetGridStrategy {
         };
     }
 
-    /// Reconciles every instrument after native post-stop event draining, without resubmission.
+    /// Nautilus 停止后事件排空完毕，再逐标的对账，且不会重新提交订单。
     ///
     /// # Errors
     ///
-    /// Returns an error before stop or if any recovered inventory/order history is inconsistent.
+    /// 策略尚未停止，或任何恢复后的库存/订单历史不一致时返回错误。
     pub fn finalize_after_stop(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(self.stopped, "Finalization requires a stopped strategy");
         let now = self.clock().timestamp_ns().as_u64();
@@ -1005,12 +1012,12 @@ impl MultiAssetGridStrategy {
         self.persist(None, None)
     }
 
-    /// Explicitly resets both risk layers only after all orders, inventory and cash reconcile.
-    /// Runners never call this operator interface automatically.
+    /// 仅在全部订单、库存与现金对账一致后，显式重置单标的和组合两层风险。
+    /// Runner 绝不会自动调用这一操作员接口。
     ///
     /// # Errors
     ///
-    /// Returns an error for unresolved orders, stale marks or any remaining instrument/portfolio limit.
+    /// 存在未终结订单、行情过期，或仍违反任一单标的/组合限制时返回错误。
     pub fn reset_risk(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.stopped
@@ -1073,8 +1080,8 @@ impl MultiAssetGridStrategy {
 impl DataActor for MultiAssetGridStrategy {
     fn on_start(&mut self) -> anyhow::Result<()> {
         self.recovering = true;
-        // The native submission limiter is process-local. Wait out its complete window on restart
-        // rather than granting a second acquisition budget; covered reductions remain available.
+        // 原生提交限速器只存在于当前进程。重启后等待完整窗口结束，不能额外获得一份买入额度；
+        // 有真实库存覆盖的减仓仍可继续执行。
         let now = self.clock().timestamp_ns().as_u64();
         self.entries_resume_ns = now.saturating_add(nautilus_core::datetime::NANOSECONDS_IN_MINUTE);
         let sid = self.config.base.strategy_id.expect("Validated identity");
@@ -1159,7 +1166,7 @@ impl DataActor for MultiAssetGridStrategy {
         Ok(())
     }
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
-        // Invalid quotes cannot even advance portfolio time or marks
+        // 无效报价既不能推进组合时间，也不能更新估值价格。
         if quote.bid_price.as_decimal() <= Decimal::ZERO
             || quote.ask_price < quote.bid_price
             || quote.bid_size.is_zero()
@@ -1183,6 +1190,15 @@ impl DataActor for MultiAssetGridStrategy {
             .diagnostics
             .timer_events
             .saturating_add(1);
+        let now = self.clock().timestamp_ns().as_u64();
+        if self.config.state_path.is_none()
+            && self
+                .engines
+                .values()
+                .all(|engine| !engine.watchdog_required(now))
+        {
+            return Ok(());
+        }
         let ids: Vec<_> = self.engines.keys().copied().collect();
         for id in ids {
             self.with_engine(id, |engine, runtime| {
@@ -1192,7 +1208,6 @@ impl DataActor for MultiAssetGridStrategy {
                 Ok(())
             })?;
         }
-        let now = self.clock().timestamp_ns().as_u64();
         let interval = self
             .config
             .instruments
@@ -1395,7 +1410,7 @@ nautilus_strategy!(MultiAssetGridStrategy, {
 impl Checkpoint {
     fn validate(&self, expected: &MultiAssetGridConfig) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.version == 5
+            self.version == 6
                 && serde_json::to_value(&self.config)? == serde_json::to_value(expected)?,
             "Checkpoint version/configuration mismatch; audit before migration"
         );

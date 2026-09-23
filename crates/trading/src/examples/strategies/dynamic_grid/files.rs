@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Shared portfolio files for historical replay and broker runners.
+//! 历史回放与券商 runner 共用的组合配置文件模型。
 
 use std::{
     collections::BTreeMap,
@@ -33,48 +33,48 @@ use super::{
     DynamicGridConfig, InstrumentConfig, MultiAssetGridConfig, portfolio::PortfolioConfig,
 };
 
-/// Per-instrument execution metadata and files, separate from portfolio cash.
+/// 单标的执行元数据与数据文件；与组合共享现金配置分离。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GridInstrumentFile {
-    /// Independent signal, grid, risk and allocation configuration.
+    /// 独立的信号、网格、风险与资金分配配置。
     pub strategy: InstrumentConfig,
-    /// Fixed venue tick size.
+    /// 交易场所固定最小价位。
     pub price_increment: Price,
-    /// Tradable lot size.
+    /// 可交易最小数量单位。
     pub lot_size: Quantity,
-    /// Completed-bar CSV for this instrument only.
+    /// 仅包含本标的已完成 K 线的 CSV 文件。
     pub bars_path: PathBuf,
-    /// Optional actual quote replay file.
+    /// 可选的真实 Quote Tick 回放文件。
     pub quotes_path: Option<PathBuf>,
 }
 
-/// One account with multiple asynchronous instrument streams.
+/// 一个账户管理多条异步标的行情流的文件配置。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GridPortfolioFile {
-    /// Instrument IDs, rather than one global symbol.
+    /// 以 InstrumentId 为键的多标的配置，而非单一全局 symbol。
     pub instruments: BTreeMap<InstrumentId, GridInstrumentFile>,
-    /// Shared risk and initial capital.
+    /// 共享组合风险与初始资金配置。
     pub portfolio: PortfolioConfig,
-    /// Single account quote currency.
+    /// 单一账户报价币种。
     pub currency: Currency,
-    /// Deterministic native fill seed.
+    /// 原生成交模拟器的确定性随机种子。
     pub random_seed: u64,
-    /// One-tick slippage probability.
+    /// 发生一个 tick 滑点的概率。
     pub slippage_probability: f64,
-    /// Inclusive historical boundary.
+    /// 历史回放起始边界，包含该时刻。
     pub start_ns: Option<u64>,
-    /// Exclusive historical boundary.
+    /// 历史回放结束边界，不包含该时刻。
     pub end_ns: Option<u64>,
 }
 
 impl GridPortfolioFile {
-    /// Creates the same production strategy used by the Longbridge runner.
+    /// 创建与 Longbridge runner 完全相同的生产策略实例。
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid metadata, allocation or instrument ownership.
+    /// 元数据、资金分配或标的所有权无效时返回错误。
     pub fn strategy_config(&self) -> anyhow::Result<MultiAssetGridConfig> {
         let first = self
             .instruments
@@ -109,14 +109,14 @@ impl GridPortfolioFile {
     }
 }
 
-/// Loads inline instruments or instrument JSON paths relative to the portfolio file.
+/// 加载内联标的配置，或相对组合文件解析各标的 JSON 路径。
 ///
-/// Returns the resolved configuration and canonical configuration input paths for overwrite checks.
-/// Historical CSV paths retain their existing working-directory-relative semantics.
+/// 返回解析后的配置及规范化配置输入路径，以便检查输出覆盖输入。
+/// 历史 CSV 路径继续保持相对当前工作目录的既有语义。
 ///
 /// # Errors
 ///
-/// Returns an error for missing files, invalid JSON, unknown fields or inconsistent instruments.
+/// 文件缺失、JSON 无效、存在未知字段或标的配置不一致时返回错误。
 pub fn load_portfolio_config(path: &Path) -> anyhow::Result<(GridPortfolioFile, Vec<PathBuf>)> {
     let path = path
         .canonicalize()

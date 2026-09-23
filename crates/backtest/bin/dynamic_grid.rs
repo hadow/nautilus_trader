@@ -194,7 +194,9 @@ fn main() -> anyhow::Result<()> {
                 &json!({"source_config": config, "bars": bars.len(),
                 "quotes": quotes.len(), "first_ns": bars[0].ts_event, "last_ns": bars[bars.len()-1].ts_event,
                 "benchmarks": reports, "notes": [
-                    "Fixed and dynamic grids use the same geometric levels, capital, costs, filters, risk limits and native execution assumptions",
+                    "All benchmarks share data, capital, costs, portfolio limits and native execution assumptions",
+                    "ATR multipliers are converted when strategy modes change so per-level ATR spacing remains comparable",
+                    "Original DGT preserves the legacy inventory model; SADG adds stock gates and target-position sleeves",
                     "Fixed grids stop new entries at the first boundary; inventory follows the same configured risk policy",
                     "Buy-and-hold is equal-weight without rebalancing; its exposure differs from risk-limited grids",
                     "Bar-only replay models intrabar order; no real spread or queue data is fabricated",

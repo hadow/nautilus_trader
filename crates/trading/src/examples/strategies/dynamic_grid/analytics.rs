@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Equity-path and grid-cycle metrics. Ratios are statistics; cash accounting stays Decimal.
+//! 权益曲线与网格周期指标；统计比例可用浮点数，现金核算始终使用 Decimal。
 
 use std::collections::BTreeMap;
 
@@ -28,47 +28,47 @@ use super::{
     risk::RiskManager,
 };
 
-/// One causal marked-equity observation.
+/// 一个只使用当时可得信息的因果权益估值点。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EquityPoint {
-    /// Aggregate marked inventory of independently trending sleeves; None uses this point's regime.
+    /// 各独立标的中处于趋势状态的库存市值合计；None 表示使用本点的 regime 判断。
     #[serde(default)]
     pub trend_inventory: Option<Decimal>,
-    /// Cumulative charged/estimated fees known at this timestamp, for causal cost diagnostics.
+    /// 截至该时刻已知的累计真实/估算费用，用于因果成本诊断。
     #[serde(default)]
     pub cumulative_fees: Decimal,
-    /// Cumulative traded notional known at this timestamp, for incremental slippage stress.
+    /// 截至该时刻已知的累计成交名义金额，用于增量滑点压力测试。
     #[serde(default)]
     pub cumulative_turnover: Decimal,
-    /// Observation timestamp.
+    /// 观测时间戳。
     pub ts_ns: u64,
-    /// Price used to mark inventory.
+    /// 库存估值使用的市场价格。
     pub price: Decimal,
-    /// Strategy cash plus marked inventory.
+    /// 策略现金与库存市值之和。
     pub equity: Decimal,
-    /// Marked inventory.
+    /// 库存市值。
     pub exposure: Decimal,
-    /// Filled quantity.
+    /// 实际成交持仓数量。
     pub position: Decimal,
-    /// Inventory plus unresolved buy reservations divided by equity.
+    /// 库存与未终结买入预留之和占权益的比例。
     pub utilization: f64,
-    /// Current market classification.
+    /// 当前市场状态分类。
     pub regime: MarketRegime,
 }
 
-/// Shared output captured by runners without depending on a particular execution client.
+/// Runner 共用的输出容器，不依赖具体执行客户端。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PerformanceTracker {
-    /// Passive diagnostics; absent legacy observations remain empty rather than reconstructed.
+    /// 被动诊断数据；旧检查点缺失的历史不会被虚构重建。
     #[serde(default)]
     pub diagnostics: GridDiagnostics,
-    /// Marked observations at completed bars and final shutdown.
+    /// 已完成 K 线时及最终停止时记录的权益估值点。
     pub equity: Vec<EquityPoint>,
-    /// Completed inventory cycles.
+    /// 已完成库存周期。
     pub cycles: Vec<GridCycle>,
-    /// Computed metrics, including open inventory in total return and drawdown.
+    /// 汇总指标；总收益与回撤均包含未平库存。
     pub metrics: GridMetrics,
-    /// Latched hard-limit reason, if any.
+    /// 已锁存的硬性风险原因（如有）。
     pub risk_off_reason: Option<String>,
     #[serde(default)]
     mark_peak: Decimal,
@@ -76,128 +76,162 @@ pub struct PerformanceTracker {
     mark_peak_ns: Option<u64>,
 }
 
-/// Report statistics; undefined ratios are None rather than fabricated infinities.
+/// 报告统计指标；无定义的比例返回 None，不伪造无穷大。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GridMetrics {
-    /// Annualized standard deviation of observed daily marked returns, using 252 days.
+    /// 已观测日度权益收益的年化标准差，按每年 252 个交易日计算。
     #[serde(default)]
     pub annualized_volatility: Option<f64>,
-    /// Exact marked PnL per observed UTC date, including open inventory and fees.
+    /// 按 UTC 日期统计的精确权益盈亏，包含未平库存与费用。
     #[serde(default)]
     pub daily_pnl: BTreeMap<String, Decimal>,
-    /// Exact marked PnL per observed UTC month, including unrecovered inventory losses.
+    /// 按 UTC 月份统计的精确权益盈亏，包含尚未恢复的库存亏损。
     #[serde(default)]
     pub monthly_pnl: BTreeMap<String, Decimal>,
-    /// Fraction of retained order intents with at least one fill; partial fills count once.
+    /// 至少发生一次成交的订单意图比例；部分成交只计一次。
     #[serde(default)]
     pub grid_fill_rate: Option<f64>,
-    /// Lifetime completed resets across all instruments.
+    /// 全部标的在策略生命周期内完成的网格重置总数。
     #[serde(default)]
     pub total_grid_resets: u64,
-    /// Absolute traded notional, not the normalized turnover ratio.
+    /// 绝对成交名义金额，而非归一化换手率。
     #[serde(default)]
     pub turnover: Decimal,
-    /// Final marked return / initial capital.
+    /// 最终按市值收益除以初始资金。
     pub total_return: f64,
-    /// Geometrically annualized return (same definition as CAGR).
+    /// 几何年化收益率，与 CAGR 使用相同定义。
     pub annualized_return: Option<f64>,
-    /// Compound annual growth rate, requiring positive terminal equity.
+    /// 复合年增长率；要求期末权益为正。
     pub cagr: Option<f64>,
-    /// Zero-risk-free daily Sharpe, 252 trading days per year.
+    /// 无风险利率取零的日度 Sharpe，按每年 252 个交易日年化。
     pub sharpe: Option<f64>,
-    /// Daily downside deviation Sortino.
+    /// 使用日度下行标准差计算的 Sortino。
     pub sortino: Option<f64>,
-    /// Maximum peak-to-trough equity decline fraction.
+    /// 权益从峰值到谷值的最大下降比例。
     pub max_drawdown: f64,
-    /// CAGR divided by maximum drawdown.
+    /// CAGR 除以最大回撤。
     pub calmar: Option<f64>,
-    /// Maximum duration below the prior high-water mark, including unrecovered tails.
+    /// 权益低于此前高水位的最长持续时间，包含期末尚未修复的回撤。
     pub drawdown_duration_secs: f64,
-    /// Winning completed cycle fraction.
+    /// 盈利完成周期占全部完成周期的比例。
     pub win_rate: Option<f64>,
-    /// Winning tactical grid-cycle fraction, excluding core rebalances.
+    /// 盈利战术网格周期比例，不包含核心仓再平衡。
     #[serde(default)]
     pub grid_cycle_win_rate: Option<f64>,
-    /// Positive completed net profits divided by negative completed net losses.
+    /// 完成周期正净利润之和除以负净亏损绝对值之和。
     pub profit_factor: Option<f64>,
-    /// Number of unique executions, including partial fills.
+    /// 去重后的成交次数，包含部分成交。
     pub number_of_trades: u64,
-    /// Number of completed inventory cycles.
+    /// 已完成库存周期数量。
     pub number_of_grid_cycles: usize,
-    /// Completed core-sleeve reductions, excluded from grid-cycle statistics.
+    /// 已完成核心仓减仓次数，不计入网格周期统计。
     #[serde(default)]
     pub number_of_core_rebalances: usize,
-    /// Average completed cycle net profit.
+    /// 已完成网格周期平均净利润。
     pub average_grid_profit: Option<f64>,
-    /// Mean first-entry-to-final-exit duration.
+    /// 从首次入场到最终出场的平均持续时间。
     pub average_holding_time_secs: Option<f64>,
-    /// Completed-cycle profit at decision prices before fees and slippage.
+    /// 已完成周期按决策价格计算、未扣费用与滑点的利润。
     pub gross_pnl: Decimal,
-    /// Total marked PnL including unsold inventory and all fees.
+    /// 包含未卖库存和全部费用的总权益盈亏。
     pub net_pnl: Decimal,
-    /// Realized PnL, including partial reductions.
+    /// 已实现盈亏，包含部分减仓。
     pub realized_pnl: Decimal,
-    /// Realized PnL attributed to the long-lived core sleeve.
+    /// 归属于长期核心仓的已实现盈亏。
     #[serde(default)]
     pub core_realized_pnl: Decimal,
-    /// Realized PnL attributed to tactical grid inventory.
+    /// 归属于战术网格库存的已实现盈亏。
     #[serde(default)]
     pub grid_realized_pnl: Decimal,
-    /// Marked PnL attributable to unsold inventory, including its remaining entry costs.
+    /// 归属于未卖库存的按市值盈亏，包含其剩余入场成本。
     #[serde(default)]
     pub unrealized_pnl: Decimal,
-    /// All entry/exit fees, including open inventory.
+    /// 常规交易时段开盘跳空造成的按市值盈亏。
+    #[serde(default)]
+    pub gap_pnl: Decimal,
+    /// 常规交易时段开盘跳空中亏损部分的绝对值。
+    #[serde(default)]
+    pub gap_loss: Decimal,
+    /// 归因于上升/下降趋势状态的亏损绝对值。
+    #[serde(default)]
+    pub trend_loss: Decimal,
+    /// 全部入场与出场费用，包含未平库存的入场费用。
     pub fees: Decimal,
-    /// Number of fills with estimated instead of reported fees.
+    /// 使用估算费用而非券商回报费用的成交数量。
     pub estimated_fee_fills: u64,
-    /// Signed execution shortfall; already included in PnL.
+    /// 有符号执行损耗，已经计入盈亏。
     pub slippage: Decimal,
-    /// Time-weighted mean capital utilization.
+    /// 非负的不利执行损耗。
+    #[serde(default)]
+    pub slippage_cost: Decimal,
+    /// 非负的有利成交价格改善。
+    #[serde(default)]
+    pub price_improvement: Decimal,
+    /// 按时间加权的平均资金利用率。
     pub capital_utilization: f64,
-    /// Total marked return divided by time-weighted capital utilization; undefined when unused.
+    /// 总权益收益除以时间加权资金利用率；资金从未使用时无定义。
     pub capital_efficiency: Option<f64>,
-    /// Maximum marked exposure.
+    /// 最大库存市值暴露。
     pub maximum_exposure: Decimal,
-    /// Maximum filled quantity.
+    /// 最大实际成交持仓数量。
     pub maximum_position: Decimal,
-    /// Time-weighted mean filled quantity.
+    /// 按时间加权的平均实际持仓数量。
     #[serde(default)]
     pub average_inventory: f64,
-    /// Elapsed seconds with nonzero filled inventory.
+    /// 实际库存非零的累计秒数。
     #[serde(default)]
     pub inventory_duration_secs: f64,
-    /// Maximum resets without a profitable completed cycle.
+    /// 未出现盈利完成周期时的最大连续重置次数。
     pub maximum_grid_reset_count: u32,
-    /// Realized completed grid profit divided by initial capital.
+    /// 已完成网格周期的已实现利润除以初始资金。
     pub grid_efficiency: f64,
-    /// Traded notional divided by initial capital.
+    /// 成交名义金额除以初始资金。
     pub grid_turnover: f64,
-    /// Completed net cycle profit / completed decision-price gross profit.
+    /// 已完成周期净利润除以按决策价格计算的毛利润。
     pub grid_capture_ratio: Option<f64>,
-    /// Total fees / positive completed decision-price gross profit.
+    /// 总费用除以正向的已完成周期决策价毛利润。
     pub fee_gross_profit_ratio: Option<f64>,
-    /// Time-weighted inventory exposure / initial capital.
+    /// 时间加权库存暴露除以初始资金。
     pub inventory_exposure: f64,
-    /// Long-only directional exposure, equal to inventory exposure.
+    /// 仅做多方向暴露，与库存暴露相同。
     pub directional_exposure: f64,
-    /// Time-weighted trend inventory exposure / initial capital.
+    /// 时间加权趋势状态库存暴露除以初始资金。
     pub trend_exposure: f64,
-    /// Resets per elapsed day.
+    /// 每个自然流逝日的网格重置次数。
     pub reset_frequency: f64,
-    /// Worst completed tactical grid cycle.
+    /// 回放期间实际创建的网格数量。
+    #[serde(default)]
+    pub grid_creation_count: usize,
+    /// 网格下边界到上边界完整宽度相对中心价的平均比例。
+    #[serde(default)]
+    pub average_grid_width: Option<f64>,
+    /// 相邻网格层级间距比例的平均值。
+    #[serde(default)]
+    pub average_grid_spacing: Option<f64>,
+    /// 已完成对账、且退出网格没有任何入场成交的重置次数。
+    #[serde(default)]
+    pub false_reset_count: usize,
+    /// 退出网格没有入场成交的重置占全部已对账重置的比例。
+    #[serde(default)]
+    pub false_reset_rate: Option<f64>,
+    /// 已发送的旧网格撤单请求数量，用于衡量网格 churn。
+    #[serde(default)]
+    pub grid_churn: u64,
+    /// 最差的已完成战术网格周期净盈亏。
     #[serde(default)]
     pub worst_grid_cycle: Option<Decimal>,
-    /// Marked equity changes assigned to the causal regime at interval start.
+    /// 按区间起点的因果市场状态归因的权益变化。
     #[serde(default)]
     pub regime_pnl: BTreeMap<String, Decimal>,
 }
 
 impl PerformanceTracker {
-    /// Computes portfolio statistics from its own marked path and independent exact-money ledgers.
+    /// 使用组合自身权益曲线与各标的精确金额账本计算组合统计。
     pub fn finish_portfolio(
         &mut self,
         capital: Decimal,
         ledgers: &[(&OrderManager, &RiskManager)],
+        instrument_reports: &[&Self],
         risk_off_reason: Option<String>,
     ) {
         let mut merged = OrderManager::new(capital);
@@ -212,6 +246,63 @@ impl PerformanceTracker {
             .cycles
             .sort_by(|a, b| a.entry_order_id.cmp(&b.entry_order_id));
         self.finish(capital, &merged, &risk);
+        self.metrics.regime_pnl.clear();
+        for report in instrument_reports {
+            for (regime, pnl) in &report.metrics.regime_pnl {
+                *self.metrics.regime_pnl.entry(regime.clone()).or_default() += pnl;
+            }
+        }
+        self.metrics.gap_pnl = instrument_reports
+            .iter()
+            .map(|report| report.metrics.gap_pnl)
+            .sum();
+        self.metrics.gap_loss = instrument_reports
+            .iter()
+            .map(|report| report.metrics.gap_loss)
+            .sum();
+        self.metrics.trend_loss = instrument_reports
+            .iter()
+            .map(|report| report.metrics.trend_loss)
+            .sum();
+        self.metrics.grid_creation_count = instrument_reports
+            .iter()
+            .map(|report| report.metrics.grid_creation_count)
+            .sum();
+        let creations = self.metrics.grid_creation_count as f64;
+        self.metrics.average_grid_width = (creations > 0.0).then(|| {
+            instrument_reports
+                .iter()
+                .filter_map(|report| {
+                    report
+                        .metrics
+                        .average_grid_width
+                        .map(|width| width * report.metrics.grid_creation_count as f64)
+                })
+                .sum::<f64>()
+                / creations
+        });
+        self.metrics.average_grid_spacing = (creations > 0.0).then(|| {
+            instrument_reports
+                .iter()
+                .filter_map(|report| {
+                    report
+                        .metrics
+                        .average_grid_spacing
+                        .map(|spacing| spacing * report.metrics.grid_creation_count as f64)
+                })
+                .sum::<f64>()
+                / creations
+        });
+        self.metrics.false_reset_count = instrument_reports
+            .iter()
+            .map(|report| report.metrics.false_reset_count)
+            .sum();
+        self.metrics.false_reset_rate = (self.metrics.total_grid_resets > 0)
+            .then(|| self.metrics.false_reset_count as f64 / self.metrics.total_grid_resets as f64);
+        self.metrics.grid_churn = instrument_reports
+            .iter()
+            .map(|report| report.metrics.grid_churn)
+            .sum();
         let submitted: usize = ledgers
             .iter()
             .map(|(o, _)| {
@@ -235,7 +326,7 @@ impl PerformanceTracker {
         self.metrics.grid_fill_rate = (submitted > 0).then(|| filled as f64 / submitted as f64);
     }
 
-    /// Tracks intrabar risk extrema without retaining every quote in memory.
+    /// 不保留全部报价，仅更新盘中风险极值。
     pub fn observe_mark(
         &mut self,
         capital: Decimal,
@@ -263,7 +354,7 @@ impl PerformanceTracker {
         self.metrics.maximum_position = self.metrics.maximum_position.max(position);
     }
 
-    /// Updates final statistics from the order/risk ledgers.
+    /// 根据订单账本与风险状态更新最终统计。
     pub fn finish(&mut self, capital: Decimal, orders: &OrderManager, risk: &RiskManager) {
         self.cycles.clone_from(&orders.cycles);
         self.risk_off_reason.clone_from(&risk.risk_off_reason);
@@ -333,6 +424,11 @@ impl PerformanceTracker {
             }
         }
         m.regime_pnl = regime_pnl;
+        m.trend_loss = ["TrendUp", "TrendDown"]
+            .iter()
+            .filter_map(|regime| m.regime_pnl.get(*regime))
+            .map(|pnl| (-*pnl).max(Decimal::ZERO))
+            .sum();
         let mut previous = number(capital);
         let changes = |mut values: BTreeMap<String, Decimal>| {
             let mut previous = capital;
@@ -437,6 +533,8 @@ impl PerformanceTracker {
         m.fees = orders.fees;
         m.estimated_fee_fills = orders.estimated_fee_fills;
         m.slippage = orders.slippage;
+        m.slippage_cost = orders.adverse_slippage;
+        m.price_improvement = orders.price_improvement;
         m.capital_utilization = if seconds > 0.0 {
             utilization_time / seconds
         } else {
@@ -474,6 +572,32 @@ impl PerformanceTracker {
         } else {
             0.0
         };
+        m.grid_creation_count = self.diagnostics.grids.len();
+        m.average_grid_width = (!self.diagnostics.grids.is_empty()).then(|| {
+            self.diagnostics
+                .grids
+                .iter()
+                .map(|grid| number((grid.upper_bound - grid.lower_bound) / grid.center))
+                .sum::<f64>()
+                / self.diagnostics.grids.len() as f64
+        });
+        m.average_grid_spacing = (!self.diagnostics.grids.is_empty()).then(|| {
+            self.diagnostics
+                .grids
+                .iter()
+                .map(|grid| number(grid.spacing))
+                .sum::<f64>()
+                / self.diagnostics.grids.len() as f64
+        });
+        m.false_reset_count = self
+            .diagnostics
+            .resets
+            .iter()
+            .filter(|reset| reset.entry_orders_with_fills == 0)
+            .count();
+        m.false_reset_rate = (!self.diagnostics.resets.is_empty())
+            .then(|| m.false_reset_count as f64 / self.diagnostics.resets.len() as f64);
+        m.grid_churn = self.diagnostics.cancellations.len() as u64;
         m.worst_grid_cycle = grid_cycles.iter().map(|cycle| cycle.net_pnl).min();
     }
 }

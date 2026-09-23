@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Durable intent identities, partial-fill inventory and exact cycle accounting.
+//! 持久化订单意图标识、部分成交库存管理与精确网格周期核算。
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,43 +25,43 @@ use serde::{Deserialize, Serialize};
 
 use super::{config::GridConfig, engine::GridLevel};
 
-/// Inventory ownership inside one stock position.
+/// 单个股票持仓内部的库存归属。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionComponent {
-    /// Long-lived inventory which ordinary grid profit-taking cannot sell.
+    /// 长期核心库存，普通网格止盈不能卖出。
     Core,
-    /// Tactical inventory owned by grid cycles.
+    /// 由网格周期持有的战术库存。
     #[default]
     Grid,
 }
 
-/// Submission/cancellation uncertainty remains an active reservation.
+/// 订单提交或撤销结果不确定时，仍视为有效资金与仓位预留。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderPhase {
-    /// Persisted before dispatch.
+    /// 已先行持久化，但尚未发送至执行引擎。
     Intent,
-    /// Transport has received the command.
+    /// 执行传输层已收到命令。
     Submitted,
-    /// Broker accepted the order.
+    /// 券商已接受订单。
     Accepted,
-    /// Some inventory has actually filled.
+    /// 已发生部分真实成交。
     PartiallyFilled,
-    /// Cancellation requested but not confirmed.
+    /// 已请求撤单，但尚未确认。
     CancelPending,
-    /// Timeout, disconnect or cancel rejection requires reconciliation.
+    /// 因超时、断线或撤单拒绝而需要与券商对账。
     Unknown,
-    /// All quantity executed.
+    /// 全部委托数量已成交。
     Filled,
-    /// Confirmed cancellation.
+    /// 撤单已确认。
     Cancelled,
-    /// Broker-confirmed expiry.
+    /// 券商已确认订单过期。
     Expired,
-    /// Definitive submission rejection.
+    /// 订单提交被明确拒绝。
     Rejected,
 }
 
 impl OrderPhase {
-    /// Whether further fills are no longer expected from the broker.
+    /// 券商是否已不可能再回报该订单的新成交。
     #[must_use]
     pub fn terminal(self) -> bool {
         matches!(
@@ -71,144 +71,150 @@ impl OrderPhase {
     }
 }
 
-/// One immutable order intent plus its observed lifecycle.
+/// 一笔不可变订单意图及其已观测生命周期。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GridOrder {
-    /// Client identity also used as the broker idempotency key.
+    /// 客户端订单标识，同时作为券商侧幂等键。
     pub id: String,
-    /// Grid generation.
+    /// 所属网格代次。
     pub grid_id: u64,
-    /// Signed pair index.
+    /// 有符号网格层级索引。
     pub level: i32,
-    /// Core or tactical grid inventory.
+    /// 订单归属核心仓或战术网格仓。
     #[serde(default)]
     pub component: PositionComponent,
-    /// True for inventory acquisition; false for a covered sale.
+    /// true 表示买入库存，false 表示有库存覆盖的卖出。
     pub buy: bool,
-    /// Requested quantity.
+    /// 委托总数量。
     pub quantity: Decimal,
-    /// Incremental fills accumulated exactly once.
+    /// 已去重并只累计一次的增量成交数量。
     pub filled: Decimal,
-    /// Limit price, or None for a seed/risk-reduction market order.
+    /// 限价；建立种子仓或风险减仓的市价单为 None。
     pub limit: Option<Decimal>,
-    /// Decision price used to measure execution slippage.
+    /// 产生订单意图时的参考价，用于衡量执行滑点。
     pub reference: Decimal,
-    /// Entry order whose inventory backs a sale, or self for a buy.
+    /// 为卖单提供库存的入场订单标识；买单则指向自身。
     pub lot_id: String,
-    /// Latest known phase.
+    /// 最近已知订单阶段。
     pub phase: OrderPhase,
-    /// Most recent control-plane transition timestamp.
+    /// 最近一次控制面状态变更时间戳。
     pub updated_ns: u64,
 }
 
-/// Filled inventory and aggregate economics for one buy-to-sell cycle.
+/// 单个买入到卖出周期的成交库存与累计经济结果。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InventoryLot {
-    /// Entry identity.
+    /// 入场订单标识。
     pub id: String,
-    /// Original grid generation.
+    /// 原始网格代次。
     pub grid_id: u64,
-    /// Original pair index.
+    /// 原始网格层级索引。
     pub level: i32,
-    /// Core or tactical grid inventory.
+    /// 库存归属核心仓或战术网格仓。
     #[serde(default)]
     pub component: PositionComponent,
-    /// Original profit-taking target, retained across resets.
+    /// 原始止盈目标；网格重置后仍保留。
     pub target: Decimal,
-    /// Quantity acquired.
+    /// 已买入数量。
     pub bought: Decimal,
-    /// Quantity sold.
+    /// 已卖出数量。
     pub sold: Decimal,
-    /// Actual entry cash value before fees.
+    /// 未扣费用的实际买入成交金额。
     pub entry_value: Decimal,
-    /// Actual exit cash value before fees.
+    /// 未扣费用的实际卖出成交金额。
     pub exit_value: Decimal,
-    /// Unallocated entry cash and fees for remaining inventory.
+    /// 剩余库存尚未分摊完的入场金额与费用。
     pub remaining_cost: Decimal,
-    /// Sum of entry and exit fees.
+    /// 入场与出场费用合计。
     pub fees: Decimal,
-    /// Signed execution shortfall relative to intent prices.
+    /// 相对订单意图价格的有符号执行损耗；负值表示价格改善。
     pub slippage: Decimal,
-    /// Hypothetical entry value at decision prices.
+    /// 按决策参考价计算的理论入场金额。
     pub entry_reference: Decimal,
-    /// Hypothetical exit value at decision prices.
+    /// 按决策参考价计算的理论出场金额。
     pub exit_reference: Decimal,
-    /// First fill time.
+    /// 首次成交时间。
     pub first_fill_ns: Option<u64>,
-    /// Latest exit fill time.
+    /// 最近一次出场成交时间。
     pub last_fill_ns: u64,
-    /// Whether the completed cycle has been emitted.
+    /// 完成周期是否已经写入统计，防止重复结算。
     pub recorded: bool,
 }
 
-/// An individually completed inventory cycle (including partial-entry cancellation).
+/// 一个独立完成的库存周期，也包含部分买入后撤销剩余委托的情况。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GridCycle {
-    /// Original entry identity.
+    /// 原始入场订单标识。
     pub entry_order_id: String,
-    /// Original generation.
+    /// 原始网格代次。
     pub grid_id: u64,
-    /// Core rebalance or completed tactical grid cycle.
+    /// 核心仓再平衡周期或已完成的战术网格周期。
     #[serde(default)]
     pub component: PositionComponent,
-    /// Average actual entry price.
+    /// 实际平均入场价。
     pub entry_price: Decimal,
-    /// Average actual exit price.
+    /// 实际平均出场价。
     pub exit_price: Decimal,
-    /// Matched quantity.
+    /// 完成买卖配对的数量。
     pub quantity: Decimal,
-    /// Decision-price profit before execution shortfall and fees.
+    /// 未扣执行损耗和费用、按决策价格计算的毛利润。
     pub gross_pnl: Decimal,
-    /// Actual fill-price profit before fees.
+    /// 未扣费用、按实际成交价格计算的利润。
     pub execution_pnl: Decimal,
-    /// Entry and exit costs.
+    /// 入场与出场费用。
     pub fees: Decimal,
-    /// Signed slippage, negative for price improvement.
+    /// 有符号滑点；负值表示成交价格改善。
     pub slippage: Decimal,
-    /// Gross profit minus fees and slippage, exactly once.
+    /// 毛利润只扣一次费用与滑点后的净利润。
     pub net_pnl: Decimal,
-    /// Time from first buy fill to final sell fill.
+    /// 从首次买入成交到最后一次卖出成交的持有时间。
     pub holding_ns: u64,
 }
 
-/// Persisted ledger. No submission is treated as a fill.
+/// 可持久化订单账本；任何“已提交”状态都不会被当作成交。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrderManager {
-    /// All intent identities, including terminal orders for replay deduplication.
+    /// 全部订单意图标识，包括用于重放去重的已终结订单。
     orders: BTreeMap<String, GridOrder>,
-    /// Entry lots and their retained inventory.
+    /// 入场批次及其仍保留的库存。
     lots: BTreeMap<String, InventoryLot>,
-    /// Individually completed cycles.
+    /// 逐笔完成的库存周期。
     pub cycles: Vec<GridCycle>,
-    /// Locally allocated cash including actual/estimated fill costs.
+    /// 本地分配现金，已计入真实或估算的成交费用。
     pub cash: Decimal,
-    /// Realized PnL including partial reductions.
+    /// 已实现盈亏，包含部分减仓。
     pub realized_pnl: Decimal,
-    /// Exact realized PnL from long-lived core rebalances.
+    /// 长期核心仓再平衡产生的精确已实现盈亏。
     #[serde(default)]
     core_realized_pnl: Decimal,
-    /// Exact realized PnL from tactical grid inventory.
+    /// 战术网格仓产生的精确已实现盈亏。
     #[serde(default)]
     grid_realized_pnl: Decimal,
-    /// Total charged or estimated fees, including open inventory.
+    /// 已收取或估算的费用合计，包含未平库存的入场费用。
     pub fees: Decimal,
-    /// Number of fills whose fees were estimated.
+    /// 费用使用估算值的成交数量。
     pub estimated_fee_fills: u64,
-    /// Number of unique fills.
+    /// 去重后的成交数量。
     pub fill_count: u64,
-    /// Total traded notional.
+    /// 总成交名义金额。
     pub turnover: Decimal,
-    /// Traded notional attributable to core rebalances.
+    /// 归属于核心仓再平衡的成交名义金额。
     #[serde(default)]
     core_turnover: Decimal,
-    /// Traded notional attributable to tactical grid orders.
+    /// 归属于战术网格订单的成交名义金额。
     #[serde(default)]
     grid_turnover: Decimal,
-    /// Signed slippage across all fills.
+    /// 全部成交的有符号滑点。
     pub slippage: Decimal,
+    /// 全部成交的不利执行损耗。
+    #[serde(default)]
+    pub adverse_slippage: Decimal,
+    /// 全部成交的有利价格改善。
+    #[serde(default)]
+    pub price_improvement: Decimal,
     sequence: u64,
     seen_fills: BTreeSet<(String, String)>,
-    // Derived only: never trust or persist an index received in a checkpoint.
+    // 纯派生索引：绝不信任或持久化检查点中传入的索引。
     #[serde(skip)]
     live: OnceLock<LiveLedger>,
 }
@@ -236,7 +242,7 @@ impl PositionComponent {
 }
 
 impl OrderManager {
-    /// Merges immutable accounting totals for a portfolio report, never for live trading.
+    /// 仅为组合报告合并不可变核算结果，绝不用于实盘交易状态。
     pub(super) fn merge_report(&mut self, other: &Self) {
         self.cycles.extend(other.cycles.iter().cloned());
         self.realized_pnl += other.realized_pnl;
@@ -244,6 +250,8 @@ impl OrderManager {
         self.grid_realized_pnl += other.grid_realized_pnl;
         self.fees += other.fees;
         self.slippage += other.slippage;
+        self.adverse_slippage += other.adverse_slippage;
+        self.price_improvement += other.price_improvement;
         self.turnover += other.turnover;
         self.core_turnover += other.core_turnover;
         self.grid_turnover += other.grid_turnover;
@@ -251,21 +259,21 @@ impl OrderManager {
         self.estimated_fee_fills += other.estimated_fee_fills;
     }
 
-    /// Immutable audit history. Mutations must invalidate the derived live index.
+    /// 不可变订单审计历史；任何修改都必须使派生实时索引失效。
     #[must_use]
     pub fn orders(&self) -> &BTreeMap<String, GridOrder> {
         &self.orders
     }
 
-    /// Immutable ownership and cycle history, including retired grids.
+    /// 不可变库存归属与周期历史，包含已退出的网格代次。
     #[must_use]
     pub fn lots(&self) -> &BTreeMap<String, InventoryLot> {
         &self.lots
     }
 
     fn live(&self) -> &LiveLedger {
-        // ponytail: rebuild once after a mutation; use incremental indices if fill throughput
-        // (rather than repeated watchdog reads) becomes the measured bottleneck.
+        // ponytail: 每次修改后最多重建一次；只有性能采样证明成交吞吐而非 watchdog
+        // 重复读取成为瓶颈时，才维护增量索引。
         self.live.get_or_init(|| {
             let mut live = LiveLedger {
                 active_ids: Vec::new(),
@@ -309,13 +317,13 @@ impl OrderManager {
         self.live().active_ids.iter().map(|id| &self.orders[id])
     }
 
-    /// Open lots which still have inventory not covered by a live sell order.
+    /// 仍有库存且尚未被有效卖单覆盖的未平批次。
     #[must_use]
     pub(super) fn exit_candidates(&self) -> Vec<String> {
         self.reduction_candidates(PositionComponent::Grid)
     }
 
-    /// Open lots for one sleeve which are not already covered by another sell.
+    /// 指定仓位组件中，尚未被其他卖单覆盖的未平批次。
     #[must_use]
     pub(super) fn reduction_candidates(&self, component: PositionComponent) -> Vec<String> {
         self.live()
@@ -342,11 +350,11 @@ impl OrderManager {
         })
     }
 
-    /// Reduces or defers a local intent before any native submission can exist.
+    /// 在任何 Nautilus 原生订单产生前，缩减或延后本地订单意图。
     ///
     /// # Errors
     ///
-    /// Rejects unknown, already dispatched, filled, negative or increased intents.
+    /// 意图未知、已发送、已有成交、数量为负或试图放大数量时返回错误。
     pub(super) fn resize_intent(&mut self, id: &str, quantity: Decimal) -> anyhow::Result<()> {
         let order = self
             .orders
@@ -372,11 +380,11 @@ impl OrderManager {
         Ok(())
     }
 
-    /// Checks durable ledger relationships before any recovered order can be used.
+    /// 在使用任何恢复订单前，校验持久化账本内的所有关联关系。
     ///
     /// # Errors
     ///
-    /// Returns an error for inconsistent inventory, identity, fill totals or completed cycles.
+    /// 库存、标识、成交汇总或完成周期不一致时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.fill_count == self.seen_fills.len() as u64
@@ -461,13 +469,14 @@ impl OrderManager {
                 && self
                     .seen_fills
                     .iter()
-                    .all(|(id, _)| self.orders.contains_key(id)),
+                    .all(|(id, _)| self.orders.contains_key(id))
+                && self.adverse_slippage - self.price_improvement == self.slippage,
             "Recovered audit records do not reconcile"
         );
         Ok(())
     }
 
-    /// Initializes funded cash without any inventory.
+    /// 使用给定资金初始化空库存订单账本。
     #[must_use]
     pub fn new(capital: Decimal) -> Self {
         Self {
@@ -485,17 +494,19 @@ impl OrderManager {
             core_turnover: Decimal::ZERO,
             grid_turnover: Decimal::ZERO,
             slippage: Decimal::ZERO,
+            adverse_slippage: Decimal::ZERO,
+            price_improvement: Decimal::ZERO,
             sequence: 0,
             seen_fills: BTreeSet::new(),
             live: OnceLock::new(),
         }
     }
 
-    /// Creates an entry only when its pair has no unresolved order or inventory.
+    /// 仅当对应层级没有未终结订单和遗留库存时创建入场意图。
     ///
     /// # Errors
     ///
-    /// Returns an error for duplicate slot ownership or invalid quantity/price.
+    /// 层级被重复占用或数量、价格无效时返回错误。
     pub fn entry(
         &mut self,
         namespace: &str,
@@ -516,7 +527,7 @@ impl OrderManager {
         )
     }
 
-    /// Creates a component-owned entry; core entries use the same durable identity and ledger.
+    /// 创建归属于指定仓位组件的入场；核心仓同样使用稳定标识与统一账本。
     #[allow(
         clippy::too_many_arguments,
         reason = "explicit durable order ownership"
@@ -590,11 +601,11 @@ impl OrderManager {
         Ok(order)
     }
 
-    /// Creates a covered exit for available filled inventory, net of existing sell reservations.
+    /// 为真实已成交库存创建覆盖卖单，并扣除已有卖单的预留数量。
     ///
     /// # Errors
     ///
-    /// Returns an error if inventory is missing, already reserved or the reference is invalid.
+    /// 库存不存在、已被完全预留或参考价格无效时返回错误。
     pub fn exit(
         &mut self,
         namespace: &str,
@@ -605,7 +616,7 @@ impl OrderManager {
         self.exit_quantity(namespace, lot_id, market_reference, Decimal::MAX, now)
     }
 
-    /// Creates a covered exit capped by a target-position reduction.
+    /// 创建受目标减仓数量上限约束的覆盖卖单。
     pub(super) fn exit_quantity(
         &mut self,
         namespace: &str,
@@ -652,13 +663,13 @@ impl OrderManager {
         Ok(order)
     }
 
-    /// Whether this pair is occupied by an active buy or retained inventory.
+    /// 该层级是否已被有效买单或保留库存占用。
     #[must_use]
     pub fn slot_busy(&self, grid_id: u64, level: i32) -> bool {
         self.live().occupied.contains(&(grid_id, level))
     }
 
-    /// Updates a control event without permitting delayed acknowledgments to undo a fill/cancel.
+    /// 更新控制面事件，但不允许延迟确认反向覆盖已成交或已撤销状态。
     pub fn transition(&mut self, id: &str, phase: OrderPhase, now: u64) {
         if let Some(order) = self.orders.get_mut(id) {
             if order.phase.terminal() {
@@ -687,11 +698,11 @@ impl OrderManager {
         }
     }
 
-    /// Applies one incremental fill exactly once. Unknown IDs and oversells fail closed.
+    /// 一笔增量成交只应用一次；未知订单或超卖一律按失败关闭处理。
     ///
     /// # Errors
     ///
-    /// Returns an error for unknown orders, invalid fills, overfills or insufficient inventory.
+    /// 订单未知、成交无效、超额成交或库存不足时返回错误。
     #[allow(
         clippy::too_many_arguments,
         reason = "One incremental execution and its accounting metadata"
@@ -782,6 +793,8 @@ impl OrderManager {
         lot.slippage += shortfall;
         self.fees += fee;
         self.slippage += shortfall;
+        self.adverse_slippage += shortfall.max(Decimal::ZERO);
+        self.price_improvement += (-shortfall).max(Decimal::ZERO);
         self.turnover += value;
         match lot.component {
             PositionComponent::Core => self.core_turnover += value,
@@ -794,19 +807,19 @@ impl OrderManager {
         Ok(true)
     }
 
-    /// Total owned long quantity, including inventory from retired grids.
+    /// 实际拥有的多头总数量，包含已退出网格代次的遗留库存。
     #[must_use]
     pub fn inventory(&self) -> Decimal {
         self.live().inventory
     }
 
-    /// Filled inventory owned by one target-position sleeve.
+    /// 指定目标仓位组件实际成交的库存数量。
     #[must_use]
     pub(super) fn component_inventory(&self, component: PositionComponent) -> Decimal {
         self.live().component_inventory[component.index()]
     }
 
-    /// Unresolved buy and sell quantities for one target-position sleeve.
+    /// 指定目标仓位组件尚未终结的买入与卖出预留数量。
     #[must_use]
     pub(super) fn component_reservations(
         &self,
@@ -818,13 +831,13 @@ impl OrderManager {
         )
     }
 
-    /// Remaining entry cost including allocated fees.
+    /// 剩余库存的入场成本，包含已分摊费用。
     #[must_use]
     pub fn inventory_cost(&self) -> Decimal {
         self.live().cost
     }
 
-    /// Exact realized PnL for one target-position sleeve.
+    /// 指定目标仓位组件的精确已实现盈亏。
     #[must_use]
     pub(super) const fn component_realized_pnl(&self, component: PositionComponent) -> Decimal {
         match component {
@@ -833,7 +846,7 @@ impl OrderManager {
         }
     }
 
-    /// Exact traded notional for one target-position sleeve.
+    /// 指定目标仓位组件的精确成交名义金额。
     #[must_use]
     pub(super) const fn component_turnover(&self, component: PositionComponent) -> Decimal {
         match component {
@@ -842,19 +855,19 @@ impl OrderManager {
         }
     }
 
-    /// Active order identities in deterministic order.
+    /// 按确定性顺序返回有效订单标识。
     #[must_use]
     pub fn active_ids(&self) -> Vec<String> {
         self.live().active_ids.clone()
     }
 
-    /// Number of live orders without cloning their identities.
+    /// 不复制订单标识即可取得有效订单数量。
     #[must_use]
     pub(super) fn active_count(&self) -> usize {
         self.live().active_ids.len()
     }
 
-    /// Worst-case buy reservations, never released by a cancel request.
+    /// 最坏情形买入预留；仅发出撤单请求不会释放该预留。
     #[must_use]
     pub fn buy_reservations(&self, config: &GridConfig, mark: Decimal) -> (Decimal, Decimal) {
         self.active_orders()
@@ -873,7 +886,7 @@ impl OrderManager {
             })
     }
 
-    /// Detects unresolved submissions and cancellations; resting accepted orders do not time out.
+    /// 检测未解决的提交与撤单；已接受并正常挂单的订单不按此规则超时。
     #[must_use]
     pub fn timed_out(&self, timeout_secs: u64, now: u64) -> bool {
         self.active_orders().any(|o| {

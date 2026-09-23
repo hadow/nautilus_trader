@@ -7,25 +7,25 @@
 //  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
 // -------------------------------------------------------------------------------------------------
 
-//! Stock target-position calculations. Orders and fills remain owned by Nautilus and `OrderManager`.
+//! 股票目标仓位计算；订单与成交状态仍由 NautilusTrader 和 `OrderManager` 管理。
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::{config::GridConfig, engine::floor_tick, regime::MarketRegime};
 
-/// Desired long inventory split into independent strategic components.
+/// 将期望多头库存拆分为相互独立的策略仓位组件。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PositionTarget {
-    /// Long-lived trend participation, protected from ordinary grid exits.
+    /// 用于参与中长期趋势的核心仓，不会被普通网格止盈卖出。
     pub core: Decimal,
-    /// Maximum tactical inventory admitted across all grid generations.
+    /// 跨全部网格代次允许持有的战术网格仓上限。
     pub grid: Decimal,
-    /// Exact sum after every quantity and notional cap.
+    /// 经过所有数量和名义金额约束后的精确目标总量。
     pub total: Decimal,
 }
 
-/// Calculates a bounded target from current equity and the latest completed-bar regime.
+/// 根据当前权益和最近一根已完成 K 线的市场状态，计算受限目标仓位。
 ///
 /// 这里计算“策略想持有多少”，不读取订单状态，也不绕过后续单标的和组合风控。
 pub(super) fn target_position(
@@ -79,7 +79,7 @@ pub(super) fn target_position(
     })
 }
 
-/// Converts a desired target into one lot-rounded order delta, including unresolved orders.
+/// 将目标仓位转换为按 lot 取整的一笔订单增量，并计入未终结订单的预留数量。
 #[must_use]
 pub(super) fn position_delta(
     target: Decimal,

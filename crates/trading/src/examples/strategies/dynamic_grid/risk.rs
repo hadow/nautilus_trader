@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Account-aware worst-case reservations and latched loss limits.
+//! 纳入账户容量的最坏情形资金预留，以及触发后保持锁定的亏损限制。
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -24,63 +24,63 @@ use super::{
 };
 
 fn unknown_daily_resets() -> u32 {
-    // Old checkpoints cannot prove how many resets occurred today; do not invent fresh capacity.
+    // 旧检查点无法证明当日已经重置多少次，因此不能凭空恢复新的重置额度。
     u32::MAX
 }
 
-/// Current marked strategy and broker capacity, without predicted fills.
+/// 当前策略与券商账户的按市值计价容量，不包含任何假设成交。
 #[derive(Clone, Debug, Default)]
 pub struct RiskSnapshot {
-    /// Strategy cash plus marked inventory.
+    /// 策略现金与库存市值之和。
     pub equity: Decimal,
-    /// Available strategy cash after actual fill fees.
+    /// 扣除实际成交费用后的策略可用现金。
     pub cash: Decimal,
-    /// Marked broker equity (single instrument/account allocation).
+    /// 券商账户按市值计价权益，用于约束单标的分配。
     pub account_equity: Decimal,
-    /// Broker free cash, excluding broker locks.
+    /// 券商可用现金，不包含已被券商冻结的资金。
     pub account_free: Decimal,
-    /// Actual long quantity.
+    /// 实际多头持仓数量。
     pub position: Decimal,
-    /// Mark-to-market inventory value.
+    /// 库存按市值计价的名义金额。
     pub exposure: Decimal,
-    /// Inventory PnL including allocated entry fees.
+    /// 包含已分摊入场费用的库存浮动盈亏。
     pub unrealized_pnl: Decimal,
-    /// Quantity reserved by unresolved buys, including cancel-pending orders.
+    /// 未终结买单预留数量，包含正在等待撤单确认的订单。
     pub pending_buy_quantity: Decimal,
-    /// Cash reserved by unresolved buys including estimated costs.
+    /// 未终结买单预留现金，包含估算交易成本。
     pub pending_buy_notional: Decimal,
-    /// Count of all unresolved orders.
+    /// 全部未终结订单数量。
     pub active_orders: usize,
-    /// Latest completed-bar ATR divided by the current mark; zero means unavailable.
+    /// 最近已完成 K 线 ATR/当前价格；零表示不可用。
     pub atr_pct: Decimal,
 }
 
-/// Persisted risk state; loss limits never silently unlock on the next bar or restart.
+/// 可持久化风险状态；亏损限制不会因下一根 K 线或程序重启而自动解除。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RiskManager {
-    /// Strategy high-water mark.
+    /// 策略权益历史高水位。
     pub peak_equity: Decimal,
-    /// Equity when the current UTC day began.
+    /// 当前 UTC 日开始时的权益。
     pub day_start_equity: Decimal,
-    /// Most recent equity, used to include overnight gaps in daily loss.
+    /// 最近一次权益，用于将隔夜跳空计入当日亏损。
     pub last_equity: Decimal,
-    /// UTC date represented by days since Unix epoch.
+    /// 自 Unix 纪元起的天数表示的 UTC 日期。
     pub day: Option<u64>,
-    /// Consecutive resets since a profitable completed cycle.
+    /// 自最近一个盈利完成周期以来的连续重置次数。
     pub consecutive_resets: u32,
-    /// Lifetime number of resets.
+    /// 策略生命周期累计重置次数。
     pub total_resets: u64,
-    /// Current UTC-day reset count. Missing legacy counts prevent additional same-day resets.
+    /// 当前 UTC 日重置次数；旧检查点缺少该值时禁止当日继续重置。
     #[serde(default = "unknown_daily_resets")]
     pub daily_resets: u32,
-    /// Largest consecutive reset count observed.
+    /// 历史观测到的最大连续重置次数。
     pub maximum_reset_count: u32,
-    /// First hard-limit reason; cleared only by an explicit audited risk reset.
+    /// 首个硬性限制原因；只能通过显式、可审计的风险重置清除。
     pub risk_off_reason: Option<String>,
 }
 
 impl RiskManager {
-    /// Starts with a funded high-water mark.
+    /// 使用初始资金建立权益高水位。
     #[must_use]
     pub fn new(capital: Decimal) -> Self {
         Self {
@@ -96,7 +96,7 @@ impl RiskManager {
         }
     }
 
-    /// Updates loss limits from current marks and reservations.
+    /// 使用当前市值与订单预留更新亏损及暴露限制。
     pub fn observe(&mut self, config: &GridConfig, snapshot: &RiskSnapshot, now: u64) {
         let day = now / 86_400_000_000_000;
         if self.day != Some(day) {
@@ -149,7 +149,7 @@ impl RiskManager {
         self.last_equity = snapshot.equity;
     }
 
-    /// Latches the first failure; later observations cannot erase it.
+    /// 锁存第一个风险失败原因，后续行情观测不能覆盖或自动清除。
     pub fn trip(&mut self, reason: impl Into<String>) {
         if self.risk_off_reason.is_none() {
             let reason = reason.into();
@@ -158,7 +158,7 @@ impl RiskManager {
         }
     }
 
-    /// Reserves quantity against every configured cap at the worse of mark and limit.
+    /// 使用市价与限价中更保守的一侧，在全部配置上限内计算可买数量。
     #[must_use]
     pub fn buy_quantity(
         &self,
@@ -208,7 +208,7 @@ impl RiskManager {
         floor_tick(quantity, lot)
     }
 
-    /// Records a completed reset, without injecting new capital.
+    /// 记录一次已完成重置，不向策略注入新资金。
     pub fn record_reset(&mut self) {
         self.daily_resets = self.daily_resets.saturating_add(1);
         self.consecutive_resets = self.consecutive_resets.saturating_add(1);
@@ -216,7 +216,7 @@ impl RiskManager {
         self.maximum_reset_count = self.maximum_reset_count.max(self.consecutive_resets);
     }
 
-    /// Checks both budgets before cancellation and again before committing the reset.
+    /// 在发起撤单前和正式提交重置前，都检查连续次数与当日次数预算。
     pub(super) fn reset_limit(&self, config: &GridConfig) -> Option<&'static str> {
         if self.consecutive_resets >= config.max_consecutive_resets {
             Some("Maximum consecutive resets")

@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use super::{
-    config::{GridConfig, PositionSizing},
+    config::{GridConfig, PositionSizing, StrategyMode},
     engine::{GridEngine, spacing},
     orders::{OrderManager, OrderPhase, PositionComponent},
     regime::{MarketRegime, Observation, RegimeDetector},
@@ -83,6 +83,48 @@ fn portfolio_trend_metric_uses_only_trending_sleeves() {
     );
     assert!((report.metrics.trend_exposure - 0.2).abs() < 1e-12);
     assert!((report.metrics.inventory_exposure - 0.6).abs() < 1e-12);
+}
+
+#[rstest]
+fn portfolio_regime_pnl_is_the_sum_of_instrument_attribution() {
+    use super::analytics::{EquityPoint, PerformanceTracker};
+
+    let mut first = PerformanceTracker::default();
+    first
+        .metrics
+        .regime_pnl
+        .insert("Range".to_string(), dec!(12));
+    let mut second = PerformanceTracker::default();
+    second
+        .metrics
+        .regime_pnl
+        .insert("Range".to_string(), dec!(3));
+    second
+        .metrics
+        .regime_pnl
+        .insert("TrendDown".to_string(), dec!(-5));
+    let point = EquityPoint {
+        trend_inventory: None,
+        cumulative_fees: Decimal::ZERO,
+        cumulative_turnover: Decimal::ZERO,
+        ts_ns: 0,
+        price: Decimal::ONE,
+        equity: dec!(2000),
+        exposure: Decimal::ZERO,
+        position: Decimal::ZERO,
+        utilization: 0.0,
+        regime: MarketRegime::Disabled,
+    };
+    let mut end = point.clone();
+    end.ts_ns = 60_000_000_000;
+    let mut portfolio = PerformanceTracker::default();
+    portfolio.equity.extend([point, end]);
+    let orders = OrderManager::new(dec!(2000));
+    let risk = RiskManager::new(dec!(2000));
+    portfolio.finish_portfolio(dec!(2000), &[(&orders, &risk)], &[&first, &second], None);
+    assert_eq!(portfolio.metrics.regime_pnl["Range"], dec!(15));
+    assert_eq!(portfolio.metrics.regime_pnl["TrendDown"], dec!(-5));
+    assert!(!portfolio.metrics.regime_pnl.contains_key("Disabled"));
 }
 
 #[rstest]
@@ -337,9 +379,39 @@ fn upper_inventory_seed_and_sell_buy_cycle() {
         .unwrap();
     assert_eq!(m.cycles[0].gross_pnl, dec!(10));
     assert_eq!(m.cycles[0].slippage, dec!(0.25));
+    assert_eq!(m.adverse_slippage, dec!(0.25));
+    assert_eq!(m.price_improvement, Decimal::ZERO);
     assert_eq!(m.cycles[0].net_pnl, dec!(8.75));
     let next = m.entry("902", 1, &g.levels[1], dec!(5), None, 4).unwrap();
     assert_eq!(next.limit, Some(dec!(100)));
+}
+
+#[rstest]
+fn favorable_fills_are_reported_separately_from_slippage_cost() {
+    let c = GridConfig::default();
+    let g = grid(&c);
+    let mut orders = OrderManager::new(c.capital);
+    let buy = orders
+        .entry("902", 1, &g.levels[1], dec!(5), Some(dec!(100)), 0)
+        .unwrap();
+    orders
+        .fill(&buy.id, "buy", dec!(5), dec!(100), Decimal::ZERO, false, 1)
+        .unwrap();
+    let sell = orders.exit("902", &buy.id, None, 2).unwrap();
+    orders
+        .fill(
+            &sell.id,
+            "sell",
+            dec!(5),
+            dec!(103),
+            Decimal::ZERO,
+            false,
+            3,
+        )
+        .unwrap();
+    assert_eq!(orders.slippage, dec!(-5));
+    assert_eq!(orders.adverse_slippage, Decimal::ZERO);
+    assert_eq!(orders.price_improvement, dec!(5));
 }
 
 #[rstest]
@@ -924,6 +996,35 @@ fn spacing_covers_fees_and_slippage() {
         ..c
     };
     assert!(invalid.validate().is_err());
+}
+
+#[rstest]
+fn stock_adaptive_atr_width_is_distributed_across_intervals() {
+    let stock = GridConfig {
+        strategy_mode: StrategyMode::StockAdaptive,
+        grid_levels: 4,
+        atr_multiplier: dec!(2),
+        min_spacing_pct: dec!(0.001),
+        max_spacing_pct: dec!(0.5),
+        spacing_pct: dec!(0.01),
+        maker_fee: Decimal::ZERO,
+        taker_fee: Decimal::ZERO,
+        slippage: Decimal::ZERO,
+        minimum_profit_margin: Decimal::ZERO,
+        ..Default::default()
+    };
+    assert_eq!(
+        spacing(&stock, dec!(10), dec!(100), Decimal::ONE).unwrap(),
+        dec!(0.05)
+    );
+    let legacy = GridConfig {
+        strategy_mode: StrategyMode::LegacyDgt,
+        ..stock
+    };
+    assert_eq!(
+        spacing(&legacy, dec!(10), dec!(100), Decimal::ONE).unwrap(),
+        dec!(0.2)
+    );
 }
 
 #[rstest]

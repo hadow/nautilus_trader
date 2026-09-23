@@ -6,7 +6,7 @@
 //  You may not use this file except in compliance with the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Causal US-stock session, gap, liquidity and breakout state.
+//! 美股常规交易时段、跳空、流动性与突破确认的因果状态。
 
 use std::{collections::VecDeque, sync::LazyLock};
 
@@ -20,21 +20,29 @@ use super::config::GridConfig;
 static NEW_YORK: LazyLock<TimeZone> =
     LazyLock::new(|| get_timezone("America/New_York").expect("bundled America/New_York timezone"));
 
-/// Direction of a completed-close boundary break.
+/// 已完成收盘价突破网格边界的方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum BreakoutDirection {
+    /// 向上突破上边界。
     Up,
+    /// 向下突破下边界。
     Down,
 }
 
-/// Reason stock-adapted entries are temporarily unavailable.
+/// 股票自适应模式暂时禁止新增仓位的原因。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum StockGate {
+    /// 当前不在美股常规交易时段。
     OffSession,
+    /// 大幅跳空后的观察期尚未结束。
     GapRecovery,
+    /// 成交额滚动窗口尚未预热。
     LiquidityWarmup,
+    /// 平均成交额低于配置下限。
     LowDollarVolume,
+    /// 实时报价买卖价差过宽。
     WideSpread,
+    /// 当前价格低于允许交易的最低价格。
     BelowMinimumPrice,
 }
 
@@ -51,7 +59,7 @@ impl StockGate {
     }
 }
 
-/// Persisted stock-market context; all values are derived from already completed data.
+/// 可持久化的股票市场上下文；所有字段均来自已经可获得的数据。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct StockMarketState {
     session_date: Option<String>,
@@ -69,14 +77,14 @@ pub(super) struct StockMarketState {
 }
 
 impl StockMarketState {
-    /// True only during the first US regular session. Exchange holidays are naturally data-free.
+    /// 仅在美股常规交易时段内返回 true；交易所休市日自然不会产生行情数据。
     #[must_use]
     pub(super) fn is_regular_session(ts_ns: u64) -> bool {
         let minute = Self::local_minute(ts_ns);
         (9 * 60 + 30..16 * 60).contains(&minute)
     }
 
-    /// Completed one-minute bars commonly carry their close timestamp, including exactly 16:00.
+    /// 已完成的一分钟 K 线通常携带收盘时间，因此恰好 16:00 的 bar 仍属于常规时段。
     #[must_use]
     pub(super) fn is_regular_session_bar(ts_ns: u64) -> bool {
         let minute = Self::local_minute(ts_ns);
@@ -90,7 +98,7 @@ impl StockMarketState {
         i16::from(local.hour()) * 60 + i16::from(local.minute())
     }
 
-    /// Observes one completed regular-session bar and detects the opening gap from prior close.
+    /// 处理一根已完成的常规时段 K 线，并用真实开盘价检测相对前收盘的跳空。
     pub(super) fn observe_bar(
         &mut self,
         config: &GridConfig,
@@ -99,15 +107,18 @@ impl StockMarketState {
         close: Decimal,
         volume: Decimal,
         prior_atr: Decimal,
-    ) -> bool {
+    ) -> (bool, Option<Decimal>) {
         if !Self::is_regular_session_bar(ts_ns) {
-            return false;
+            return (false, None);
         }
         let local = UnixNanos::from(ts_ns)
             .to_datetime_utc()
             .to_zoned(NEW_YORK.clone());
         let date = local.date().to_string();
-        if self.session_date.as_deref() != Some(&date) {
+        let opening_gap = if self.session_date.as_deref() == Some(&date) {
+            None
+        } else {
+            let opening_gap = self.previous_close.map(|previous| open - previous);
             self.gap_pct = self
                 .previous_close
                 .map(|previous| (open / previous - Decimal::ONE).abs())
@@ -125,7 +136,8 @@ impl StockMarketState {
                 self.gap_recovery_bars_remaining = config.gap_recovery_bars;
             }
             self.session_date = Some(date);
-        }
+            opening_gap
+        };
         self.previous_close = Some(close);
         self.dollar_volumes.push_back(close * volume);
         while self.dollar_volumes.len() > config.liquidity_lookback_bars {
@@ -136,22 +148,22 @@ impl StockMarketState {
         } else {
             self.dollar_volumes.iter().sum::<Decimal>() / Decimal::from(self.dollar_volumes.len())
         };
-        true
+        (true, opening_gap)
     }
 
-    /// Advances the gap pause only after the current completed bar has been processed.
+    /// 当前已完成 K 线处理完毕后，才递减跳空恢复期，避免少暂停一根 bar。
     pub(super) fn finish_bar(&mut self) {
         self.gap_recovery_bars_remaining = self.gap_recovery_bars_remaining.saturating_sub(1);
     }
 
-    /// Updates an executable quote spread without inventing a spread from OHLC bars.
+    /// 使用可执行买卖报价更新价差，不从 OHLC K 线虚构 spread。
     pub(super) fn observe_quote(&mut self, bid: Decimal, ask: Decimal) {
         let midpoint = (bid + ask) / Decimal::from(2);
         self.spread_bps = (midpoint > Decimal::ZERO && ask >= bid)
             .then(|| (ask - bid) / midpoint * Decimal::from(10_000));
     }
 
-    /// Returns the first deterministic stock-market entry gate which currently fails.
+    /// 按固定优先级返回当前第一个未通过的股票市场入场门槛。
     #[must_use]
     pub(super) fn gate(
         &self,
@@ -186,7 +198,7 @@ impl StockMarketState {
         None
     }
 
-    /// Counts consecutive completed closes beyond the ATR-buffered boundary.
+    /// 统计连续收在含 ATR 缓冲的网格边界之外的已完成 K 线数量。
     pub(super) fn observe_breakout(
         &mut self,
         config: &GridConfig,
@@ -258,22 +270,28 @@ mod tests {
             ..Default::default()
         };
         let mut state = StockMarketState::default();
-        assert!(state.observe_bar(
-            &config,
-            OPEN_2025_01_02,
-            dec!(100),
-            dec!(100),
-            dec!(1000),
-            dec!(2),
-        ));
-        assert!(state.observe_bar(
-            &config,
-            OPEN_2025_01_02 + DAY,
-            dec!(90),
-            dec!(91),
-            dec!(1000),
-            dec!(2),
-        ));
+        assert_eq!(
+            state.observe_bar(
+                &config,
+                OPEN_2025_01_02,
+                dec!(100),
+                dec!(100),
+                dec!(1000),
+                dec!(2),
+            ),
+            (true, None)
+        );
+        assert_eq!(
+            state.observe_bar(
+                &config,
+                OPEN_2025_01_02 + DAY,
+                dec!(90),
+                dec!(91),
+                dec!(1000),
+                dec!(2),
+            ),
+            (true, Some(dec!(-10)))
+        );
         assert_eq!(state.gap_pct, dec!(0.1));
         assert_eq!(state.gap_atr, dec!(5));
         assert_eq!(
