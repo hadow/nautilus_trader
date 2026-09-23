@@ -1,0 +1,13 @@
+{
+  "provider": "Alpaca",
+  "symbol": "UBER",
+  "timeframe": "1Min",
+  "start": "2023-10-01T00:00:00Z",
+  "end": "2026-01-01T00:00:00Z",
+  "adjustment": "raw",
+  "feed": "API default, same unspecified feed as Notebook",
+  "rows": 304630,
+  "pages": 31,
+  "notebook_sha256": "2f21c39f5b292643ab8c1eb53e0ceac24c870f642408b871283eeb6737219788",
+  "complete": true
+}
