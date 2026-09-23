@@ -59,6 +59,7 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance},
 };
+use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
@@ -90,6 +91,37 @@ struct OrderContexts {
     client_order: VecDeque<String>,
     venue_order: VecDeque<String>,
     short_preflights: AHashMap<ClientOrderId, bool>,
+    pending_queries: AHashSet<ClientOrderId>,
+}
+
+struct OrderQueryGuard {
+    contexts: Arc<Mutex<OrderContexts>>,
+    id: ClientOrderId,
+}
+
+impl OrderQueryGuard {
+    fn acquire(contexts: &Arc<Mutex<OrderContexts>>, id: ClientOrderId) -> Option<Self> {
+        contexts
+            .lock()
+            .expect(MUTEX_POISONED)
+            .pending_queries
+            .insert(id)
+            .then(|| Self {
+                contexts: Arc::clone(contexts),
+                id,
+            })
+    }
+}
+
+impl Drop for OrderQueryGuard {
+    fn drop(&mut self) {
+        // 限流等待、查询失败或任务被取消，都必须释放查询许可；订单资金预留不受影响
+        self.contexts
+            .lock()
+            .expect(MUTEX_POISONED)
+            .pending_queries
+            .remove(&self.id);
+    }
 }
 
 impl OrderContexts {
@@ -131,47 +163,20 @@ impl OrderContexts {
         self.by_venue.insert(venue_order_id.to_string(), context);
     }
 
-    fn for_order(&mut self, order: &Order) -> Option<OrderContext> {
+    fn for_order(&mut self, order: &Order) -> anyhow::Result<Option<OrderContext>> {
         if let Some(context) = self.by_venue.get(&order.order_id) {
-            return Some(context.clone());
+            validate_order_identity(order, context)?;
+            return Ok(Some(context.clone()));
         }
 
         if !order.remark.is_empty()
             && let Some(context) = self.by_client.get(&order.remark).cloned()
         {
+            validate_order_identity(order, &context)?;
             self.associate_venue(&order.order_id, context.clone());
-            return Some(context);
+            return Ok(Some(context));
         }
-        None
-    }
-}
-
-#[derive(Debug, Default)]
-struct SeenTradeIds {
-    ids: AHashSet<String>,
-    order: VecDeque<String>,
-}
-
-impl SeenTradeIds {
-    const CAPACITY: usize = 10_000;
-
-    fn insert(&mut self, trade_id: String) -> bool {
-        if self.ids.contains(&trade_id) {
-            return false;
-        }
-
-        if self.ids.len() >= Self::CAPACITY
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.ids.remove(&oldest);
-        }
-        self.order.push_back(trade_id.clone());
-        self.ids.insert(trade_id)
-    }
-
-    fn clear(&mut self) {
-        self.ids.clear();
-        self.order.clear();
+        Ok(None)
     }
 }
 
@@ -184,7 +189,6 @@ pub struct LongbridgeExecutionClient {
     stream_handle: Option<JoinHandle<()>>,
     pending_tasks: TaskHandles,
     order_contexts: Arc<Mutex<OrderContexts>>,
-    seen_trade_ids: Arc<Mutex<SeenTradeIds>>,
     clock: &'static AtomicTime,
 }
 
@@ -220,7 +224,6 @@ impl LongbridgeExecutionClient {
             stream_handle: None,
             pending_tasks: TaskHandles::default(),
             order_contexts: Arc::new(Mutex::new(OrderContexts::default())),
-            seen_trade_ids: Arc::new(Mutex::new(SeenTradeIds::default())),
             clock,
         }
     }
@@ -243,12 +246,29 @@ impl LongbridgeExecutionClient {
         self.pending_tasks.push(handle);
     }
 
-    fn client_order_id_for(&self, order: &Order) -> Option<ClientOrderId> {
+    fn client_order_id_for(&self, order: &Order) -> anyhow::Result<Option<ClientOrderId>> {
+        // 重启后只认本地检查点里的订单，不把任意 broker remark 当作本策略订单
+        if let Ok(id) = ClientOrderId::new_checked(&order.remark)
+            && let Some(cached) = self.core.cache().order(&id)
+            && cached
+                .account_id()
+                .is_none_or(|id| id == self.core.account_id)
+        {
+            self.order_contexts
+                .lock()
+                .expect(MUTEX_POISONED)
+                .insert_client(OrderContext {
+                    client_order_id: id,
+                    strategy_id: cached.strategy_id(),
+                    instrument_id: cached.instrument_id(),
+                    order_side: cached.order_side(),
+                });
+        }
         self.order_contexts
             .lock()
             .expect(MUTEX_POISONED)
             .for_order(order)
-            .map(|context| context.client_order_id)
+            .map(|context| context.map(|context| context.client_order_id))
     }
 
     fn terminate(&mut self) {
@@ -299,7 +319,114 @@ fn order_side_from_sdk(side: LongbridgeOrderSide) -> anyhow::Result<OrderSide> {
 }
 
 fn is_authoritative_rejection(error: &LongbridgeError) -> bool {
-    error.openapi_error_code().is_some()
+    // 服务端内部错误不证明订单未到达券商；保留 Submitted 和资金预留等待对账
+    error
+        .openapi_error_code()
+        .is_some_and(|code| code != 500_000)
+}
+
+fn validate_order_identity(order: &Order, context: &OrderContext) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        crate::common::parse::instrument_id(&order.symbol) == context.instrument_id
+            && order_side_from_sdk(order.side)? == context.order_side,
+        "Longbridge order identity mismatch for {} / {}",
+        context.strategy_id,
+        context.client_order_id,
+    );
+    Ok(())
+}
+
+fn select_order(
+    orders: Vec<Order>,
+    client_order_id: Option<ClientOrderId>,
+    venue_order_id: Option<VenueOrderId>,
+) -> anyhow::Result<Order> {
+    anyhow::ensure!(
+        client_order_id.is_some() || venue_order_id.is_some(),
+        "Missing order identity"
+    );
+    let mut matches = orders.into_iter().filter(|order| {
+        venue_order_id.map_or_else(
+            || client_order_id.is_some_and(|id| order.remark == id.as_str()),
+            |id| order.order_id == id.as_str(),
+        )
+    });
+    // 查不到不等于拒单：不能向原生 missing-order 逻辑返回 None 并释放预留
+    let order = matches
+        .next()
+        .context("Longbridge order outcome unresolved; retain reservations")?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "Conflicting Longbridge order identities"
+    );
+    // 已知券商号优先：手工订单的 remark 不一定等于 Nautilus 为其分配的客户订单号
+    Ok(order)
+}
+
+fn order_with_fills(
+    order: &Order,
+    executions: Vec<Execution>,
+    account_id: AccountId,
+    client_order_id: Option<ClientOrderId>,
+    now: UnixNanos,
+) -> anyhow::Result<(OrderStatusReport, Vec<FillReport>)> {
+    let report = parse_order_status_report(order, account_id, client_order_id, now)?;
+    let mut fills = Vec::new();
+    let mut seen = AHashSet::new();
+    for execution in executions
+        .into_iter()
+        .filter(|e| e.order_id == order.order_id)
+    {
+        anyhow::ensure!(
+            execution.symbol == order.symbol,
+            "Longbridge execution symbol mismatch"
+        );
+        if seen.insert(execution.trade_id.clone()) {
+            fills.push(parse_fill_report(
+                &execution,
+                account_id,
+                order_side_from_sdk(order.side)?,
+                &order.currency,
+                client_order_id,
+                now,
+            )?);
+        }
+    }
+    anyhow::ensure!(
+        fills
+            .iter()
+            .map(|fill| fill.last_qty.as_decimal())
+            .sum::<Decimal>()
+            == order.executed_quantity,
+        "Longbridge executions and order snapshot disagree; defer reconciliation"
+    );
+    fills.sort_by_key(|fill| fill.ts_event);
+    // 原生 OrderWithFills 原子对账并按 TradeId 去重，避免先推累计状态而生成推算成交
+    Ok((report, fills))
+}
+
+async fn reconcile_order(
+    context: &TradeContext,
+    order: &Order,
+    account_id: AccountId,
+    client_order_id: Option<ClientOrderId>,
+    emitter: &ExecutionEventEmitter,
+    now: UnixNanos,
+) -> anyhow::Result<()> {
+    let executions = if order.executed_quantity.is_zero() {
+        Vec::new()
+    } else {
+        fetch_executions(
+            context,
+            Some(crate::common::parse::instrument_id(&order.symbol)),
+            None,
+            None,
+        )
+        .await?
+    };
+    let (report, fills) = order_with_fills(order, executions, account_id, client_order_id, now)?;
+    emitter.send_order_with_fills(report, fills);
+    Ok(())
 }
 
 async fn fetch_orders(
@@ -451,8 +578,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.terminate();
-        *self.order_contexts.lock().expect(MUTEX_POISONED) = OrderContexts::default();
-        self.seen_trade_ids.lock().expect(MUTEX_POISONED).clear();
+        self.order_contexts = Arc::new(Mutex::new(OrderContexts::default()));
         Ok(())
     }
 
@@ -484,7 +610,6 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let task_context = context.clone();
         let emitter = self.emitter.clone();
         let contexts = Arc::clone(&self.order_contexts);
-        let seen_trade_ids = Arc::clone(&self.seen_trade_ids);
         let account_id = self.core.account_id;
         let clock = self.clock;
 
@@ -493,74 +618,44 @@ impl ExecutionClient for LongbridgeExecutionClient {
                 let PushEvent::OrderChanged(update) = event;
                 let options = GetTodayOrdersOptions::new().order_id(update.order_id.clone());
                 let order = match trade_api_call(task_context.today_orders(options)).await {
-                    Ok(orders) => orders.into_iter().find(|order| order.order_id == update.order_id),
+                    Ok(orders) => orders
+                        .into_iter()
+                        .find(|order| order.order_id == update.order_id),
                     Err(e) => {
-                        log::warn!("Failed to refresh Longbridge pushed order {}: {e}", update.order_id);
+                        log::warn!(
+                            "Failed to refresh Longbridge pushed order {}: {e}",
+                            update.order_id
+                        );
                         None
                     }
                 };
                 let Some(order) = order else {
-                    log::warn!("Longbridge push referenced unavailable order {}", update.order_id);
+                    log::warn!(
+                        "Longbridge push referenced unavailable order {}",
+                        update.order_id
+                    );
                     continue;
                 };
 
-                let client_context = contexts.lock().expect(MUTEX_POISONED).for_order(&order);
-                if let Some(local) = &client_context {
-                    let pushed_instrument = crate::common::parse::instrument_id(&order.symbol);
-                    if local.instrument_id != pushed_instrument
-                        || order_side_from_sdk(order.side).ok() != Some(local.order_side)
-                    {
-                        log::warn!(
-                            "Longbridge order identity mismatch for strategy {} and client order {}",
-                            local.strategy_id,
-                            local.client_order_id,
-                        );
+                let local = contexts.lock().expect(MUTEX_POISONED).for_order(&order);
+                let client_order_id = match local {
+                    Ok(local) => local.map(|context| context.client_order_id),
+                    Err(e) => {
+                        log::error!("Refusing mismatched Longbridge push: {e:#}");
+                        continue;
                     }
-                }
-                let client_order_id = client_context.as_ref().map(|ctx| ctx.client_order_id);
-                let ts_init = clock.get_time_ns();
-                match parse_order_status_report(&order, account_id, client_order_id, ts_init) {
-                    Ok(report) => emitter.send_order_status_report(report),
-                    Err(e) => log::warn!("Failed to parse Longbridge order push: {e:#}"),
-                }
-
-                let execution_options = GetTodayExecutionsOptions::new().order_id(order.order_id.clone());
-                match trade_api_call(task_context.today_executions(execution_options)).await {
-                    Ok(executions) => {
-                        for execution in executions {
-                            let is_new = seen_trade_ids
-                                .lock()
-                                .expect(MUTEX_POISONED)
-                                .insert(execution.trade_id.clone());
-
-                            if !is_new {
-                                continue;
-                            }
-                            let side = match order_side_from_sdk(order.side) {
-                                Ok(side) => side,
-                                Err(e) => {
-                                    log::warn!("Failed to parse Longbridge fill side: {e:#}");
-                                    continue;
-                                }
-                            };
-
-                            match parse_fill_report(
-                                &execution,
-                                account_id,
-                                side,
-                                &order.currency,
-                                client_order_id,
-                                clock.get_time_ns(),
-                            ) {
-                                Ok(report) => emitter.send_fill_report(report),
-                                Err(e) => log::warn!("Failed to parse Longbridge fill push: {e:#}"),
-                            }
-                        }
-                    }
-                    Err(e) => log::warn!(
-                        "Failed to refresh executions for Longbridge order {}: {e}",
-                        order.order_id,
-                    ),
+                };
+                if let Err(e) = reconcile_order(
+                    &task_context,
+                    &order,
+                    account_id,
+                    client_order_id,
+                    &emitter,
+                    clock.get_time_ns(),
+                )
+                .await
+                {
+                    log::warn!("Longbridge push reconciliation deferred: {e:#}");
                 }
             }
         }));
@@ -602,22 +697,39 @@ impl ExecutionClient for LongbridgeExecutionClient {
         let client_order_id = cmd.client_order_id;
         let venue_order_id = cmd.venue_order_id;
         let clock = self.clock;
+        let contexts = Arc::clone(&self.order_contexts);
+        let cached = self.core.cache().try_order_owned(&client_order_id)?;
+        let local = OrderContext {
+            client_order_id,
+            strategy_id: cached.strategy_id(),
+            instrument_id: cached.instrument_id(),
+            order_side: cached.order_side(),
+        };
+        let Some(query_guard) = OrderQueryGuard::acquire(&contexts, client_order_id) else {
+            return Ok(());
+        };
         self.spawn_task("order query", async move {
-            let Some(venue_order_id) = venue_order_id else {
-                anyhow::bail!("Longbridge order query requires venue_order_id");
-            };
-            let order = fetch_orders(&context, Some(cmd.instrument_id), None, None, false)
-                .await?
-                .into_iter()
-                .find(|order| order.order_id == venue_order_id.as_str())
-                .context("Longbridge order was not found")?;
-            let report = parse_order_status_report(
+            let _query_guard = query_guard;
+            let order = select_order(
+                fetch_orders(&context, Some(cmd.instrument_id), None, None, false).await?,
+                Some(client_order_id),
+                venue_order_id,
+            )?;
+            validate_order_identity(&order, &local)?;
+            {
+                let mut contexts = contexts.lock().expect(MUTEX_POISONED);
+                contexts.insert_client(local.clone());
+                contexts.associate_venue(&order.order_id, local);
+            }
+            reconcile_order(
+                &context,
                 &order,
                 account_id,
                 Some(client_order_id),
+                &emitter,
                 clock.get_time_ns(),
-            )?;
-            emitter.send_order_status_report(report);
+            )
+            .await?;
             Ok(())
         });
         Ok(())
@@ -967,38 +1079,14 @@ impl ExecutionClient for LongbridgeExecutionClient {
         cmd: &GenerateOrderStatusReport,
     ) -> anyhow::Result<Option<OrderStatusReport>> {
         let context = self.context()?;
-        let venue_order_id = cmd.venue_order_id.or_else(|| {
-            cmd.client_order_id.and_then(|client_order_id| {
-                self.order_contexts
-                    .lock()
-                    .expect(MUTEX_POISONED)
-                    .by_venue
-                    .iter()
-                    .find_map(|(venue_id, context)| {
-                        (context.client_order_id == client_order_id)
-                            .then(|| VenueOrderId::from(venue_id.as_str()))
-                    })
-            })
-        });
-        let Some(venue_order_id) = venue_order_id else {
-            return Ok(None);
-        };
-        let order = fetch_orders(&context, cmd.instrument_id, None, None, false)
-            .await?
-            .into_iter()
-            .find(|order| order.order_id == venue_order_id.as_str());
-        order
-            .as_ref()
-            .map(|order| {
-                parse_order_status_report(
-                    order,
-                    self.core.account_id,
-                    cmd.client_order_id
-                        .or_else(|| self.client_order_id_for(order)),
-                    cmd.ts_init,
-                )
-            })
-            .transpose()
+        let order = select_order(
+            fetch_orders(&context, cmd.instrument_id, None, None, false).await?,
+            cmd.client_order_id,
+            cmd.venue_order_id,
+        )?;
+        let client_order_id = self.client_order_id_for(&order)?.or(cmd.client_order_id);
+        parse_order_status_report(&order, self.core.account_id, client_order_id, cmd.ts_init)
+            .map(Some)
     }
 
     async fn generate_order_status_reports(
@@ -1019,7 +1107,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
             parse_order_status_report(
                 order,
                 self.core.account_id,
-                self.client_order_id_for(order),
+                self.client_order_id_for(order)?,
                 cmd.ts_init,
             )
         })
@@ -1060,7 +1148,7 @@ impl ExecutionClient for LongbridgeExecutionClient {
                 self.core.account_id,
                 order_side_from_sdk(order.side)?,
                 &order.currency,
-                self.client_order_id_for(order),
+                self.client_order_id_for(order)?,
                 cmd.ts_init,
             )?);
         }
@@ -1113,7 +1201,371 @@ impl ExecutionClient for LongbridgeExecutionClient {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{
+        cache::Cache,
+        clock::TestClock,
+        messages::{ExecutionEvent, ExecutionReport},
+    };
+    use nautilus_core::UUID4;
+    use nautilus_execution::engine::ExecutionEngine;
+    use nautilus_model::{
+        enums::{AccountType, OrderStatus, OrderType},
+        identifiers::Symbol,
+        instruments::{Equity, InstrumentAny},
+        orders::builder::OrderTestBuilder,
+        types::{Currency, Price, Quantity},
+    };
+    use rstest::rstest;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    fn broker_order() -> Order {
+        serde_json::from_str(include_str!("../test_data/order_reconciliation.json")).unwrap()
+    }
+
+    fn broker_fill(order: &Order) -> Execution {
+        Execution {
+            order_id: order.order_id.clone(),
+            trade_id: "execution-1".into(),
+            symbol: order.symbol.clone(),
+            trade_done_at: order.updated_at.unwrap(),
+            quantity: Decimal::ONE,
+            price: Decimal::new(9990, 2),
+        }
+    }
+
+    #[rstest]
+    fn pending_query_is_coalesced_and_released_on_drop() {
+        let contexts = Arc::new(Mutex::new(OrderContexts::default()));
+        let id = ClientOrderId::from("DG-QUERY-1");
+        let guard = OrderQueryGuard::acquire(&contexts, id).unwrap();
+        assert!(OrderQueryGuard::acquire(&contexts, id).is_none());
+        assert!(OrderQueryGuard::acquire(&contexts, ClientOrderId::from("DG-QUERY-2")).is_some());
+        drop(guard);
+        assert!(OrderQueryGuard::acquire(&contexts, id).is_some());
+    }
+
+    #[tokio::test]
+    async fn sdk_recovers_ambiguous_submission_and_native_engine_deduplicates_fills() {
+        // 仅测试传输使用本地 HTTP 服务，查询和解析走生产 Adapter 与官方 SDK
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let order_json: serde_json::Value =
+            serde_json::from_str(include_str!("../test_data/order_reconciliation.json")).unwrap();
+        let executions = serde_json::json!([{
+            "order_id":"broker-42", "trade_id":"execution-1", "symbol":"AAPL.US",
+            "trade_done_at":"1758547801", "quantity":"1", "price":"99.90"
+        }]);
+        let (submitted_at_broker, submission_seen) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut submitted_at_broker = Some(submitted_at_broker);
+            let mut requests = Vec::new();
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0_u8; 4096];
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let header_end = bytes
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let mut buffer = [0_u8; 4096];
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                let path = request.lines().next().unwrap().to_string();
+                if index == 0 {
+                    assert!(path.starts_with("POST /v1/trade/order"));
+                    let submitted: serde_json::Value =
+                        serde_json::from_str(&request[header_end..]).unwrap();
+                    assert_eq!(submitted["client_request_id"], "DG-TEST-AAPL-1-B-1");
+                    assert_eq!(submitted["remark"], submitted["client_request_id"]);
+                    requests.push(path);
+                    let body = r#"{"code":500000,"message":"unknown outcome","data":null}"#;
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    submitted_at_broker.take().unwrap().send(()).unwrap();
+                    continue;
+                }
+                assert!(
+                    path.starts_with("GET "),
+                    "reconciliation must never resubmit"
+                );
+                let data = if path.contains("/order/today") {
+                    serde_json::json!({"orders":[order_json.clone()]})
+                } else if path.contains("/order/history") {
+                    serde_json::json!({"orders":[]})
+                } else if path.contains("/execution/today") {
+                    serde_json::json!({"trades":executions.clone()})
+                } else {
+                    assert!(path.contains("/execution/history"));
+                    serde_json::json!({"trades":[]})
+                };
+                requests.push(path);
+                let body =
+                    serde_json::json!({"code":0,"message":"success","data":data}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let instrument_id = InstrumentId::from("AAPL.US.LONGBRIDGE");
+        let id = ClientOrderId::from("DG-TEST-AAPL-1-B-1");
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_id)
+            .client_order_id(id)
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(3))
+            .price(Price::from("100.00"))
+            .build();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        let core = ExecutionClientCore::new(
+            order.trader_id(),
+            ClientId::from("LONGBRIDGE"),
+            instrument_id.venue,
+            OmsType::Netting,
+            AccountId::from("LONGBRIDGE-001"),
+            AccountType::Cash,
+            Some(Currency::USD()),
+            cache.clone(),
+        );
+        let mut client =
+            LongbridgeExecutionClient::new(core, LongbridgeExecClientConfig::default());
+        let sdk = longbridge::Config::from_apikey("test-key", "test-secret", "test-token")
+            .http_url(format!("http://{address}"))
+            .trade_ws_url(format!("ws://{address}/unused"));
+        let (context, _pushes) = TradeContext::new(Arc::new(sdk));
+        client.context = Some(context);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(sender);
+        client
+            .submit_order(SubmitOrder::from_order(
+                &order,
+                order.trader_id(),
+                None,
+                None,
+                UUID4::new(),
+                0.into(),
+            ))
+            .unwrap();
+        let submitted = receiver.recv().await.unwrap();
+        let ExecutionEvent::Order(event) = submitted else {
+            panic!("expected submitted event");
+        };
+        cache
+            .borrow_mut()
+            .order_mut(&id)
+            .unwrap()
+            .apply(event)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), submission_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .query_order(QueryOrder::new(
+                order.trader_id(),
+                None,
+                order.strategy_id(),
+                instrument_id,
+                id,
+                None,
+                UUID4::new(),
+                0.into(),
+                None,
+                None,
+            ))
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ExecutionEvent::Report(report @ ExecutionReport::OrderWithFills(_, _)) = event else {
+            panic!("expected an atomic order/fills report");
+        };
+        assert_eq!(server.await.unwrap().len(), 5);
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::Equity(
+                Equity::builder()
+                    .instrument_id(instrument_id)
+                    .raw_symbol(Symbol::from("AAPL.US"))
+                    .currency(Currency::USD())
+                    .price_precision(2)
+                    .price_increment(Price::from("0.01"))
+                    .lot_size(Quantity::from(1))
+                    .ts_event(0.into())
+                    .ts_init(0.into())
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        let mut engine =
+            ExecutionEngine::new(Rc::new(RefCell::new(TestClock::new())), cache.clone(), None);
+        engine.reconcile_execution_report(&report);
+        engine.reconcile_execution_report(&report);
+        let recovered = cache.borrow().order(&id).unwrap().clone();
+        assert_eq!(recovered.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(recovered.filled_qty(), Quantity::from(1));
+        assert_eq!(recovered.trade_ids().len(), 1);
+        assert_eq!(
+            recovered.venue_order_id(),
+            Some(VenueOrderId::from("broker-42"))
+        );
+
+        let mut canceled = broker_order();
+        canceled.status = longbridge::trade::OrderStatus::PartialWithdrawal;
+        let (snapshot, fills) = order_with_fills(
+            &canceled,
+            vec![broker_fill(&canceled)],
+            client.account_id(),
+            Some(id),
+            0.into(),
+        )
+        .unwrap();
+        engine.reconcile_order_with_fills(&snapshot, &fills);
+        engine.reconcile_order_with_fills(&snapshot, &fills);
+        assert_eq!(
+            cache.borrow().order(&id).unwrap().status(),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            cache.borrow().order(&id).unwrap().filled_qty(),
+            Quantity::from(1)
+        );
+
+        // 重启后的空映射仍从 native cache 找回客户身份，不导入另一策略的订单
+        *client.order_contexts.lock().unwrap() = OrderContexts::default();
+        assert_eq!(
+            client.client_order_id_for(&broker_order()).unwrap(),
+            Some(id)
+        );
+        client.terminate();
+    }
+
+    #[rstest]
+    fn unresolved_submission_matches_remark_without_venue_id_and_rejects_ambiguity() {
+        let order = broker_order();
+        let id = ClientOrderId::from(order.remark.as_str());
+        assert_eq!(
+            select_order(vec![order.clone()], Some(id), None)
+                .unwrap()
+                .order_id,
+            "broker-42"
+        );
+        assert!(select_order(Vec::new(), Some(id), None).is_err());
+        let mut duplicate = order.clone();
+        duplicate.order_id = "broker-43".into();
+        assert!(select_order(vec![order.clone(), duplicate], Some(id), None).is_err());
+        assert!(
+            select_order(
+                vec![order.clone()],
+                Some(ClientOrderId::from("FOREIGN")),
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            select_order(
+                vec![order],
+                Some(ClientOrderId::from("EXTERNAL-1")),
+                Some(VenueOrderId::from("broker-42"))
+            )
+            .unwrap()
+            .order_id,
+            "broker-42"
+        );
+    }
+
+    #[rstest]
+    fn reconciliation_validates_identity_before_associating_venue_id() {
+        let mut order = broker_order();
+        let id = ClientOrderId::from(order.remark.as_str());
+        let mut contexts = OrderContexts::default();
+        contexts.insert_client(OrderContext {
+            client_order_id: id,
+            strategy_id: StrategyId::from("GRID-001"),
+            instrument_id: InstrumentId::from("AAPL.US.LONGBRIDGE"),
+            order_side: OrderSide::Buy,
+        });
+        order.symbol = "MSFT.US".into();
+        assert!(contexts.for_order(&order).is_err());
+        assert!(contexts.by_venue.is_empty());
+        order.symbol = "AAPL.US".into();
+        order.side = LongbridgeOrderSide::Sell;
+        assert!(contexts.for_order(&order).is_err());
+        order.side = LongbridgeOrderSide::Buy;
+        assert_eq!(
+            contexts.for_order(&order).unwrap().unwrap().client_order_id,
+            id
+        );
+    }
+
+    #[rstest]
+    fn partial_fill_snapshot_requires_consistent_executions_and_deduplicates() {
+        let order = broker_order();
+        let fill = broker_fill(&order);
+        let account = AccountId::from("LONGBRIDGE-001");
+        let id = Some(ClientOrderId::from(order.remark.as_str()));
+        let (report, fills) = order_with_fills(
+            &order,
+            vec![fill.clone(), fill.clone()],
+            account,
+            id,
+            0.into(),
+        )
+        .unwrap();
+        assert_eq!(report.filled_qty.as_decimal(), Decimal::ONE);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].last_px.as_decimal(), Decimal::new(9990, 2));
+        assert!(order_with_fills(&order, Vec::new(), account, id, 0.into()).is_err());
+        let mut wrong = fill;
+        wrong.symbol = "MSFT.US".into();
+        assert!(order_with_fills(&order, vec![wrong], account, id, 0.into()).is_err());
+    }
+
+    #[rstest]
+    #[case(500_000, false)]
+    #[case(429_001, true)]
+    #[case(429_002, true)]
+    #[case(429_003, true)]
+    fn server_errors_do_not_fabricate_rejections(#[case] code: i32, #[case] rejected: bool) {
+        let error = LongbridgeError::HttpClient(longbridge::httpclient::HttpClientError::OpenApi {
+            code,
+            message: "test response".into(),
+            trace_id: "test-trace".into(),
+        });
+        assert_eq!(is_authoritative_rejection(&error), rejected);
+        assert!(!is_authoritative_rejection(&LongbridgeError::HttpClient(
+            longbridge::httpclient::HttpClientError::RequestTimeout,
+        )));
+    }
 
     #[test]
     fn short_preflight_cancel_survives_until_dispatch() {

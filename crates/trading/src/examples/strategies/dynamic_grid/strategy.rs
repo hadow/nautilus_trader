@@ -1811,9 +1811,8 @@ impl GridStrategyEngine {
                 self.halt(runtime, e);
             }
             for id in self.state.orders.active_ids() {
-                if let Some(order) = runtime.cache().order(&ClientOrderId::new_checked(id)?)
-                    && order.venue_order_id().is_some()
-                {
+                if let Some(order) = runtime.cache().order(&ClientOrderId::new_checked(id)?) {
+                    // 提交超时可能尚无券商订单号，Adapter 仍须按 ClientOrderId 查回
                     runtime.query_order(&order, None, None)?;
                 }
             }

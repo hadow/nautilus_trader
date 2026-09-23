@@ -158,6 +158,12 @@ required-features = ["examples"]
 doc = false
 
 [[example]]
+name = "longbridge-dynamic-grid-selector"
+path = "examples/node_dynamic_grid_selector.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
 name = "longbridge-manipulation-backtest"
 path = "examples/node_manipulation_backtest.rs"
 required-features = ["examples"]

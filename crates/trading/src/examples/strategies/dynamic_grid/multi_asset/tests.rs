@@ -187,6 +187,91 @@ fn account_event(total: Decimal, locked: Decimal, ts: u64) -> AccountState {
 }
 
 #[rstest]
+fn watchdog_queries_unacknowledged_submissions_without_releasing_cash() {
+    use nautilus_common::{
+        messages::execution::TradingCommand,
+        msgbus::{self, TypedIntoHandler, switchboard::MessagingSwitchboard},
+        timer::TimeEvent,
+    };
+    use nautilus_model::{
+        enums::OrderType, identifiers::ClientOrderId, orders::builder::OrderTestBuilder,
+    };
+
+    use super::super::{engine::GridEngine, orders::OrderPhase};
+
+    let (mut runtime, mut engine, cache) = runtime(1);
+    let now = (engine.config.grid.order_timeout_secs + 1) * 1_000_000_000;
+    runtime
+        .core
+        .clock_mut()
+        .as_any_mut()
+        .downcast_mut::<TestClock>()
+        .unwrap()
+        .advance_time(now.into(), true);
+    engine.state.last_market_ns = now;
+    let grid = GridEngine::build(
+        &engine.config.grid,
+        1,
+        dec!(100),
+        dec!(0.02),
+        dec!(10000),
+        dec!(0.01),
+        dec!(1),
+        0,
+    )
+    .unwrap();
+    let intent = engine
+        .state
+        .orders
+        .entry("901-AAPL.SIM", 1, &grid.levels[0], dec!(1), None, 0)
+        .unwrap();
+    engine
+        .state
+        .orders
+        .transition(&intent.id, OrderPhase::Submitted, 0);
+    let id = ClientOrderId::from(intent.id.as_str());
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(engine.config.instrument_id)
+        .client_order_id(id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(1))
+        .price(Price::from("98.00"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order, None, None, false)
+        .unwrap();
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let received = Rc::clone(&commands);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::exec_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: TradingCommand| received.borrow_mut().push(command)),
+    );
+    let reserved = engine
+        .state
+        .orders
+        .buy_reservations(&engine.config.grid, dec!(100));
+    engine
+        .on_time_event(
+            &mut runtime,
+            &TimeEvent::new("GRID_WATCHDOG".into(), UUID4::new(), now.into(), now.into()),
+        )
+        .unwrap();
+    assert_eq!(engine.state.state, super::StrategyState::RiskOff);
+    assert_eq!(
+        engine
+            .state
+            .orders
+            .buy_reservations(&engine.config.grid, dec!(100)),
+        reserved
+    );
+    assert!(
+        matches!(&commands.borrow()[0], TradingCommand::QueryOrder(query) if query.client_order_id == id && query.venue_order_id.is_none())
+    );
+    assert_eq!(commands.borrow().len(), 1);
+}
+
+#[rstest]
 #[case::rejected(true)]
 #[case::expired(false)]
 fn hardening_native_terminal_events_release_only_their_owned_reservations(#[case] rejected: bool) {

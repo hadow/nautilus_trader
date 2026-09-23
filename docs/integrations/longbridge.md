@@ -196,10 +196,130 @@ The client distinguishes three outcomes:
 then associate private updates with locally submitted orders; external orders remain valid
 reconciliation reports without a fabricated client order ID.
 
+An order query can recover a missing venue order ID by matching the exact client ID in the broker
+remark. Multiple matches, conflicting symbol/side identities, and an absent result fail closed;
+absence is not treated as proof of rejection. Restored native orders provide the identity map after
+restart. Concurrent explicit queries for the same client ID share one in-flight query, including
+time spent waiting for a rate-limit permit. Transport failures and the broker's internal-error
+response do not trigger automatic resubmission. The broker's idempotency cache lasts only ten
+minutes; it does not replace durable
+strategy state. See [submit-order semantics](https://open.longbridge.com/docs/trade/order/submit).
+
+Private pushes and explicit queries deliver order snapshots and their executions together through
+Nautilus `OrderWithFills`. Native execution handles fill deduplication. When the execution sum differs
+from the cumulative order quantity, reconciliation waits for another query instead of guessing a
+fill. Keep periodic native reconciliation enabled: API snapshots are not transactionally consistent.
+
+Trade calls share a process-wide rolling quota and one in-flight permit, held until 25 ms after the
+response. Dispatch spacing alone is insufficient: network jitter can bunch concurrent requests at
+the broker and trigger `429003`. This does not coordinate separate processes or retry mutations.
+Quote padding such as `12.970` is normalized without rounding genuine sub-cent prices.
+
+## Dynamic Grid paper acceptance
+
+Build the debug runner and perform a read-only check first:
+
+```bash
+CARGO_INCREMENTAL=0 cargo build -p nautilus-longbridge --features dynamic-grid \
+  --bin longbridge-dynamic-grid -j 2
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_paper.json --check-paper
+```
+
+The check uses OAuth with `papertrading=true`, the shared trade rate limiter, and native account,
+position and order parsers. It reports counts without printing credentials or balances. It does not
+submit/cancel orders, acquire the strategy checkpoint lock, or claim that execution is accepted.
+`fresh_account_candidate=false` means existing positions or active orders need investigation before
+starting a fresh strategy. Even `true` does not validate a checkpoint or authorize trading.
+
+Run the offline regressions separately from any account session:
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p nautilus-longbridge --features dynamic-grid \
+  --lib --profile dev -j 2 -- --test-threads=1
+CARGO_INCREMENTAL=0 cargo test -p nautilus-trading --features examples \
+  --lib dynamic_grid --profile dev -j 2 -- --test-threads=1
+```
+
+The adapter regression sends a submission through the SDK to a local HTTP fixture, receives an
+ambiguous server error, then queries the same client identity without a venue ID. It feeds the real
+broker-shaped partial execution into the native engine twice and verifies one applied fill, followed
+by a partial cancellation. This tests production parsing and reconciliation, not real broker fills.
+Other regressions cover concurrent rate permits, no mutation retries, and retained grid reservations
+after confirmation timeout.
+
+For a bounded adapter execution check, the existing Rust execution tester is Paper-only and defaults
+to printing a plan without connecting. It uses `F.US`, one share, a $300 per-order cap and the shared
+trade limiter. Verify the symbol contract before changing its constants. The tester checks for
+conflicting symbol orders/inventory and uses the broker trading calendar to require the US regular
+session. Execute the sell step only after verifying the buy's result:
+
+```bash
+CARGO_INCREMENTAL=0 cargo build -p nautilus-longbridge --features examples \
+  --example longbridge-exec-tester -j 2
+target/debug/examples/longbridge-exec-tester --check-paper
+target/debug/examples/longbridge-exec-tester --paper-buy
+# Inspect PAPER_ACCEPTANCE and the broker account before the separate sell step.
+target/debug/examples/longbridge-exec-tester --paper-sell
+```
+
+Each execution run submits one marketable limit, stops after 60 seconds, individually cancels its
+remaining orders and queries the broker again. It never auto-closes with a market order and never
+retries a failed acceptance run. A successful result requires one native filled order with execution
+IDs, no active symbol orders and the expected broker quantity (one after buy, zero after sell).
+A timeout or incomplete result requires read-only reconciliation before another execution run.
+This tests the shared adapter/native execution path, not a complete Dynamic Grid restart scenario.
+
+Full strategy acceptance still needs an isolated account or an explicitly reconciled checkpoint.
+Do not run the default portfolio merely to force a fill. Record the following evidence before
+considering live deployment:
+
+1. Submitted client ID, broker order ID and real execution IDs match across push and query.
+2. Partial and terminal fills update position, cash and grid inventory once, including replay.
+3. Cancellation is broker-confirmed before reservations disappear or replacement orders start.
+4. After reconnect/restart, orders and positions match the broker; no new entry occurs while unknown.
+5. Rate-limit/timeout incidents retain reservations and stop entries; no repeated submission occurs.
+6. Shutdown is followed by a broker check for residual orders and inventory, not just a clean exit code.
+
+Dynamic Grid keeps timeout risk latched; successful connectivity or a recovered fill does not
+automatically authorize new entries. Resolve discrepancies before using the existing risk-reset
+workflow. Do not delete checkpoints to bypass recovery. Broker fee totals still require statement
+reconciliation, and the limiter coordinates only one process. Do not intentionally overload the
+broker or disconnect a real-money account to induce these failure scenarios.
+
+### Bounded Paper result (2026-09-23)
+
+The user-authorized acceptance used `F.US`, one share, a $300 maximum buy notional, cash-mode risk
+checks and US regular-session limits. No live-money orders or default grid portfolio were started.
+
+| Check                                      | Result                 | Evidence                                                                                                                                                                                                      |
+| ------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Paper buy                                  | PASS                   | 14:30:34 UTC; one share at $12.875; native Submitted, Accepted and Filled with a broker execution ID.                                                                                                         |
+| Separate-process recovery                  | PASS                   | Seller startup restored the earlier buy execution and one-share position before submitting its sell.                                                                                                          |
+| Paper sell                                 | PASS                   | 14:32:27 UTC; one share at $12.8839; native Filled with a different broker execution ID.                                                                                                                      |
+| Final broker check                         | PASS                   | `F.US` quantity 0, active orders 0; account-wide today orders 2, executions 2, active orders 0.                                                                                                               |
+| Limiter                                    | PARTIAL                | Encountered real `429003` before strategy startup; after serialization/cooldown, both execution runs completed without this error. Concurrent-process quotas remain untested.                                 |
+| Ambiguous submission / partial-fill replay | PASS (offline)         | SDK HTTP fixture recovers by client remark, then native execution applies the real-shaped fill only once. No real broker timeout was induced.                                                                 |
+| Acceptance reporter                        | PARTIAL                | Seller incorrectly counted its recovered buy as another new submission. Fixed by checking current-run Submitted events; three example tests pass. No extra trades were made to rerun this reporting-only fix. |
+| Full Dynamic Grid checkpoint recovery      | NOT RUN on broker      | The round trip used the existing native execution tester, not the grid portfolio. Grid timeout/reservation regression passes offline.                                                                         |
+| Statement fees / live money                | NOT VERIFIED / NOT RUN | Broker execution queries omit commission; zero reported commission is not proof of zero account fees.                                                                                                         |
+
+Earlier attempts exposed quote-padding precision and server-arrival rate-limit issues; neither
+attempt submitted a broker order. The final account still has its original unrelated position;
+`fresh_account_candidate=false` is therefore expected, not permission to start a fresh grid over it.
+Raw local logs can contain account balances and must not be committed or published.
+
+Validation: debug build passed; adapter library 42 tests passed, Dynamic Grid 87 passed with four
+pre-existing performance tests ignored, execution tester three passed. Targeted adapter Clippy
+with `--no-deps` and changed-file formatting passed. Dependency-inclusive Clippy remains blocked
+by 13 pre-existing findings in `dynamic_grid/files.rs` and `momentum_pullback`; workspace formatting
+also has pre-existing import differences outside this change. This is not full live readiness.
+
 ## Examples and tests
 
-The Rust examples construct complete `LiveNode` instances. The data and execution testers register a
-sample `AAPL.US` equity; the grid example registers the three equities described below:
+The Rust examples construct complete `LiveNode` instances. The data tester registers a sample
+`AAPL.US` equity; the bounded Paper execution tester uses `F.US`. The grid example registers the
+three equities described below:
 
 ```bash
 cargo run -p nautilus-longbridge --features examples --example longbridge-data-tester
@@ -214,10 +334,10 @@ python examples/live/longbridge/data_tester.py
 python examples/live/longbridge/exec_tester.py
 ```
 
-The data tester subscribes to quotes, 10-level depth, trades and one-minute external bars. The
-execution tester enables reconciliation and exercises market submission, a passive limit order,
-cancellation, position close and private order push. Its defaults use Longbridge paper trading,
-submit one-share orders, and avoid unsupported post-only and reduce-only flags.
+The data tester subscribes to quotes, 10-level depth, trades and one-minute external bars. The Rust
+execution tester enables reconciliation and exercises one-share Paper limits and private order
+push, as described above. It avoids unsupported post-only and reduce-only flags. The Python
+execution example is separate; inspect its settings before running it.
 
 The grid example runs an independent built-in Rust `GridMarketMaker` for each of `AAPL.US`,
 `MSFT.US` and `NVDA.US`. Each symbol uses three levels per side, ten shares per order, a 60-share

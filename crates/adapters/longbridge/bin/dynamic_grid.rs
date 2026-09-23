@@ -20,7 +20,10 @@ mod dynamic_grid_config;
 use std::{fs::File, path::Path, time::Duration};
 
 use dynamic_grid_config::{AppConfig, Mode};
-use longbridge::{TradeContext, trade::GetTodayOrdersOptions};
+use longbridge::{
+    TradeContext,
+    trade::{GetTodayExecutionsOptions, GetTodayOrdersOptions},
+};
 use nautilus_common::{actor::registry::try_get_actor_unchecked, enums::Environment};
 use nautilus_execution::models::fee::{FeeModelAny, PerContractFeeModel};
 use nautilus_live::{
@@ -30,6 +33,10 @@ use nautilus_live::{
 use nautilus_longbridge::{
     LongbridgeDataClientConfig, LongbridgeDataClientFactory, LongbridgeExecClientConfig,
     LongbridgeExecutionClientFactory,
+    common::{
+        parse::{parse_account_state, parse_order_status_report, parse_position_status_report},
+        rate_limit::trade_api_call,
+    },
 };
 use nautilus_model::{
     enums::{AccountType, OmsType},
@@ -68,30 +75,49 @@ async fn main() -> anyhow::Result<()> {
             outside_rth: false,
             ..Default::default()
         };
-        let (balances, positions, orders) = tokio::time::timeout(Duration::from_secs(45), async {
+        let snapshot = tokio::time::timeout(Duration::from_secs(45), async {
             let (context, _receiver) = TradeContext::new(exec.sdk_config().await?);
-            let balances = context.account_balance(None).await?;
+            let balances = trade_api_call(context.account_balance(None)).await?;
             anyhow::ensure!(!balances.is_empty(), "Paper account returned no balances");
-            let positions = context.stock_positions(None).await?;
-            let orders = context.today_orders(GetTodayOrdersOptions::new()).await?;
-            Ok::<_, anyhow::Error>((
-                balances.len(),
-                positions
-                    .channels
-                    .iter()
-                    .map(|c| c.positions.len())
-                    .sum::<usize>(),
-                orders.len(),
-            ))
+            parse_account_state(&balances)?;
+            let positions = trade_api_call(context.stock_positions(None)).await?;
+            let orders = trade_api_call(context.today_orders(GetTodayOrdersOptions::new())).await?;
+            let executions =
+                trade_api_call(context.today_executions(GetTodayExecutionsOptions::new())).await?;
+            let mut active_orders = 0;
+            for order in &orders {
+                let report = parse_order_status_report(order, app.account_id, None, 0.into())?;
+                active_orders += usize::from(!report.order_status.is_closed());
+            }
+            let mut position_records = 0;
+            let mut nonflat_positions = 0;
+            for position in positions
+                .channels
+                .iter()
+                .flat_map(|channel| &channel.positions)
+            {
+                parse_position_status_report(position, app.account_id, 0.into())?;
+                position_records += 1;
+                nonflat_positions += usize::from(!position.quantity.is_zero());
+            }
+            // 不输出余额、账户编号或持仓明细；只报告门禁结果，不把连通性称为成交验收
+            Ok::<_, anyhow::Error>(serde_json::json!({
+                "account_records": balances.len(), "position_records": position_records,
+                "nonflat_positions": nonflat_positions, "today_orders": orders.len(),
+                "active_orders": active_orders, "today_executions": executions.len(),
+                "native_snapshot_parsing": "PASS",
+                "fresh_account_candidate": nonflat_positions == 0 && active_orders == 0,
+            }))
         })
         .await
         .map_err(|_| anyhow::anyhow!("Paper read-only check timed out; no orders submitted"))??;
         println!(
             "{}",
             serde_json::json!({
-                "mode": "Paper", "read_only": true, "account_records": balances,
-                "position_records": positions, "today_orders": orders,
+                "mode": "Paper", "read_only": true, "snapshot": snapshot,
                 "checkpoint_exists": app.state_path.exists(),
+                "broker_fill_acceptance": "NOT_RUN",
+                "timeout_reconciliation_acceptance": "NOT_RUN",
                 "note": "Connectivity only; startup reconciliation and execution are not validated"
             })
         );

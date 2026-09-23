@@ -216,10 +216,15 @@ pub fn parse_depth(
                 && !bid.size.is_zero()
                 && !ask.size.is_zero() =>
         {
+            // SDK 的 12.970 只是带尾零的表示，不能把它当成三位小数的报价精度。
+            // 买卖价统一到所需的最大有效精度；不舍入真实存在的次分价格。
+            let bid_price = bid.price.as_decimal().normalize();
+            let ask_price = ask.price.as_decimal().normalize();
+            let precision = u8::try_from(bid_price.scale().max(ask_price.scale()))?;
             Some(QuoteTick::new_checked(
                 instrument_id,
-                bid.price,
-                ask.price,
+                Price::from_decimal_dp(bid_price, precision)?,
+                Price::from_decimal_dp(ask_price, precision)?,
                 bid.size,
                 ask.size,
                 ts_event,
@@ -699,6 +704,40 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[rstest]
+    #[case("12.970", 2)]
+    #[case("12.975", 3)]
+    fn test_depth_quote_normalizes_padding_without_rounding(
+        #[case] ask: &str,
+        #[case] precision: u8,
+    ) {
+        let level = |price: &str| Depth {
+            position: 1,
+            price: Some(Decimal::from_str(price).unwrap()),
+            volume: 100,
+            order_num: 1,
+        };
+        let (_, quote) = parse_depth(
+            "F.US",
+            &[level("12.900")],
+            &[level(ask)],
+            0.into(),
+            0.into(),
+        )
+        .unwrap();
+        let quote = quote.unwrap();
+        assert_eq!(quote.bid_price.precision, precision);
+        assert_eq!(quote.ask_price.precision, precision);
+        assert_eq!(
+            quote.bid_price.as_decimal(),
+            Decimal::from_str("12.900").unwrap()
+        );
+        assert_eq!(
+            quote.ask_price.as_decimal(),
+            Decimal::from_str(ask).unwrap()
+        );
+    }
 
     #[rstest]
     fn test_completed_minute_preserves_source_vwap_precision_and_timestamp() {

@@ -23,6 +23,12 @@ cargo run -p nautilus-longbridge --features examples --example longbridge-slc-ba
 cargo run -p nautilus-longbridge --features examples --example longbridge-slc-trader
 ```
 
+The Rust execution tester prints a plan unless passed `--check-paper`, `--paper-buy` or
+`--paper-sell`. It is Paper-only: `F.US`, one share, a $300 order cap, regular-session checks and
+post-run broker reconciliation. Buy and sell are separate steps; inspect the first result before
+selling. It does not automatically flatten with a market order. See the
+[acceptance runbook](../../../docs/integrations/longbridge.md#dynamic-grid-paper-acceptance).
+
 The range-fakeout backtest downloads up to 1,000 historical Longbridge 5-minute bars, loads the
 instrument definition from Longbridge, and replays only those bars through `BacktestEngine`. Its
 defaults implement a New York 00:00-04:00 range, close-confirmed breakout and reentry, one-tick stop
@@ -91,7 +97,8 @@ be guaranteed.
 
 Python tester nodes are available in
 [`examples/live/longbridge`](../../../examples/live/longbridge). The tester examples register an
-explicit sample `AAPL.US` equity. Production data clients can instead configure exact price
+explicit sample `AAPL.US` equity (the Rust bounded execution tester uses `F.US`). Production data
+clients can instead configure exact price
 increments and load the remaining static metadata from Longbridge. Verify every definition before
 connecting, and review the execution warning before changing the paper-trading default.
 

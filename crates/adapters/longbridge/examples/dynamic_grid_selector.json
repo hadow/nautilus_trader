@@ -1,0 +1,40 @@
+{
+  "grid_template": "../../../backtest/examples/instuments/AAPL.json",
+  "signal_history_bars": 400,
+  "selection": {
+    "lookback_sessions": 60,
+    "max_candidates": 5,
+    "max_per_sector": 2,
+    "minimum_score": 55.0,
+    "target_rebounds": 6,
+    "minimum_average_dollar_volume": "20000000",
+    "max_quote_age_secs": 120,
+    "max_history_age_days": 7,
+    "grid_capital": "10000",
+    "minimum_commission_per_order": "0",
+    "maximum_correlation": 0.8,
+    "minimum_correlation_observations": 30
+  },
+  "universe": {
+    "AAPL.US": { "sector": "InformationTechnology", "grid_config": null },
+    "AMD.US": { "sector": "InformationTechnology", "grid_config": null },
+    "AMZN.US": { "sector": "ConsumerDiscretionary", "grid_config": null },
+    "AVGO.US": { "sector": "InformationTechnology", "grid_config": null },
+    "BAC.US": { "sector": "Financials", "grid_config": null },
+    "CAT.US": { "sector": "Industrials", "grid_config": null },
+    "CVX.US": { "sector": "Energy", "grid_config": null },
+    "F.US": { "sector": "ConsumerDiscretionary", "grid_config": null },
+    "GOOGL.US": { "sector": "CommunicationServices", "grid_config": null },
+    "HD.US": { "sector": "ConsumerDiscretionary", "grid_config": null },
+    "JNJ.US": { "sector": "HealthCare", "grid_config": null },
+    "JPM.US": { "sector": "Financials", "grid_config": null },
+    "KO.US": { "sector": "ConsumerStaples", "grid_config": null },
+    "META.US": { "sector": "CommunicationServices", "grid_config": null },
+    "MSFT.US": { "sector": "InformationTechnology", "grid_config": "../../../backtest/examples/instuments/MSFT.json" },
+    "NVDA.US": { "sector": "InformationTechnology", "grid_config": null },
+    "PG.US": { "sector": "ConsumerStaples", "grid_config": null },
+    "TSLA.US": { "sector": "ConsumerDiscretionary", "grid_config": null },
+    "UNH.US": { "sector": "HealthCare", "grid_config": null },
+    "XOM.US": { "sector": "Energy", "grid_config": null }
+  }
+}

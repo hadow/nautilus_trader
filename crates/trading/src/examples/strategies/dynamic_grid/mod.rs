@@ -26,6 +26,7 @@ pub mod portfolio;
 pub mod position;
 pub mod regime;
 pub mod risk;
+pub mod selection;
 pub mod stock;
 pub mod strategy;
 

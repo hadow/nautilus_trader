@@ -166,8 +166,9 @@ fn quote_rate_limiter() -> &'static RateLimiter {
 
 /// Longbridge trade APIs: at most 30 calls per 30 seconds and at least 20ms between calls.
 fn trade_rate_limiter() -> &'static RateLimiter {
-    static LIMITER: LazyLock<RateLimiter> =
-        LazyLock::new(|| RateLimiter::new(TRADE_MAX_CALLS, TRADE_WINDOW, TRADE_MIN_INTERVAL, None));
+    static LIMITER: LazyLock<RateLimiter> = LazyLock::new(|| {
+        RateLimiter::new(TRADE_MAX_CALLS, TRADE_WINDOW, TRADE_MIN_INTERVAL, Some(1))
+    });
     &LIMITER
 }
 
@@ -261,12 +262,17 @@ where
 }
 
 /// Executes one trade API call after acquiring the process-wide trade limits.
-pub(crate) async fn trade_api_call<F>(call: F) -> F::Output
+#[doc(hidden)]
+pub async fn trade_api_call<F>(call: F) -> F::Output
 where
     F: Future,
 {
     let _permit = trade_rate_limiter().acquire().await;
-    call.await
+    let result = call.await;
+    // 券商按到达时间限制间隔。并发 HTTP 的发送间隔无法防止网络抖动导致请求挤在一起。
+    // 持有串行许可直到响应后的冷却期结束；不重试任何可能已生效的交易操作。
+    tokio::time::sleep(TRADE_MIN_INTERVAL).await;
+    result
 }
 
 static QUOTE_CONNECTION_HELD: AtomicBool = AtomicBool::new(false);
@@ -301,6 +307,60 @@ pub const MAX_QUOTE_SUBSCRIPTION_SYMBOLS: usize = 500;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_trade_calls_wait_for_previous_response_and_cooldown() {
+        let call = || {
+            trade_api_call(async {
+                let started = Instant::now();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                (started, Instant::now())
+            })
+        };
+        let (first, second) = tokio::join!(call(), call());
+        let mut calls = [first, second];
+        calls.sort_by_key(|(start, _)| *start);
+        assert!(calls[1].0.duration_since(calls[0].1) >= TRADE_MIN_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_trade_calls_share_the_same_window() {
+        let window = Duration::from_millis(50);
+        let interval = Duration::from_millis(5);
+        let limiter = Arc::new(RateLimiter::new(3, window, interval, None));
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+        for _ in 0..9 {
+            let limiter = Arc::clone(&limiter);
+            tasks.push(tokio::spawn(async move {
+                let _permit = limiter.acquire().await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        // 直接检查已授予许可的记录，避免并发任务调度抖动影响测量时间
+        let state = limiter.state.lock().await;
+        assert!(started.elapsed() >= window * 2);
+        assert!(state.calls.len() <= 3);
+        for (previous, next) in state.calls.iter().zip(state.calls.iter().skip(1)) {
+            assert!(next.duration_since(*previous) >= interval);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trade_mutation_timeout_is_never_automatically_retried() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: longbridge::Result<()> = trade_api_call(async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(longbridge::Error::HttpClient(
+                longbridge::httpclient::HttpClientError::RequestTimeout,
+            ))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn test_trade_rate_limiter_enforces_minimum_interval() {
