@@ -212,11 +212,11 @@ pub struct GridConfig {
     pub realized_volatility_max: f64,
     /// 将股票自适应模式的入场限制在纽约时间 09:30–16:00 常规交易时段。
     pub regular_session_only: bool,
-    /// 触发暂停新增仓位的隔夜跳空绝对比例。
+    /// 触发暂停新增仓位的严重向下隔夜跳空比例。
     pub max_gap_pct: Decimal,
-    /// 以前一根已完成 K 线 ATR 衡量、触发暂停入场的隔夜跳空倍数。
+    /// 以前一根已完成 K 线 ATR 衡量、触发暂停入场的严重向下跳空倍数。
     pub max_gap_atr_multiple: Decimal,
-    /// 大幅跳空后暂停入场的常规时段已完成 K 线数。
+    /// 严重向下跳空后暂停入场的常规时段已完成 K 线数。
     pub gap_recovery_bars: u32,
     /// 成交额流动性门槛使用的已完成 K 线滚动窗口。
     pub liquidity_lookback_bars: usize,

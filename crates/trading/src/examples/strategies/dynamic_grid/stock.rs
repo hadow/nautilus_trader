@@ -34,7 +34,7 @@ pub(super) enum BreakoutDirection {
 pub(super) enum StockGate {
     /// 当前不在美股常规交易时段。
     OffSession,
-    /// 大幅跳空后的观察期尚未结束。
+    /// 严重向下跳空后的观察期尚未结束。
     GapRecovery,
     /// 成交额滚动窗口尚未预热。
     LiquidityWarmup,
@@ -128,7 +128,7 @@ impl StockMarketState {
                 .filter(|_| prior_atr > Decimal::ZERO)
                 .map(|previous| (open - previous).abs() / prior_atr)
                 .unwrap_or_default();
-            if self.previous_close.is_some()
+            if opening_gap.is_some_and(|change| change < Decimal::ZERO)
                 && ((config.max_gap_pct > Decimal::ZERO && self.gap_pct > config.max_gap_pct)
                     || (config.max_gap_atr_multiple > Decimal::ZERO
                         && self.gap_atr > config.max_gap_atr_multiple))
@@ -252,6 +252,7 @@ impl StockMarketState {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -259,7 +260,7 @@ mod tests {
     const OPEN_2025_01_02: u64 = 1_735_828_200_000_000_000;
     const DAY: u64 = 86_400_000_000_000;
 
-    #[test]
+    #[rstest]
     fn gap_pause_uses_real_open_and_expires_after_completed_bars() {
         let config = GridConfig {
             max_gap_pct: dec!(0.05),
@@ -307,7 +308,43 @@ mod tests {
         assert_eq!(state.gate(&config, OPEN_2025_01_02 + DAY, dec!(91)), None);
     }
 
-    #[test]
+    #[rstest]
+    fn upward_and_ordinary_downward_gaps_do_not_pause_entries() {
+        let config = GridConfig {
+            max_gap_pct: dec!(0.05),
+            max_gap_atr_multiple: dec!(3),
+            gap_recovery_bars: 2,
+            minimum_price: Decimal::ZERO,
+            maximum_spread_bps: Decimal::ZERO,
+            ..Default::default()
+        };
+
+        for (open, expected_change) in [(dec!(110), dec!(10)), (dec!(97), dec!(-3))] {
+            let mut state = StockMarketState::default();
+            state.observe_bar(
+                &config,
+                OPEN_2025_01_02,
+                dec!(100),
+                dec!(100),
+                dec!(1000),
+                dec!(2),
+            );
+            assert_eq!(
+                state.observe_bar(
+                    &config,
+                    OPEN_2025_01_02 + DAY,
+                    open,
+                    open,
+                    dec!(1000),
+                    dec!(2),
+                ),
+                (true, Some(expected_change))
+            );
+            assert_eq!(state.gate(&config, OPEN_2025_01_02 + DAY, open), None);
+        }
+    }
+
+    #[rstest]
     fn breakout_requires_persistent_atr_buffered_closes() {
         let config = GridConfig {
             breakout_confirmation_bars: 2,
