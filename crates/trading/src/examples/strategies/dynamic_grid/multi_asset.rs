@@ -176,8 +176,6 @@ impl From<DynamicGridConfig> for MultiAssetGridConfig {
             capital: c.grid.capital,
             max_instrument_allocation: Decimal::ONE,
             max_total_exposure: Decimal::ONE,
-            max_total_grid_exposure: Decimal::ONE,
-            max_total_equity_exposure: Decimal::ONE,
             min_cash_reserve: Decimal::ZERO,
             max_sector_exposure: Decimal::ONE,
             max_correlated_exposure: Decimal::ONE,
@@ -860,12 +858,7 @@ impl MultiAssetGridStrategy {
         }
         // 预算缩减只撤销新增库存订单；撤单结果未确认前仍保留全部资金占用。
         let pending: Decimal = views.iter().map(|v| v.pending).sum();
-        let global_limit = self
-            .config
-            .portfolio
-            .max_total_exposure
-            .min(self.config.portfolio.max_total_grid_exposure)
-            .min(self.config.portfolio.max_total_equity_exposure);
+        let global_limit = self.config.portfolio.exposure_limit();
         let cancel_all = self.portfolio_blocked()
             || exposure + pending > risk_equity * global_limit
             || cash - pending < risk_equity * self.config.portfolio.min_cash_reserve
@@ -1051,11 +1044,7 @@ impl MultiAssetGridStrategy {
                 .all(|v| now.saturating_sub(v.mark_ns) / 1_000_000_000 <= v.max_age_secs)
                 && equity > Decimal::ZERO
                 && cash.min(free) >= equity * c.min_cash_reserve
-                && exposure
-                    <= equity
-                        * c.max_total_exposure
-                            .min(c.max_total_grid_exposure)
-                            .min(c.max_total_equity_exposure)
+                && exposure <= equity * c.exposure_limit()
                 && self
                     .portfolio_risk
                     .concentration_breaches(c, &views, equity, now)
@@ -1409,9 +1398,17 @@ nautilus_strategy!(MultiAssetGridStrategy, {
 
 impl Checkpoint {
     fn validate(&self, expected: &MultiAssetGridConfig) -> anyhow::Result<()> {
+        // 仅兼容等价的旧总暴露字段迁移，其他配置及真实风险上限变化仍须人工审计。
+        self.config.validate()?;
+        let canonical = |config: &MultiAssetGridConfig| {
+            let mut config = config.clone();
+            config.portfolio.max_total_exposure = config.portfolio.exposure_limit().normalize();
+            config.portfolio.max_total_grid_exposure = None;
+            config.portfolio.max_total_equity_exposure = None;
+            serde_json::to_value(config)
+        };
         anyhow::ensure!(
-            self.version == 6
-                && serde_json::to_value(&self.config)? == serde_json::to_value(expected)?,
+            self.version == 6 && canonical(&self.config)? == canonical(expected)?,
             "Checkpoint version/configuration mismatch; audit before migration"
         );
         anyhow::ensure!(

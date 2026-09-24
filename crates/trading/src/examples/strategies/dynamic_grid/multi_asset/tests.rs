@@ -39,6 +39,239 @@ use rust_decimal_macros::dec;
 use super::{DynamicGridConfig, GridStrategyEngine, MultiAssetGridStrategy};
 
 #[rstest]
+#[case(dec!(0.7))]
+#[case(dec!(0.500))]
+#[case(dec!(0.9))]
+fn review_checkpoint_allows_only_equivalent_exposure_migration(#[case] legacy: Decimal) {
+    let (mut runtime, _, _) = runtime(1);
+    runtime.config.portfolio.max_total_exposure = dec!(0.7);
+    runtime.config.portfolio.max_total_grid_exposure = Some(legacy);
+    runtime.config.portfolio.max_total_equity_exposure = Some(dec!(0.8));
+    let saved = runtime.checkpoint(None, None);
+    let saved: super::Checkpoint =
+        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    let mut canonical = runtime.config.clone();
+    canonical.portfolio.max_total_exposure = dec!(0.7).min(legacy).normalize();
+    canonical.portfolio.max_total_grid_exposure = None;
+    canonical.portfolio.max_total_equity_exposure = None;
+    saved.validate(&canonical).unwrap();
+    let mut changed = canonical.clone();
+    changed.portfolio.max_total_exposure += dec!(0.01);
+    assert!(saved.validate(&changed).is_err());
+    let mut changed = canonical;
+    changed
+        .instruments
+        .values_mut()
+        .next()
+        .unwrap()
+        .grid
+        .grid_levels += 1;
+    assert!(saved.validate(&changed).is_err());
+}
+
+#[rstest]
+#[case::expired(-181_000_000_000, true)]
+#[case::future(1_000_000_000, true)]
+#[case::out_of_order(-1_000_000_000, true)]
+#[case::fresh(0, false)]
+fn review_rejected_quote_cannot_change_spread_gate(#[case] offset: i64, #[case] blocked: bool) {
+    use nautilus_model::data::QuoteTick;
+
+    use super::super::{config::StrategyMode, stock::StockGate};
+
+    let (mut runtime, mut engine, _) = runtime(1);
+    let now = 1_735_828_260_000_000_000_u64;
+    runtime
+        .core
+        .clock_mut()
+        .as_any_mut()
+        .downcast_mut::<TestClock>()
+        .unwrap()
+        .advance_time(now.into(), true);
+    engine.config.tick_execution = true;
+    engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
+    engine.state.last_tick_event_ns = now;
+    engine.state.stock.observe_quote(dec!(99), dec!(101));
+    let quote = QuoteTick::new(
+        engine.config.instrument_id,
+        Price::from("99.99"),
+        Price::from("100.01"),
+        Quantity::from(1),
+        Quantity::from(1),
+        now.checked_add_signed(offset).unwrap().into(),
+        now.into(),
+    );
+    engine.on_quote(&mut runtime, &quote).unwrap();
+    assert_eq!(
+        engine.state.stock.gate(&engine.config.grid, now, dec!(100)),
+        blocked.then_some(StockGate::WideSpread)
+    );
+}
+
+#[rstest]
+fn review_target_reduction_replaces_distant_take_profit_only_after_cancel() {
+    use nautilus_common::{
+        messages::execution::TradingCommand,
+        msgbus::{self, TypedIntoHandler, switchboard::MessagingSwitchboard},
+    };
+    use nautilus_model::{
+        enums::OrderType,
+        events::{
+            OrderEventAny,
+            order::spec::{OrderAcceptedSpec, OrderCanceledSpec},
+        },
+        identifiers::ClientOrderId,
+        orders::{Order, builder::OrderTestBuilder},
+    };
+
+    use super::super::{
+        config::StrategyMode,
+        engine::GridEngine,
+        orders::{OrderPhase, PositionComponent},
+        regime::MarketRegime,
+    };
+
+    let (mut runtime, mut engine, cache) = runtime(1);
+    runtime.recovering = false;
+    engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
+    engine.config.grid.regular_session_only = false;
+    engine.state.state = super::StrategyState::GridActive;
+    engine.state.regime.snapshot.initialized = true;
+    engine.state.regime.snapshot.regime = MarketRegime::TrendDown;
+    engine.state.regime.snapshot.ts_ns = 1;
+    let grid = GridEngine::build(
+        &engine.config.grid,
+        1,
+        dec!(110),
+        dec!(0.02),
+        dec!(10000),
+        dec!(0.01),
+        dec!(1),
+        0,
+    )
+    .unwrap();
+    let buy = engine
+        .state
+        .orders
+        .entry("901-AAPL.SIM", 1, &grid.levels[0], dec!(5), None, 0)
+        .unwrap();
+    let fill = OrderFilledSpec::builder()
+        .instrument_id(engine.config.instrument_id)
+        .strategy_id(StrategyId::from("DYNAMIC-GRID-901"))
+        .client_order_id(ClientOrderId::from(buy.id.as_str()))
+        .account_id(AccountId::from("SIM-001"))
+        .position_id(PositionId::from("GRID-POSITION-REVIEW"))
+        .order_side(OrderSide::Buy)
+        .last_qty(Quantity::from(5))
+        .last_px(Price::from("107.84"))
+        .build();
+    engine.apply_fill(&fill).unwrap();
+    let position = Position::new(engine.instrument.as_ref().unwrap(), fill);
+    cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+    let sell = engine
+        .state
+        .orders
+        .exit("901-AAPL.SIM", &buy.id, None, 1)
+        .unwrap();
+    assert_eq!(sell.limit, Some(dec!(110)));
+    engine
+        .state
+        .orders
+        .transition(&sell.id, OrderPhase::Accepted, 1);
+    let id = ClientOrderId::from(sell.id.as_str());
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(engine.config.instrument_id)
+        .strategy_id(StrategyId::from("DYNAMIC-GRID-901"))
+        .client_order_id(id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(5))
+        .price(Price::from("110.00"))
+        .build();
+    order
+        .apply(OrderEventAny::Accepted(
+            OrderAcceptedSpec::builder()
+                .instrument_id(engine.config.instrument_id)
+                .strategy_id(StrategyId::from("DYNAMIC-GRID-901"))
+                .client_order_id(id)
+                .build(),
+        ))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order(order, None, None, false)
+        .unwrap();
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let received = Rc::clone(&commands);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::exec_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: TradingCommand| received.borrow_mut().push(command)),
+    );
+    engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    assert_eq!(
+        engine.state.orders.orders()[&sell.id].phase,
+        OrderPhase::CancelPending
+    );
+    assert!(
+        matches!(&commands.borrow()[0], TradingCommand::CancelOrder(command) if command.client_order_id == id)
+    );
+    assert_eq!(
+        engine
+            .state
+            .orders
+            .component_reservations(PositionComponent::Grid)
+            .1,
+        dec!(5)
+    );
+    let count = engine.state.orders.orders().len();
+    engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    assert_eq!(engine.state.orders.orders().len(), count);
+    assert_eq!(commands.borrow().len(), 1);
+    engine
+        .state
+        .orders
+        .transition(&sell.id, OrderPhase::Unknown, 1);
+    engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    assert_eq!(engine.state.orders.orders().len(), count);
+    assert_eq!(
+        engine
+            .state
+            .orders
+            .component_reservations(PositionComponent::Grid)
+            .1,
+        dec!(5)
+    );
+    engine
+        .state
+        .orders
+        .transition(&sell.id, OrderPhase::Cancelled, 1);
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Canceled(
+            OrderCanceledSpec::builder()
+                .instrument_id(engine.config.instrument_id)
+                .strategy_id(StrategyId::from("DYNAMIC-GRID-901"))
+                .client_order_id(id)
+                .build(),
+        ))
+        .unwrap();
+    engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    let reductions: Vec<_> = engine
+        .state
+        .orders
+        .orders()
+        .values()
+        .filter(|o| !o.buy && o.limit.is_none())
+        .collect();
+    assert_eq!(reductions.len(), 1);
+    assert_eq!(reductions[0].quantity, dec!(5));
+    engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    assert_eq!(engine.state.orders.orders().len(), count + 1);
+}
+
+#[rstest]
 fn recovery_checks_exact_grid_geometry_against_native_instrument() {
     use super::super::engine::GridEngine;
 

@@ -49,10 +49,13 @@ pub struct PortfolioConfig {
     pub max_instrument_allocation: Decimal,
     /// 库存与全部未终结买单成本占组合权益的最大比例。
     pub max_total_exposure: Decimal,
-    /// 全部网格仓库存与待买成本占组合权益的最大比例。
-    pub max_total_grid_exposure: Decimal,
-    /// 已成交股票库存占组合权益的最大比例；新买入前也会预留容量。
-    pub max_total_equity_exposure: Decimal,
+    /// 旧配置兼容上限：历史实现约束的同样是总暴露，并非仅 Grid 仓。
+    /// 新配置只需 `max_total_exposure`；保留旧值时仍取更严格者。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_grid_exposure: Option<Decimal>,
+    /// 旧配置兼容上限：历史实现也包含全部未终结买单。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_equity_exposure: Option<Decimal>,
     /// 不可被新订单占用的最低现金储备占权益比例。
     pub min_cash_reserve: Decimal,
     /// 组合权益从高水位到低点的最大亏损比例。
@@ -94,8 +97,8 @@ impl Default for PortfolioConfig {
             risk_policy: RiskPolicy::Hold,
             max_instrument_allocation: Decimal::new(20, 2),
             max_total_exposure: Decimal::new(60, 2),
-            max_total_grid_exposure: Decimal::new(60, 2),
-            max_total_equity_exposure: Decimal::new(60, 2),
+            max_total_grid_exposure: None,
+            max_total_equity_exposure: None,
             min_cash_reserve: Decimal::new(30, 2),
             max_portfolio_drawdown: Decimal::new(15, 2),
             max_portfolio_daily_loss: Decimal::new(5, 2),
@@ -115,6 +118,13 @@ impl Default for PortfolioConfig {
 }
 
 impl PortfolioConfig {
+    /// 准入、超额撤单与风险恢复共用同一个上限，旧字段不能悄悄放宽风险预算。
+    pub(super) fn exposure_limit(&self) -> Decimal {
+        self.max_total_exposure
+            .min(self.max_total_grid_exposure.unwrap_or(Decimal::ONE))
+            .min(self.max_total_equity_exposure.unwrap_or(Decimal::ONE))
+    }
+
     /// 校验比例有限性、时间边界及非空相关性窗口。
     ///
     /// # Errors
@@ -131,8 +141,6 @@ impl PortfolioConfig {
         for (name, value) in [
             ("max_instrument_allocation", self.max_instrument_allocation),
             ("max_total_exposure", self.max_total_exposure),
-            ("max_total_grid_exposure", self.max_total_grid_exposure),
-            ("max_total_equity_exposure", self.max_total_equity_exposure),
             ("max_portfolio_drawdown", self.max_portfolio_drawdown),
             ("max_portfolio_daily_loss", self.max_portfolio_daily_loss),
             ("max_sector_exposure", self.max_sector_exposure),
@@ -145,6 +153,15 @@ impl PortfolioConfig {
             anyhow::ensure!(
                 value > Decimal::ZERO && value <= Decimal::ONE,
                 "Invalid {name}"
+            );
+        }
+        for value in [self.max_total_grid_exposure, self.max_total_equity_exposure]
+            .into_iter()
+            .flatten()
+        {
+            anyhow::ensure!(
+                value > Decimal::ZERO && value <= Decimal::ONE,
+                "Invalid legacy portfolio exposure limit"
             );
         }
         for value in [
@@ -616,13 +633,7 @@ impl PortfolioRiskManager {
         let capacity = (cash - pending - equity * c.min_cash_reserve)
             .min(c.max_order_value)
             .min(broker_free - pending)
-            .min(
-                equity
-                    * c.max_total_exposure
-                        .min(c.max_total_grid_exposure)
-                        .min(c.max_total_equity_exposure)
-                    - total,
-            )
+            .min(equity * c.exposure_limit() - total)
             .min(equity * c.max_sector_exposure - sector)
             .min(equity * c.max_correlated_exposure - correlated)
             .min(equity * allocation - view.exposure - view.pending);

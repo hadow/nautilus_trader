@@ -39,7 +39,7 @@ use super::{
     analytics::{EquityPoint, PerformanceTracker, number},
     config::{GridConfig, RiskPolicy, StrategyMode, TrendPolicy},
     diagnostics::{CancelObservation, ObservationCount, RejectionObservation, ResetObservation},
-    engine::{GridEngine, LevelStatus, spacing},
+    engine::{GridEngine, LevelStatus, floor_tick, spacing},
     multi_asset::MultiAssetGridStrategy,
     orders::{GridOrder, OrderManager, OrderPhase, PositionComponent},
     position::{PositionTarget, position_delta, target_position},
@@ -450,8 +450,13 @@ impl GridStrategyEngine {
         now: u64,
     ) -> anyhow::Result<bool> {
         let current = self.state.orders.component_inventory(component);
-        let (pending_buys, pending_sells) = self.state.orders.component_reservations(component);
-        if position_delta(target, current, pending_buys, pending_sells, lot_size) >= Decimal::ZERO {
+        let (pending_buys, _) = self.state.orders.component_reservations(component);
+        // 远端止盈卖单不等于已经减仓；先按真实库存和待买量判断是否需要撤换订单。
+        if floor_tick(
+            (current + pending_buys - target).max(Decimal::ZERO),
+            lot_size,
+        ) == Decimal::ZERO
+        {
             return Ok(false);
         }
 
@@ -1751,11 +1756,6 @@ impl GridStrategyEngine {
             }
             let price =
                 (quote.bid_price.as_decimal() + quote.ask_price.as_decimal()) / Decimal::from(2);
-            if self.config.grid.strategy_mode == StrategyMode::StockAdaptive {
-                self.state
-                    .stock
-                    .observe_quote(quote.bid_price.as_decimal(), quote.ask_price.as_decimal());
-            }
             let now = runtime.clock().timestamp_ns().as_u64();
             if quote.ts_event.as_u64() < self.state.last_tick_event_ns
                 || !is_fresh(
@@ -1765,6 +1765,12 @@ impl GridStrategyEngine {
                 )
             {
                 return Ok(());
+            }
+            // 被拒绝的行情不能改变后续 TradeTick 使用的价差过滤状态。
+            if self.config.grid.strategy_mode == StrategyMode::StockAdaptive {
+                self.state
+                    .stock
+                    .observe_quote(quote.bid_price.as_decimal(), quote.ask_price.as_decimal());
             }
             self.state.last_tick_event_ns = quote.ts_event.as_u64();
             self.drive(runtime, price, now)?;

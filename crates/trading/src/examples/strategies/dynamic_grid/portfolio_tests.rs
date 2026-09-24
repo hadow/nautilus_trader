@@ -24,6 +24,62 @@ use super::{
     regime::MarketRegime,
 };
 
+#[rstest]
+fn review_single_exposure_parameter_has_no_hidden_default_cap() {
+    let config: PortfolioConfig = serde_json::from_value(serde_json::json!({
+        "max_total_exposure": "0.8",
+        "max_instrument_allocation": "1",
+        "max_sector_exposure": "1",
+        "max_correlated_exposure": "1",
+        "min_cash_reserve": "0",
+        "max_order_value": "100000"
+    }))
+    .unwrap();
+    config.validate().unwrap();
+    let mut view = exposure("AAPL.SIM", "Tech");
+    view.base_allocation = Decimal::ONE;
+    view.max_position_pct = Decimal::ONE;
+    let mut risk = PortfolioRiskManager::new(config.capital);
+    assert_eq!(
+        risk.admit(
+            &config,
+            std::slice::from_ref(&view),
+            view.id,
+            dec!(100000),
+            dec!(100000),
+            dec!(100000),
+            dec!(1000),
+            dec!(100),
+            dec!(1),
+            1,
+        ),
+        (OrderDecision::Reduce, dec!(800))
+    );
+    let json = serde_json::to_value(config).unwrap();
+    assert!(json.get("max_total_grid_exposure").is_none());
+    assert!(json.get("max_total_equity_exposure").is_none());
+}
+
+#[rstest]
+#[case("max_total_grid_exposure")]
+#[case("max_total_equity_exposure")]
+fn review_legacy_exposure_limits_are_honored_and_validated(#[case] field: &str) {
+    let mut json = serde_json::json!({"max_total_exposure": "0.8"});
+    json[field] = serde_json::json!("0.4");
+    let config: PortfolioConfig = serde_json::from_value(json.clone()).unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.exposure_limit(), dec!(0.4));
+    for invalid in ["0", "-0.1", "1.01"] {
+        json[field] = serde_json::json!(invalid);
+        assert!(
+            serde_json::from_value::<PortfolioConfig>(json.clone())
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+}
+
 fn exposure(id: &str, sector: &str) -> InstrumentExposure {
     InstrumentExposure {
         id: InstrumentId::from(id),
@@ -151,8 +207,8 @@ fn every_portfolio_exposure_and_cash_limit_is_a_final_gate(
 ) {
     let c = PortfolioConfig {
         max_total_exposure: total,
-        max_total_grid_exposure: grid,
-        max_total_equity_exposure: equities,
+        max_total_grid_exposure: Some(grid),
+        max_total_equity_exposure: Some(equities),
         min_cash_reserve: reserve,
         ..Default::default()
     };

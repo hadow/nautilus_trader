@@ -373,7 +373,6 @@ impl GridConfig {
             self.max_daily_loss,
             self.max_unrealized_loss,
             self.trend_level_fraction,
-            self.core_target_pct,
             self.grid_max_pct,
         ] {
             anyhow::ensure!(
@@ -402,7 +401,8 @@ impl GridConfig {
             );
         }
         anyhow::ensure!(
-            self.trend_up_core_multiplier > Decimal::ZERO
+            (Decimal::ZERO..=Decimal::ONE).contains(&self.core_target_pct)
+                && self.trend_up_core_multiplier > Decimal::ZERO
                 && self.trend_up_core_multiplier <= Decimal::from(4)
                 && self.core_target_pct + self.grid_max_pct <= Decimal::ONE,
             "Invalid stock target-position allocation"
@@ -413,10 +413,14 @@ impl GridConfig {
                 && self.max_spacing_pct < Decimal::ONE,
             "Invalid spacing bounds"
         );
-        anyhow::ensure!(
-            self.spacing_pct >= self.min_spacing_pct && self.spacing_pct <= self.max_spacing_pct,
-            "Fixed spacing outside bounds"
-        );
+        // ATR 模式不使用备用固定间距；切换回固定间距时再校验其有效范围。
+        if self.spacing_mode == SpacingMode::Percentage {
+            anyhow::ensure!(
+                self.spacing_pct >= self.min_spacing_pct
+                    && self.spacing_pct <= self.max_spacing_pct,
+                "Fixed spacing outside bounds"
+            );
+        }
         anyhow::ensure!(
             self.minimum_reset_atr_multiple >= Decimal::ZERO
                 && self.minimum_reset_atr_multiple <= Decimal::from(100)
@@ -492,5 +496,36 @@ impl GridConfig {
             return Decimal::MAX;
         }
         (Decimal::from(2) * cost + self.minimum_profit_margin) / (Decimal::ONE - cost)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[rstest]
+    fn review_atr_grid_does_not_require_an_unused_fixed_spacing() {
+        let mut config = GridConfig {
+            min_spacing_pct: dec!(0.025),
+            max_spacing_pct: dec!(0.05),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        config.spacing_mode = SpacingMode::Percentage;
+        assert!(config.validate().is_err());
+    }
+
+    #[rstest]
+    fn review_pure_grid_can_disable_core_inventory() {
+        let config = GridConfig {
+            strategy_mode: StrategyMode::StockAdaptive,
+            core_target_pct: Decimal::ZERO,
+            grid_max_pct: Decimal::ONE,
+            ..Default::default()
+        };
+        config.validate().unwrap();
     }
 }
