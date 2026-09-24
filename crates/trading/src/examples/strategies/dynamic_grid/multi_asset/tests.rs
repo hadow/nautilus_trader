@@ -39,6 +39,31 @@ use rust_decimal_macros::dec;
 use super::{DynamicGridConfig, GridStrategyEngine, MultiAssetGridStrategy};
 
 #[rstest]
+fn gap_simplification_restores_old_config_without_loosening_active_limits() {
+    let (runtime, _, _) = runtime(1);
+    let mut document = serde_json::to_value(runtime.checkpoint(None, None)).unwrap();
+    document["config"]["instruments"]["AAPL.SIM"]["grid"]["max_gap_atr_multiple"] =
+        serde_json::json!("3");
+    let saved: super::Checkpoint = serde_json::from_value(document).unwrap();
+    saved.validate(&runtime.config).unwrap();
+    let canonical = serde_json::to_value(&saved).unwrap();
+    assert!(
+        canonical["config"]["instruments"]["AAPL.SIM"]["grid"]
+            .get("max_gap_atr_multiple")
+            .is_none()
+    );
+    let mut changed = runtime.config.clone();
+    changed
+        .instruments
+        .values_mut()
+        .next()
+        .unwrap()
+        .grid
+        .max_gap_pct += dec!(0.01);
+    assert!(saved.validate(&changed).is_err());
+}
+
+#[rstest]
 #[case(dec!(0.7))]
 #[case(dec!(0.500))]
 #[case(dec!(0.9))]

@@ -68,7 +68,6 @@
     "realized_volatility_max": 0.04,
     "regular_session_only": true,
     "max_gap_pct": "0.08",
-    "max_gap_atr_multiple": "3",
     "gap_recovery_bars": 5,
     "liquidity_lookback_bars": 20,
     "minimum_average_dollar_volume": "0",

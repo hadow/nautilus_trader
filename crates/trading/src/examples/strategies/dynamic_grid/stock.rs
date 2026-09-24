@@ -128,10 +128,10 @@ impl StockMarketState {
                 .filter(|_| prior_atr > Decimal::ZERO)
                 .map(|previous| (open - previous).abs() / prior_atr)
                 .unwrap_or_default();
+            // 分钟 ATR 仅保留诊断，不用日内波动尺度独立否决隔夜跳空后的买入。
             if opening_gap.is_some_and(|change| change < Decimal::ZERO)
-                && ((config.max_gap_pct > Decimal::ZERO && self.gap_pct > config.max_gap_pct)
-                    || (config.max_gap_atr_multiple > Decimal::ZERO
-                        && self.gap_atr > config.max_gap_atr_multiple))
+                && config.max_gap_pct > Decimal::ZERO
+                && self.gap_pct > config.max_gap_pct
             {
                 self.gap_recovery_bars_remaining = config.gap_recovery_bars;
             }
@@ -261,6 +261,54 @@ mod tests {
     const DAY: u64 = 86_400_000_000_000;
 
     #[rstest]
+    #[case::minute_atr_spike(dec!(99), dec!(0.2), dec!(0.08), dec!(5), false)]
+    #[case::tiny_atr(dec!(99), dec!(0.001), dec!(0.08), dec!(1000), false)]
+    #[case::at_threshold(dec!(92), dec!(0.2), dec!(0.08), dec!(40), false)]
+    #[case::above_threshold(dec!(91.99), dec!(10), dec!(0.08), dec!(0.801), true)]
+    #[case::without_atr(dec!(90), dec!(0), dec!(0.08), dec!(0), true)]
+    #[case::upward(dec!(110), dec!(0.2), dec!(0.08), dec!(50), false)]
+    #[case::disabled_threshold(dec!(90), dec!(0.2), dec!(0), dec!(50), false)]
+    fn gap_simplification_uses_only_downside_percentage(
+        #[case] open: Decimal,
+        #[case] prior_atr: Decimal,
+        #[case] max_gap_pct: Decimal,
+        #[case] expected_gap_atr: Decimal,
+        #[case] paused: bool,
+    ) {
+        let config = GridConfig {
+            max_gap_pct,
+            // 旧配置中的有效值仍能加载，但不再影响入场。
+            max_gap_atr_multiple: dec!(3),
+            ..Default::default()
+        };
+        let mut state = StockMarketState::default();
+        state.observe_bar(
+            &config,
+            OPEN_2025_01_02,
+            dec!(100),
+            dec!(100),
+            dec!(1000),
+            prior_atr,
+        );
+        assert_eq!(
+            state.observe_bar(
+                &config,
+                OPEN_2025_01_02 + DAY,
+                open,
+                open,
+                dec!(1000),
+                prior_atr,
+            ),
+            (true, Some(open - dec!(100)))
+        );
+        assert_eq!(state.gap_atr, expected_gap_atr);
+        assert_eq!(
+            state.gate(&config, OPEN_2025_01_02 + DAY, open),
+            paused.then_some(StockGate::GapRecovery)
+        );
+    }
+
+    #[rstest]
     fn gap_pause_uses_real_open_and_expires_after_completed_bars() {
         let config = GridConfig {
             max_gap_pct: dec!(0.05),
@@ -300,6 +348,9 @@ mod tests {
             Some(StockGate::GapRecovery)
         );
         state.finish_bar();
+        // 升级不擅自清除检查点中已启动的观察期；恢复后照常递减。
+        let mut state: StockMarketState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert_eq!(
             state.gate(&config, OPEN_2025_01_02 + DAY, dec!(91)),
             Some(StockGate::GapRecovery)

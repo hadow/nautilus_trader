@@ -212,9 +212,10 @@ pub struct GridConfig {
     pub realized_volatility_max: f64,
     /// 将股票自适应模式的入场限制在纽约时间 09:30–16:00 常规交易时段。
     pub regular_session_only: bool,
-    /// 触发暂停新增仓位的严重向下隔夜跳空比例。
+    /// 严重向下隔夜跳空比例；严格超过才暂停新增仓位，零表示关闭。
     pub max_gap_pct: Decimal,
-    /// 以前一根已完成 K 线 ATR 衡量、触发暂停入场的严重向下跳空倍数。
+    /// 已废弃，仅兼容旧配置读取；不参与跳空判断，也不再写入配置快照。
+    #[serde(skip_serializing)]
     pub max_gap_atr_multiple: Decimal,
     /// 严重向下跳空后暂停入场的常规时段已完成 K 线数。
     pub gap_recovery_bars: u32,
@@ -311,7 +312,7 @@ impl Default for GridConfig {
             realized_volatility_max: 0.04,
             regular_session_only: true,
             max_gap_pct: Decimal::new(8, 2),
-            max_gap_atr_multiple: Decimal::from(3),
+            max_gap_atr_multiple: Decimal::ZERO,
             gap_recovery_bars: 5,
             liquidity_lookback_bars: 20,
             minimum_average_dollar_volume: Decimal::ZERO,
@@ -505,6 +506,24 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    fn gap_simplification_reads_but_does_not_write_retired_atr_threshold() {
+        let config: GridConfig = serde_json::from_value(serde_json::json!({
+            "max_gap_pct": "0.08",
+            "max_gap_atr_multiple": "3"
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.max_gap_pct, dec!(0.08));
+        assert_eq!(config.max_gap_atr_multiple, dec!(3));
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("max_gap_atr_multiple").is_none());
+        let canonical: GridConfig = serde_json::from_value(serialized).unwrap();
+        canonical.validate().unwrap();
+        assert_eq!(canonical.max_gap_pct, config.max_gap_pct);
+        assert_eq!(canonical.max_gap_atr_multiple, Decimal::ZERO);
+    }
 
     #[rstest]
     fn review_atr_grid_does_not_require_an_unused_fixed_spacing() {

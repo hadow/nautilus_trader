@@ -28,7 +28,6 @@
         "breakout_confirmation_bars": 1,
         "regular_session_only": false,
         "max_gap_pct": "0",
-        "max_gap_atr_multiple": "0",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",
         "minimum_price": "0"
@@ -58,7 +57,6 @@
         "breakout_confirmation_bars": 1,
         "regular_session_only": false,
         "max_gap_pct": "0",
-        "max_gap_atr_multiple": "0",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",
         "minimum_price": "0"
@@ -88,7 +86,6 @@
         "breakout_confirmation_bars": 1,
         "regular_session_only": false,
         "max_gap_pct": "0",
-        "max_gap_atr_multiple": "0",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",
         "minimum_price": "0"
@@ -116,7 +113,6 @@
         "breakout_confirmation_bars": 1,
         "regular_session_only": false,
         "max_gap_pct": "0",
-        "max_gap_atr_multiple": "0",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",
         "minimum_price": "0"
@@ -144,7 +140,6 @@
         "breakout_confirmation_bars": 2,
         "regular_session_only": true,
         "max_gap_pct": "0.08",
-        "max_gap_atr_multiple": "3",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",
         "minimum_price": "0"
@@ -172,7 +167,6 @@
         "breakout_confirmation_bars": 2,
         "regular_session_only": true,
         "max_gap_pct": "0.08",
-        "max_gap_atr_multiple": "3",
         "minimum_average_dollar_volume": "100000",
         "maximum_spread_bps": "30",
         "minimum_price": "5"
@@ -201,7 +195,6 @@
         "enable_volatility_filter": false,
         "regular_session_only": false,
         "max_gap_pct": "0",
-        "max_gap_atr_multiple": "0",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",
         "minimum_price": "0"
