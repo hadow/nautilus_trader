@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     config::{GridConfig, TrendPolicy},
     engine::{GridEngine, spacing_components},
+    grid_scale::GridScaleSnapshot,
     regime::{MarketRegime, RegimeDetector, RegimeSnapshot},
     regime_filter::RegimeFilter,
 };
@@ -95,6 +96,9 @@ pub struct SpacingObservation {
     /// 分类源刚收盘时才记录其原始指标，未收盘桶不产生观测。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regime_source: Option<RegimeSnapshot>,
+    /// 网格尺度候选的收盘观测；Shadow 也记录，但不改变订单决策。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid_scale: Option<GridScaleSnapshot>,
     /// 已完成信号 K 线时间戳。
     pub ts_ns: u64,
     /// 该时刻已经可知的 ATR，不包含未来 K 线。
@@ -187,6 +191,10 @@ impl GridDiagnostics {
             && let Ok((raw, effective)) = spacing_components(config, atr, price, multiplier)
         {
             self.spacing.push(SpacingObservation {
+                grid_scale: filter
+                    .and_then(RegimeFilter::scale_snapshot)
+                    .filter(|s| s.ts_ns == signal.ts_ns)
+                    .cloned(),
                 regime: Some(signal.clone()),
                 decision_regime: decision,
                 regime_source: filter

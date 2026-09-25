@@ -232,11 +232,38 @@ submit/cancel orders, acquire the strategy checkpoint lock, or claim that execut
 `fresh_account_candidate=false` means existing positions or active orders need investigation before
 starting a fresh strategy. Even `true` does not validate a checkpoint or authorize trading.
 
+The snapshot also reports `startup_blockers` for positions/orders outside the configured universe,
+broker inventory/orders without a checkpoint, and missing portfolio-currency cash records.
+A configured symbol is not proof of strategy ownership. The cash check compares configured capital
+with native free cash only; it never adds frozen cash, settling cash, financing or another currency.
+Longbridge reports these as separate [account fields](https://open.longbridge.com/docs/trade/asset/account),
+not per-order reservation evidence. `reservation_overlap_verification=NOT_PERFORMED` means the
+check cannot remove the strategy's conservative pending-order reservations.
+
+`--run` now enforces these blockers before building a Paper/Live node. It first locks and validates
+the local checkpoint, then queries the account. A fresh start additionally requires free cash to
+cover the configured capital and no unattributed frozen cash. Restoring a valid checkpoint does
+not require funding the initial budget again: native reconciliation and order risk checks must
+still run, and lack of spare cash must not by itself prevent recovery for inventory reduction.
+Do not create a dummy checkpoint to evade these checks.
+
+The read-only command remains diagnostic, not a replacement for native startup reconciliation or
+an order permission. An empty blocker list or exit code zero does not mean readiness to trade.
+The queries are sequential snapshots, not an atomic account view; order counts cover the existing
+`today_orders` query, not an independently verified full-history audit. Checkpoint existence alone
+does not validate its contents. No checkpoint is created, imported, deleted or unlocked by this check.
+
+For a separately prepared `mode=Live` configuration, `--check-live` performs the same read-only
+queries against the live account; it cannot be combined with `--run` or `--live`. It does not place
+orders. Trading still requires both `mode=Live` and `--run --live`. A bare `--live`, duplicate flags,
+or a check flag for the wrong mode is rejected before connecting. The repository Paper example
+is not converted to a live configuration by any of these commands.
+
 Run the offline regressions separately from any account session:
 
 ```bash
 CARGO_INCREMENTAL=0 cargo test -p nautilus-longbridge --features dynamic-grid \
-  --lib --profile dev -j 2 -- --test-threads=1
+  --lib --bin longbridge-dynamic-grid --profile dev -j 2 -- --test-threads=1
 CARGO_INCREMENTAL=0 cargo test -p nautilus-trading --features examples \
   --lib dynamic_grid --profile dev -j 2 -- --test-threads=1
 ```
@@ -309,11 +336,99 @@ attempt submitted a broker order. The final account still has its original unrel
 `fresh_account_candidate=false` is therefore expected, not permission to start a fresh grid over it.
 Raw local logs can contain account balances and must not be committed or published.
 
+### Startup gate result (2026-09-25)
+
+The Paper SDK check still reports one nonzero configured-symbol holding without a grid checkpoint,
+plus unattributed frozen cash. Startup is blocked by `BROKER_STATE_WITHOUT_CHECKPOINT` and
+`UNATTRIBUTED_FROZEN_CASH`. No position was adopted or sold; no strategy node or live account was
+started. The next broker acceptance requires an isolated Paper account, or an independently audited
+ownership/recovery process. Do not solve this by changing symbols or ignoring the existing position.
+
+For an already running, correctly reconciled node, use its existing SIGINT/SIGTERM shutdown path.
+It stops strategies, requests cancellations, drains residual events and persists final state.
+Stopping is not flattening, and a cancellation request is not a broker confirmation. After exit,
+query the broker again, check retained inventory and every unresolved order against the checkpoint,
+and do not restart while there is a discrepancy. Preserve the checkpoint, configuration and local
+logs; do not delete them, send repeated mutations or automatically reset latched risk.
+
+Full broker restart/timeout acceptance, statement fee reconciliation, alert delivery and a bounded
+live rollout remain unaccepted. See the [Chinese implementation record](dynamic_grid_review_fixes.zh-CN.md#启动门禁与部署验收推进2026-09-25).
+
 Validation: debug build passed; adapter library 42 tests passed, Dynamic Grid 87 passed with four
 pre-existing performance tests ignored, execution tester three passed. Targeted adapter Clippy
 with `--no-deps` and changed-file formatting passed. Dependency-inclusive Clippy remains blocked
 by 13 pre-existing findings in `dynamic_grid/files.rs` and `momentum_pullback`; workspace formatting
 also has pre-existing import differences outside this change. This is not full live readiness.
+
+### Six-symbol 15-minute configuration (2026-09-25)
+
+`dynamic_grid_paper_six.json` and `dynamic_grid_live_six.json` cover AAPL, MSFT, NVDA, TSLA, AMZN
+and META. Both load `crates/backtest/examples/dynamic_grid_comparison.json` and its existing
+per-symbol files. The resolved strategy uses 15-minute Regime bars, eight-bar confirmation and
+no Grid-scale candidate. AAPL/MSFT use `instuments/comparison/`; the remaining symbols use
+`instuments/`. Backtest dates and CSV paths do not restrict live trading or preload live indicators.
+Changing those shared files also changes the deployment configuration; stop and review checkpoint
+compatibility before editing them for another experiment.
+
+These are the existing research-budget settings, not a small real-money canary: initial capital
+is USD 100,000, maximum total exposure 70%, minimum cash reserve 20%, portfolio drawdown gate 25%
+and daily-loss gate 7%. Allocation weights are 18% AAPL, 18% MSFT, 14% NVDA and 10% each for
+TSLA/AMZN/META; shared risk gates can reduce actual allocations. Loss gates do not guarantee
+maximum realized losses. No risk limits were relaxed for this deployment configuration.
+
+The two new runners use distinct trader IDs, checkpoint paths and recovery contexts. The original
+two-symbol Paper configuration and its checkpoint are unchanged. Do not rename, copy or delete an
+old checkpoint to switch universes, and do not run both old and new nodes on the same account.
+`account_id` is a Nautilus identity, not a selector for a different brokerage account; routing uses
+OAuth and the explicit Paper/Live mode.
+
+From the repository root, with `LONGBRIDGE_OAUTH_CLIENT_ID` exported:
+
+```bash
+# Offline validation only; prints effective strategy configuration.
+target/debug/longbridge-dynamic-grid crates/adapters/longbridge/examples/dynamic_grid_paper_six.json
+target/debug/longbridge-dynamic-grid crates/adapters/longbridge/examples/dynamic_grid_live_six.json
+
+# Read-only broker diagnostics; inspect startup_blockers, not just the exit code.
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_paper_six.json --check-paper
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_live_six.json --check-live
+```
+
+Both six-symbol native configuration checks passed, and resolved per-symbol parameters and
+portfolio risk settings match the source and each other. Four wrong-mode/flag cases were rejected
+before connecting. No Rust logic changed, no additional backtest or rebuild was run, and the
+previously built debug runner was used. No grid process was running at the time of inspection.
+
+Both read-only broker checks returned `BROKER_STATE_WITHOUT_CHECKPOINT` and
+`UNATTRIBUTED_FROZEN_CASH`: one nonzero in-universe holding, zero active orders, and no six-symbol
+checkpoint. Available USD covered configured capital, but that does not establish ownership of
+the existing holding or frozen cash. Neither startup reconciliation nor broker execution was
+performed. Do not bypass these blockers; use an isolated account or a separately audited ownership
+and recovery procedure. Broker state can change, so repeat the check before any later launch.
+
+The local filesystem also had only about 127 MiB free. Free operational space before running a
+node that must persist orders and inventory. The current grid startup subscribes to new confirmed
+bars without requesting historical warmup; a fresh 15-minute ADX/confirmation state may require
+multiple sessions. Launching a process is not a promise of a trade on its first evening.
+
+Only after resolving account ownership, frozen-cash attribution, disk capacity and the remaining
+acceptance requirements, choose the appropriate command below. These commands were **not run**:
+
+```bash
+# Broker Paper account, not local simulation.
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_paper_six.json --run
+
+# Real capital: requires Live configuration and both explicit flags.
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_live_six.json --run --live
+```
+
+Use Ctrl-C for the normal shutdown path and verify broker orders/inventory afterwards. Stopping
+does not flatten positions. Preserve the matching checkpoint; never restart with a fresh state
+merely to evade a recovery or risk failure.
 
 ## Examples and tests
 

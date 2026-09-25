@@ -20,6 +20,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod engine;
 pub mod files;
+pub mod grid_scale;
 pub mod multi_asset;
 pub mod orders;
 pub mod portfolio;

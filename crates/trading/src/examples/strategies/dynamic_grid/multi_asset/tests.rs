@@ -80,7 +80,9 @@ fn cash_capacity_only_credits_proven_native_reservations(
 }
 
 #[rstest]
-fn regime_clocks_are_independent_and_recover_through_native_bar_routing() {
+fn regime_clocks_are_independent_and_recover_through_native_bar_routing(
+    #[values(false, true)] grid_scale: bool,
+) {
     use nautilus_common::actor::DataActor;
     use nautilus_model::data::Bar;
 
@@ -98,6 +100,8 @@ fn regime_clocks_are_independent_and_recover_through_native_bar_routing() {
     for (id, c) in &mut runtime.config.instruments {
         c.capital_allocation = dec!(0.4);
         c.grid.strategy_mode = StrategyMode::StockAdaptive;
+        c.grid.grid_scale_regime =
+            grid_scale.then(super::super::grid_scale::GridScaleConfig::default);
         let mut config = DynamicGridConfig::new(*id, c.bar_type);
         config.grid = c.grid.clone();
         config.grid.capital = runtime.config.portfolio.capital * c.capital_allocation;
@@ -321,10 +325,13 @@ fn review_rejected_quote_cannot_change_spread_gate(#[case] offset: i64, #[case] 
 }
 
 #[rstest]
-#[case::reduce_filled_inventory(false)]
-#[case::trim_pending_buys_only(true)]
+#[case::reduce_filled_inventory(false, false)]
+#[case::trim_pending_buys_only(true, false)]
+#[case::soft_budget_keeps_covered_inventory(false, true)]
+#[case::soft_budget_trims_pending_buys(true, true)]
 fn review_target_reduction_replaces_distant_take_profit_only_after_cancel(
     #[case] pending_only: bool,
+    #[case] soft_budget: bool,
 ) {
     use nautilus_common::{
         messages::execution::TradingCommand,
@@ -350,6 +357,12 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel(
     let (mut runtime, mut engine, cache) = runtime(1);
     runtime.recovering = false;
     engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
+    if soft_budget {
+        engine.config.grid.grid_scale_regime = Some(super::super::grid_scale::GridScaleConfig {
+            mode: super::super::grid_scale::GridScaleMode::Adaptive,
+            ..Default::default()
+        });
+    }
     engine.state.state = super::StrategyState::GridActive;
     engine.state.regime.snapshot.initialized = true;
     engine.state.regime.snapshot.regime = MarketRegime::TrendDown;
@@ -474,6 +487,40 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel(
         TypedIntoHandler::from(move |command: TradingCommand| received.borrow_mut().push(command)),
     );
     engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    if soft_budget {
+        // 未建立候选观测时预算为零，也不能把柔性禁买误用成市价清仓。
+        assert_eq!(engine.state.position_target.grid, Decimal::ZERO);
+        assert_eq!(
+            engine.state.orders.orders()[&sell.id].phase,
+            OrderPhase::Accepted
+        );
+        assert!(
+            engine
+                .state
+                .orders
+                .orders()
+                .values()
+                .filter(|o| !o.buy)
+                .all(|o| o.limit.is_some())
+        );
+        for buy in &buys {
+            assert_eq!(
+                engine.state.orders.orders()[&buy.id].phase,
+                OrderPhase::CancelPending
+            );
+        }
+        assert_eq!(commands.borrow().len(), buys.len());
+        engine.drive(&mut runtime, dec!(100), 1).unwrap();
+        assert_eq!(commands.borrow().len(), buys.len());
+        assert_eq!(
+            engine
+                .state
+                .orders
+                .component_reservations(PositionComponent::Grid),
+            (if pending_only { dec!(8) } else { dec!(0) }, dec!(5))
+        );
+        return;
+    }
     if pending_only {
         assert_eq!(engine.state.position_target.grid, dec!(10));
         assert_eq!(
@@ -699,7 +746,7 @@ fn stock_grid_plan_uses_the_position_target_budget(#[case] tick_execution: bool)
             now.into(),
             now.into(),
         );
-        filter.update(&engine.config.grid, &bar).unwrap();
+        filter.update(&engine.config.grid, &bar, None).unwrap();
         engine
             .state
             .regime

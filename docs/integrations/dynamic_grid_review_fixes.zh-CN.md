@@ -131,3 +131,132 @@ target/debug/dynamic-grid-backtest --dynamic-only \
 旧检查点的账本/指标格式保留；新 Quote 时间缺失时不凭旧 spread 恢复 Tick 入场，需等待新 Quote。
 旧网格的数量计划不会被静默重写，新的预算规则在下次合法建网格时生效。
 升级前仍须按原流程停机、核对账户与检查点；不得通过删除检查点绕过对账。
+
+## OAuth 与 Paper 只读验收续作（2026-09-25）
+
+本次使用用户提供的 OAuth client ID 和已有授权，经真实 Longbridge SDK 的 Paper 路由查询，
+没有启动策略、下单、撤单、接管持仓或写入交易检查点，没有连接实盘执行路径。
+
+- PASS：模拟账户、持仓、当日订单与成交查询，以及 Nautilus 原生快照解析。
+- BLOCKED：账户有 1 笔配置标的内的非零持仓，但没有网格检查点。
+  新诊断明确返回 `BROKER_STATE_WITHOUT_CHECKPOINT`；标的在配置中不等于仓位属于本策略。
+- PASS（快照检查）：USD 可用现金为正，且足以覆盖配置资本，不依靠融资或其他币种。
+- NOT VERIFIED：账户同时存在冻结款和待结算款；当日查询返回 0 笔订单、0 笔成交，
+  不能据此推断冻结额全部属于策略订单，也不能证明不存在查询范围外的历史挂单。
+  冻结款去重仍未完成，没有加回任何未知冻结额。
+- NOT RUN：真实成交与真实超时后的全链路对账。现有受限 tester 的只读检查确认
+  F.US 为 0 持仓、0 活跃订单，券商日历显示常规交易时段未开；没有执行买卖步骤。
+
+修改 `crates/adapters/longbridge/bin/dynamic_grid.rs` 的 `--check-paper` 输出：
+增加标的范围外持仓/订单计数、无检查点的账户状态诊断、币种及可用现金诊断。
+部分成交、撤单待确认仍按原生订单状态计入活跃订单。
+缺少配置币种或可用现金时，不再将空持仓账户标为新策略候选。
+检查点存在不代表内容有效；输出始终保留 `startup_reconciliation=NOT_RUN`。
+这些是启动前诊断，不是新增的交易过滤器，也不替代 `--run` 的现有对账与风控。
+
+验证命令与结果：
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p nautilus-longbridge --features dynamic-grid \
+  --bin longbridge-dynamic-grid --lib --profile dev -j2 -- --test-threads=1
+```
+
+PASS：新增 9 项 runner 测试、既有 42 项 adapter 测试全部通过。
+本地 HTTP 故障夹具最初被沙箱禁止监听，获得运行权限后重跑通过；这不是券商成交证据。
+包含模糊提交后按客户端身份查询、部分成交与重复回报去重、撤单待确认和限流回归。
+debug runner 与回测二进制构建通过；未重跑回测或修改 15 分钟＋8 根确认及资金配置。
+PASS：目标 runner 的 `cargo check`、`cargo clippy --no-deps`、目标文件格式检查、
+Markdown 校验和 `git diff --check`。未运行全 workspace 检查；稳定版 rustfmt 提示两项
+已有 nightly 导入格式选项不可用，但目标文件 `--check` 返回成功。
+使用命令、诊断局限见 [Longbridge 验收说明](longbridge.md#dynamic-grid-paper-acceptance)。
+
+下一步需要先隔离模拟账户中的既有持仓，或完成可审计的持仓归属与检查点恢复设计，再进行
+常规交易时段的受限成交、撤单和资金前后对账。不得为了启动成功自动卖出或冒充接管已有仓位。
+自动风险恢复、增量持久化仍未改动；本次不把只读连通性称为完整 Paper/Live 验收。
+
+## 启动门禁与部署验收推进（2026-09-25）
+
+本节接续前面的只读诊断，将检查接入实际启动路径；总体状态仍是 PARTIAL，不能部署真实资金。
+
+### 已落地
+
+- `longbridge-dynamic-grid --run`：先取得检查点锁并校验内容，再检查整个券商账户，
+  有阻塞即返回错误，不创建可下单节点。保留原生启动对账、订单幂等与共享账户风控。
+- 新增 `--check-live`，仅适用于显式 `mode=Live` 配置，只读、不创建检查点或取得锁。
+  拒绝只读与交易标志混用、模式不符、重复参数及单独 `--live`；未运行真实资金路径。
+- 首次启动要求配置资本由同币种 free cash 覆盖，不使用 frozen、settling、融资或其他币种。
+  无检查点但存在冻结款时返回 `UNATTRIBUTED_FROZEN_CASH`，不猜测其归属。
+- 恢复路径不要求 free cash 再次达到初始资金，也不因现金为零阻止恢复减仓。
+  这不放行买单；检查点必须有效，之后仍须通过券商对账和既有现金风险检查。
+- 修复六标的比较示例的预算冲突：AAPL/MSFT 使用
+  `crates/backtest/examples/instuments/comparison/` 中各自的显式配置，分配各 18%；
+  加上其余四标的，预算总额 80%，保留 20% 现金预留和原组合风控上限。
+  两份配置仅与原文件的外层 `capital_allocation` 不同，不增加配置继承机制。
+  主组合及 Paper 引用的 AAPL/MSFT 30% 配置、15 分钟＋8 根确认和交易阈值均未改动。
+- 修复旧 ablation 示例中与 StockAdaptive 校验矛盾的非常规交易时段配置。
+  对应候选更名为 `dgt_plus_target_position_and_regular_session`，明确同时包含时段约束，
+  不能再把它与 Legacy 的差异解释为纯粹的 Target Position 增量贡献。
+  本次仅恢复配置合法性，没有重新运行收益实验或宣布这些预算适合实盘。
+
+### 实际验证
+
+- PASS：先增加测试，复现首次启动资金不足未阻断、恢复时错误要求可用现金两个问题；修复后通过。
+- PASS：runner 13 项、Longbridge adapter 42 项测试。HTTP 故障夹具需本机监听权限；
+  允许监听后重跑通过。包含模糊提交、部分成交去重、撤单及限流，不冒充券商故障验收。
+- PASS：debug 构建、目标 `cargo check` 和 `cargo clippy --no-deps`。
+- PASS：策略测试 176 项通过、4 项原有性能测试忽略；集成测试先复现 75 通过、3 个配置失败，
+  修复后重跑全部 78 项通过。磁盘仅剩约 1 GiB，使用本日已编译且策略源码未改变的测试二进制，
+  未因此宣称完成全 workspace 重编译或全仓测试。
+- PASS（只读）：真实 Paper SDK 仍可查询并解析账户、持仓、当日订单及成交。
+  本轮没有下单、撤单、删除检查点或自动接管账户持仓。
+
+可重跑命令：
+
+```bash
+CARGO_INCREMENTAL=0 cargo test -p nautilus-longbridge --features dynamic-grid \
+  --lib --bin longbridge-dynamic-grid --profile dev -j2 -- --test-threads=1
+CARGO_INCREMENTAL=0 cargo check -p nautilus-longbridge --features dynamic-grid \
+  --bin longbridge-dynamic-grid -j2
+CARGO_INCREMENTAL=0 cargo clippy -p nautilus-longbridge --features dynamic-grid \
+  --bin longbridge-dynamic-grid --no-deps -j2
+CARGO_INCREMENTAL=0 cargo build -p nautilus-longbridge --features dynamic-grid \
+  --bin longbridge-dynamic-grid -j2
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_paper.json --check-paper
+```
+
+本次原生策略/集成测试直接执行的已有二进制：
+
+```bash
+target/debug/deps/nautilus_trading-45e0aaafb3963cab \
+  examples::strategies::dynamic_grid --test-threads=1
+target/debug/deps/dynamic_grid-a29e696830a7d8dc --test-threads=1
+```
+
+哈希仅对应本机本次构建；重新构建仍使用上文已有 Cargo 测试命令，不依赖固定二进制文件名。
+日志在 `/tmp/grid-startup-*.log`，只读摘要在 `/tmp/grid-startup-paper-readonly.json`，均不提交。
+
+### 真实账户阻塞与后续顺序
+
+1. 账户归属与启动对账：PARTIAL / BLOCKED。
+   真实模拟账户仍有 1 笔无检查点持仓和未归属冻结款；需要专用隔离模拟账户，
+   或独立、可审计的库存归属恢复方案。
+2. 完整策略 Paper 闭环：NOT RUN。
+   上一步通过后，以受限预算跑真实 MultiAssetGridStrategy 的买卖、周期、重置与停机后账户核对，
+   不能复用 tester 的 PASS 代替。
+3. 重启与异常验收：PARTIAL。
+   离线测试通过；真实账户上的断连、未知提交、晚到成交及重启对账仍未验收，
+   不自动重试订单或解除风险锁。
+4. 冻结资金与费用：PARTIAL。
+   保留保守预留；需逐订单冻结证据及券商账单核对，不能把零佣金字段当作零成本。
+5. 灰度与运维：PARTIAL。
+   已记录原生 SIGINT/SIGTERM 停机流程；尚无经账户验证的灰度配置、告警送达和完整恢复演练，
+   未新增无人值守服务。
+6. 回归与样本外验证：PARTIAL。
+   修复示例配置；未重跑季度回测、Quote/费用压力实验、Walk-forward 或新 OOS。
+
+当日订单为零不等于全历史无挂单：[官方当日订单接口](https://open.longbridge.com/docs/trade/order/today_orders)
+并未在本次验收中证明跨日订单全覆盖；[历史接口](https://open.longbridge.com/docs/trade/order/history_orders)
+还有返回数量限制，当前 SDK 丢弃其 `has_more` 字段。
+启动门禁不能替代该完整性验证、原生对账或人工账户归属审计。
+任何阻塞都不通过删检查点、改成本或伪造成交绕过；也不将默认研究配置自动转换为实盘配置。

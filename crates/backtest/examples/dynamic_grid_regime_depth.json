@@ -1,0 +1,74 @@
+{
+  "settings": {
+    "train_days": 60,
+    "validation_days": 30,
+    "test_days": 30,
+    "validation_finalists": 2,
+    "drawdown_penalty": 1,
+    "sensitivity_atr_multipliers": [
+      "6",
+      "8",
+      "10"
+    ],
+    "sensitivity_reset_distances": [
+      "0.01",
+      "0.015",
+      "0.02"
+    ],
+    "parameter_cliff_threshold": 0.02,
+    "simulations": 1000,
+    "ruin_equity_fraction": 0.5,
+    "random_seed": 42,
+    "stress": {
+      "return_noise": 0.002,
+      "fee_multiplier_max": 2,
+      "additional_slippage_max": 0.001
+    }
+  },
+  "candidates": [
+    {
+      "name": "baseline_15m_8",
+      "grid_overrides": {
+        "grid_scale_regime": null
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    },
+    {
+      "name": "grid_scale_adaptive",
+      "grid_overrides": {
+        "grid_scale_regime": {
+          "mode": "Adaptive",
+          "lookback_sessions": 10,
+          "trend_enter_efficiency": "0.6",
+          "trend_exit_efficiency": "0.4",
+          "trend_drift_grids": "2",
+          "minimum_rebounds": 2,
+          "uncertain_budget": "0.5",
+          "reset_on_regime_change": false,
+          "drawdown_budget_grids": null
+        }
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    },
+    {
+      "name": "grid_scale_depth_4",
+      "grid_overrides": {
+        "grid_scale_regime": {
+          "mode": "Adaptive",
+          "lookback_sessions": 10,
+          "trend_enter_efficiency": "0.6",
+          "trend_exit_efficiency": "0.4",
+          "trend_drift_grids": "2",
+          "minimum_rebounds": 2,
+          "uncertain_budget": "0.5",
+          "reset_on_regime_change": false,
+          "drawdown_budget_grids": "4"
+        }
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    }
+  ]
+}

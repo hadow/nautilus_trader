@@ -94,6 +94,9 @@ pub(super) fn set_strategy_mode_preserving_atr_spacing(
         };
     }
     config.strategy_mode = mode;
+    if mode == StrategyMode::LegacyDgt {
+        config.grid_scale_regime = None;
+    }
     Ok(())
 }
 

@@ -13,17 +13,19 @@ use nautilus_model::{
     data::{Bar, BarSpecification, BarType},
     enums::{AggregationSource, BarAggregation, PriceType},
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use super::{
     config::{GridConfig, StrategyMode},
+    grid_scale::{GridScaleMode, GridScaleRegime, GridScaleSnapshot},
     regime::{MarketRegime, Observation, RegimeDetector, RegimeSnapshot, is_fresh},
     stock::StockMarketState,
 };
 
 const MINUTE: u64 = 60_000_000_000;
 
-/// 股票策略唯一的 15 分钟分类与 8 根确认状态；分钟指标由原检测器维护。
+/// 共用 15 分钟聚合；旧分类与网格尺度候选独立保存，分钟指标由原检测器维护。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RegimeFilter {
@@ -35,6 +37,8 @@ pub(super) struct RegimeFilter {
     count: u32,
     observed_ns: u64,
     confirmed_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale: Option<GridScaleRegime>,
 }
 
 pub(super) fn observation(bar: &Bar) -> Observation {
@@ -47,6 +51,27 @@ pub(super) fn observation(bar: &Bar) -> Observation {
 }
 
 impl RegimeFilter {
+    pub(super) fn new(config: &GridConfig) -> Self {
+        Self {
+            scale: config
+                .grid_scale_regime
+                .as_ref()
+                .map(|_| GridScaleRegime::default()),
+            ..Self::default()
+        }
+    }
+
+    fn scale_active(config: &GridConfig) -> bool {
+        config
+            .grid_scale_regime
+            .as_ref()
+            .is_some_and(|c| c.mode != GridScaleMode::Shadow)
+    }
+
+    pub(super) fn scale_snapshot(&self) -> Option<&GridScaleSnapshot> {
+        self.scale.as_ref().map(|scale| &scale.snapshot)
+    }
+
     pub(super) fn enabled(config: &GridConfig) -> bool {
         config.strategy_mode == StrategyMode::StockAdaptive
     }
@@ -84,7 +109,11 @@ impl RegimeFilter {
     pub(super) fn ready(&self, config: &GridConfig, fast: &RegimeSnapshot, now: u64) -> bool {
         let source = self.source();
         fast.initialized
-            && source.initialized
+            && if Self::scale_active(config) {
+                self.scale_snapshot().is_some_and(|s| s.initialized)
+            } else {
+                source.initialized
+            }
             && is_fresh(fast.ts_ns, now, config.max_signal_age_secs)
             && is_fresh(
                 source.ts_ns,
@@ -108,15 +137,29 @@ impl RegimeFilter {
         if !self.ready(config, fast, fast.ts_ns) {
             return MarketRegime::Disabled;
         }
-        self.confirmed
+        if Self::scale_active(config) {
+            self.scale_snapshot()
+                .map_or(MarketRegime::Disabled, |s| s.regime)
+        } else {
+            self.confirmed
+        }
     }
 
-    pub(super) fn entry_confirmed(&self) -> bool {
-        self.confirmed_ns > 0
+    pub(super) fn entry_confirmed(&self, config: &GridConfig) -> bool {
+        if Self::scale_active(config) {
+            self.scale_snapshot().is_some_and(|s| s.initialized)
+        } else {
+            self.confirmed_ns > 0
+        }
     }
 
     /// 只在分类时钟真正收盘时推进确认次数；重复 Tick 不能充当确认 Bar。
-    pub(super) fn update(&mut self, config: &GridConfig, bar: &Bar) -> anyhow::Result<bool> {
+    pub(super) fn update(
+        &mut self,
+        config: &GridConfig,
+        bar: &Bar,
+        spacing: Option<Decimal>,
+    ) -> anyhow::Result<bool> {
         anyhow::ensure!(
             bar.low <= bar.open && bar.open <= bar.high,
             "Invalid regime input open"
@@ -167,6 +210,14 @@ impl RegimeFilter {
         let completed = builder.build(bar.ts_event, bar.ts_init);
         self.detector
             .update(&Self::slow_config(config), observation(&completed))?;
+        if let (Some(scale), Some(scale_config)) = (&mut self.scale, &config.grid_scale_regime) {
+            scale.update(
+                scale_config,
+                ts,
+                completed.close.as_decimal(),
+                spacing.ok_or_else(|| anyhow::anyhow!("Grid-scale spacing unavailable"))?,
+            )?;
+        }
         self.pending.clear();
         self.confirm(config)?;
         Ok(true)
@@ -213,6 +264,13 @@ impl RegimeFilter {
     ) -> anyhow::Result<()> {
         Self::validate_bar_type(config, bar_type)?;
         self.detector.validate(&Self::slow_config(config))?;
+        anyhow::ensure!(
+            self.scale.is_some() == config.grid_scale_regime.is_some(),
+            "Grid-scale recovery/configuration mismatch"
+        );
+        if let (Some(scale), Some(scale_config)) = (&self.scale, &config.grid_scale_regime) {
+            scale.validate(scale_config, self.source().ts_ns)?;
+        }
         let source = self.source();
         anyhow::ensure!(
             self.detector.snapshot.ts_ns <= fast.ts_ns
@@ -273,6 +331,84 @@ mod tests {
 
     const OPEN: u64 = 1_735_828_200_000_000_000;
 
+    #[rstest::rstest]
+    fn grid_scale_filter_uses_completed_buckets_and_keeps_cross_session_memory() {
+        use super::super::grid_scale::GridScaleConfig;
+        let config = GridConfig {
+            strategy_mode: StrategyMode::StockAdaptive,
+            grid_scale_regime: Some(GridScaleConfig {
+                mode: GridScaleMode::Adaptive,
+                lookback_sessions: 2,
+                ..Default::default()
+            }),
+            atr_period: 2,
+            adx_period: 2,
+            ma_period: 2,
+            slope_period: 2,
+            volatility_period: 2,
+            enable_volatility_filter: false,
+            ..Default::default()
+        };
+        let mut filter = RegimeFilter::new(&config);
+        let mut fast = RegimeDetector::default();
+        for day in 0..2 {
+            for minute in 1..=390 {
+                let mut b = bar(minute);
+                b.ts_event = (b.ts_event.as_u64() + day * 86_400_000_000_000).into();
+                b.ts_init = b.ts_event;
+                b.close = if (minute / 15) % 2 == 0 {
+                    Price::from("100")
+                } else {
+                    Price::from("96")
+                };
+                b.low = Price::from("95");
+                fast.update(&config, observation(&b)).unwrap();
+                let changed = filter
+                    .update(&config, &b, Some(Decimal::new(3, 2)))
+                    .unwrap();
+                assert_eq!(changed, minute % 15 == 0);
+                if minute % 15 != 0 {
+                    assert!(filter.scale_snapshot().unwrap().ts_ns < b.ts_event.as_u64());
+                }
+            }
+        }
+        assert!(filter.entry_confirmed(&config));
+        assert_eq!(filter.regime(&config, &fast.snapshot), MarketRegime::Range);
+        let mut restored: RegimeFilter =
+            serde_json::from_value(serde_json::to_value(&filter).unwrap()).unwrap();
+        restored
+            .validate(&config, bar(1).bar_type, &fast.snapshot)
+            .unwrap();
+        let mut next = bar(15);
+        next.ts_event = (OPEN + 4 * 86_400_000_000_000 + 15 * MINUTE).into();
+        next.ts_init = next.ts_event;
+        fast.snapshot.ts_ns = next.ts_event.as_u64();
+        // 周末保留历史不等于允许旧行情交易：新完整桶到来前仍然过期。
+        assert!(!restored.ready(&config, &fast.snapshot, fast.snapshot.ts_ns));
+        for minute in 1..=15 {
+            let mut b = next;
+            b.ts_event = (OPEN + 4 * 86_400_000_000_000 + minute * MINUTE).into();
+            b.ts_init = b.ts_event;
+            restored
+                .update(&config, &b, Some(Decimal::new(3, 2)))
+                .unwrap();
+        }
+        assert!(restored.ready(&config, &fast.snapshot, fast.snapshot.ts_ns));
+        assert!(restored.entry_confirmed(&config));
+        fast.snapshot.regime = MarketRegime::HighVolatility;
+        assert_eq!(
+            restored.regime(&config, &fast.snapshot),
+            MarketRegime::HighVolatility
+        );
+        let mut bad = serde_json::to_value(&restored).unwrap();
+        bad["scale"]["snapshot"]["budget"] = serde_json::json!("1.1");
+        let bad: RegimeFilter = serde_json::from_value(bad).unwrap();
+        assert!(
+            bad.validate(&config, next.bar_type, &fast.snapshot)
+                .is_err()
+        );
+    }
+
     fn bar(minute: u64) -> Bar {
         Bar::new(
             "AAPL.SIM-1-MINUTE-LAST-EXTERNAL".parse().unwrap(),
@@ -326,7 +462,7 @@ mod tests {
             b.low = Price::from_decimal_dp(price - Decimal::new(5, 2), 2).unwrap();
             fast.update(&config, observation(&b)).unwrap();
             original_fast.update(&baseline, observation(&b)).unwrap();
-            filter.update(&config, &b).unwrap();
+            filter.update(&config, &b, None).unwrap();
             assert_eq!(fast.snapshot.atr, original_fast.snapshot.atr);
             assert_eq!(fast.snapshot.ma_slope, original_fast.snapshot.ma_slope);
             // 在确认尚未结束、桶尚未收盘时恢复；不能靠重启跳过趋势确认。
@@ -376,7 +512,7 @@ mod tests {
         for minute in 1..=180 {
             let b = bar(minute);
             fast.update(&config, observation(&b)).unwrap();
-            let changed = filter.update(&config, &b).unwrap();
+            let changed = filter.update(&config, &b, None).unwrap();
             assert_eq!(changed, minute % 15 == 0);
             if changed && filter.source().regime == MarketRegime::Range {
                 first_range.get_or_insert(minute);
@@ -396,7 +532,7 @@ mod tests {
             confirmed_range,
             Some(60 + u64::from(confirmations - 1) * 15)
         );
-        assert!(filter.entry_confirmed());
+        assert!(filter.entry_confirmed(&config));
 
         // 增加软确认不能让分钟级高波动等待 45/75/120 分钟才生效。
         let before = filter.source().ts_ns;
@@ -430,7 +566,7 @@ mod tests {
         for minute in 1..15 {
             let b = bar(minute);
             fast.update(&config, observation(&b)).unwrap();
-            assert!(!filter.update(&config, &b).unwrap());
+            assert!(!filter.update(&config, &b, None).unwrap());
         }
         assert_eq!(filter.source().ts_ns, 0);
         let mut restored: RegimeFilter =
@@ -440,8 +576,8 @@ mod tests {
             .unwrap();
         let b = bar(15);
         fast.update(&config, observation(&b)).unwrap();
-        assert!(filter.update(&config, &b).unwrap());
-        assert!(restored.update(&config, &b).unwrap());
+        assert!(filter.update(&config, &b, None).unwrap());
+        assert!(restored.update(&config, &b, None).unwrap());
         assert_eq!(
             serde_json::to_value(&filter).unwrap(),
             serde_json::to_value(&restored).unwrap()
@@ -461,7 +597,7 @@ mod tests {
         for minute in (1..=30).filter(|m| *m != 8) {
             let b = bar(minute);
             fast.update(&config, observation(&b)).unwrap();
-            assert_eq!(filter.update(&config, &b).unwrap(), minute == 30);
+            assert_eq!(filter.update(&config, &b, None).unwrap(), minute == 30);
             filter
                 .validate(&config, b.bar_type, &fast.snapshot)
                 .unwrap();
@@ -487,7 +623,7 @@ mod tests {
                 b.low = Price::from("90.00");
             }
             fast.update(&config, observation(&b)).unwrap();
-            filter.update(&config, &b).unwrap();
+            filter.update(&config, &b, None).unwrap();
             assert_eq!(
                 filter.detector.snapshot.atr,
                 if minute == 15 { 20.0 } else { 0.0 }
@@ -511,7 +647,7 @@ mod tests {
                 b.ts_event = (open + minute * MINUTE).into();
                 b.ts_init = b.ts_event;
                 fast.update(&config, observation(&b)).unwrap();
-                assert_eq!(filter.update(&config, &b).unwrap(), minute == 15);
+                assert_eq!(filter.update(&config, &b, None).unwrap(), minute == 15);
                 filter
                     .validate(&config, b.bar_type, &fast.snapshot)
                     .unwrap();
@@ -532,7 +668,7 @@ mod tests {
         for minute in 1..=390 {
             let b = bar(minute);
             fast.update(&config, observation(&b)).unwrap();
-            filter.update(&config, &b).unwrap();
+            filter.update(&config, &b, None).unwrap();
         }
         // 26 根尚不足默认 ADX 暖机，不允许偷用分钟方向状态代替。
         assert!(!filter.ready(&config, &fast.snapshot, fast.snapshot.ts_ns));
@@ -541,7 +677,7 @@ mod tests {
             b.ts_event = (b.ts_event.as_u64() + 86_400_000_000_000).into();
             b.ts_init = b.ts_event;
             fast.update(&config, observation(&b)).unwrap();
-            filter.update(&config, &b).unwrap();
+            filter.update(&config, &b, None).unwrap();
         }
         let now = fast.snapshot.ts_ns;
         assert!(filter.ready(&config, &fast.snapshot, now));
@@ -589,7 +725,7 @@ mod tests {
         }
         fast.regime = MarketRegime::HighVolatility;
         assert_eq!(filter.regime(&config, &fast), MarketRegime::HighVolatility);
-        assert!(filter.entry_confirmed());
+        assert!(filter.entry_confirmed(&config));
     }
 
     #[rstest::rstest]
@@ -616,7 +752,7 @@ mod tests {
         let mut fast = RegimeDetector::default();
         let b = bar(1);
         fast.update(&config, observation(&b)).unwrap();
-        filter.update(&config, &b).unwrap();
+        filter.update(&config, &b, None).unwrap();
         filter.count = 9;
         assert!(
             filter

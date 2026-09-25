@@ -31,7 +31,7 @@ use super::{
     config::{GridConfig, TrendPolicy},
     engine::{GridEngine, spacing},
     portfolio::{PortfolioConfig, PortfolioRiskManager},
-    regime::{MarketRegime, Observation, RegimeDetector, RegimeSnapshot},
+    regime::{MarketRegime, Observation, RegimeDetector, RegimeSnapshot, rebound_opportunities},
     regime_filter::RegimeFilter,
     stock::StockMarketState,
 };
@@ -390,7 +390,13 @@ fn assess(
         as_of_ns - daily_last.ts_event.as_u64() <= config.max_history_age_days * DAY_NS,
         "STALE_DAILY_HISTORY"
     );
-    let signal = completed_tail(&input.signal_bars, as_of_ns, 1000);
+    let signal_limit = input
+        .grid
+        .grid_scale_regime
+        .as_ref()
+        .filter(|c| c.mode != super::grid_scale::GridScaleMode::Shadow)
+        .map_or(1000, |c| (c.lookback_sessions + 1) * 390);
+    let signal = completed_tail(&input.signal_bars, as_of_ns, signal_limit);
     let last = signal.last().context("MISSING_COMPLETED_SIGNAL_BARS")?;
     anyhow::ensure!(
         as_of_ns - last.ts_event.as_u64() <= config.max_history_age_days * DAY_NS,
@@ -437,7 +443,7 @@ fn assess(
         "INSUFFICIENT_DOLLAR_VOLUME"
     );
     let mut detector = RegimeDetector::default();
-    let mut filter = RegimeFilter::enabled(&input.grid).then(RegimeFilter::default);
+    let mut filter = RegimeFilter::enabled(&input.grid).then(|| RegimeFilter::new(&input.grid));
     if filter.is_some() {
         RegimeFilter::validate_bar_type(&input.grid, last.bar_type)?;
     }
@@ -455,14 +461,24 @@ fn assess(
             },
         )?;
         if let Some(filter) = &mut filter {
-            filter.update(&input.grid, bar)?;
+            let scale = if input.grid.grid_scale_regime.is_some() {
+                Some(spacing(
+                    &input.grid,
+                    Decimal::from_f64_retain(detector.snapshot.atr).context("INVALID_ATR")?,
+                    bar.close.as_decimal(),
+                    Decimal::ONE,
+                )?)
+            } else {
+                None
+            };
+            filter.update(&input.grid, bar, scale)?;
         }
     }
     anyhow::ensure!(detector.snapshot.initialized, "INDICATOR_WARMUP");
     let regime = if let Some(filter) = &filter {
         anyhow::ensure!(
             filter.ready(&input.grid, &detector.snapshot, last.ts_event.as_u64())
-                && filter.entry_confirmed(),
+                && filter.entry_confirmed(&input.grid),
             "REGIME_CONFIRMATION_WARMUP"
         );
         let mut snapshot = filter.source().clone();
@@ -572,37 +588,6 @@ fn assess(
         score_components: components,
         regime,
     })
-}
-
-// 只是闭市价方向改变的机会计数。跳空最多确认一个状态变化，不假造跳过价位的成交。
-fn rebound_opportunities(closes: &[Decimal], spacing: Decimal) -> (usize, Option<f64>, usize) {
-    let mut high = closes[0];
-    let mut low = high;
-    let mut down_since = None;
-    let mut rebounds = 0;
-    let mut duration = 0;
-    for (index, close) in closes.iter().copied().enumerate().skip(1) {
-        if let Some(start) = down_since {
-            low = low.min(close);
-            if close >= low * (Decimal::ONE + spacing) {
-                rebounds += 1;
-                duration += index - start;
-                down_since = None;
-                high = close;
-            }
-        } else {
-            high = high.max(close);
-            if close * (Decimal::ONE + spacing) <= high {
-                low = close;
-                down_since = Some(index);
-            }
-        }
-    }
-    (
-        rebounds,
-        (rebounds > 0).then(|| duration as f64 / rebounds as f64),
-        down_since.map_or(0, |start| closes.len() - 1 - start),
-    )
 }
 
 #[cfg(test)]

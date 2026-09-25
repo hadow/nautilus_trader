@@ -18,6 +18,8 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use super::grid_scale::GridScaleConfig;
+
 /// 核心策略与执行链路共用的仓位语义。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrategyMode {
@@ -158,10 +160,13 @@ pub struct GridConfig {
     pub minimum_reset_atr_multiple: Decimal,
     /// 股票自适应模式重置前，要求连续收在网格外的已完成 K 线数。
     pub breakout_confirmation_bars: u32,
-    /// 股票方案固定 8 根完整分类 Bar 确认；显式保留用于配置与检查点审计。
+    /// 旧股票方案固定 8 根确认；网格尺度候选使用滞回而非此计数，保留字段便于对照审计。
     pub regime_confirmation_bars: u32,
     /// 股票方案固定 15 分钟，从常规时段一分钟 Bar 聚合；不改变分钟 ATR 与硬风控。
     pub regime_bar_minutes: usize,
+    /// 可选网格尺度分类实验；缺省保持原 15 分钟＋8 根确认，不改变已有配置快照。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid_scale_regime: Option<GridScaleConfig>,
     /// 两次网格重置之间的最短秒数。
     pub minimum_reset_interval_secs: u64,
     /// 触发波动率重置所需的相对间距变化。
@@ -289,6 +294,7 @@ impl Default for GridConfig {
             breakout_confirmation_bars: 2,
             regime_confirmation_bars: 8,
             regime_bar_minutes: 15,
+            grid_scale_regime: None,
             minimum_reset_interval_secs: 300,
             volatility_reset_ratio: Decimal::new(5, 1),
             enable_dynamic_reset: true,
@@ -341,6 +347,15 @@ impl GridConfig {
     ///
     /// 周期无效、信号参数非有限值，或风险/成本边界相互矛盾时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(scale) = &self.grid_scale_regime {
+            anyhow::ensure!(
+                self.strategy_mode == StrategyMode::StockAdaptive
+                    && (scale.mode == super::grid_scale::GridScaleMode::Shadow
+                        || self.enable_trend_filter),
+                "Active grid-scale regime requires StockAdaptive with trend filtering"
+            );
+            scale.validate()?;
+        }
         anyhow::ensure!(
             self.strategy_mode != StrategyMode::StockAdaptive
                 || (self.regular_session_only
@@ -518,6 +533,26 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    fn grid_scale_regime_is_opt_in_and_rejects_invalid_research_limits() {
+        let baseline = serde_json::to_value(GridConfig::default()).unwrap();
+        assert!(baseline.get("grid_scale_regime").is_none());
+        let mut document = baseline;
+        document["strategy_mode"] = serde_json::json!("StockAdaptive");
+        document["grid_scale_regime"] = serde_json::json!({"mode": "Shadow"});
+        let config: GridConfig = serde_json::from_value(document.clone()).unwrap();
+        config.validate().unwrap();
+        for invalid in [
+            serde_json::json!({"lookback_sessions": 0}),
+            serde_json::json!({"trend_enter_efficiency": 0.3, "trend_exit_efficiency": 0.6}),
+            serde_json::json!({"uncertain_budget": "1.1"}),
+        ] {
+            document["grid_scale_regime"] = invalid;
+            let invalid: GridConfig = serde_json::from_value(document.clone()).unwrap();
+            assert!(invalid.validate().is_err());
+        }
+    }
 
     #[rstest]
     #[case(15, 8, true)]

@@ -106,12 +106,12 @@
       }
     },
     {
-      "name": "dgt_plus_target_position",
+      "name": "dgt_plus_target_position_and_regular_session",
       "grid_overrides": {
         "strategy_mode": "StockAdaptive",
         "spacing_mode": "Atr",
         "breakout_confirmation_bars": 1,
-        "regular_session_only": false,
+        "regular_session_only": true,
         "max_gap_pct": "0",
         "minimum_average_dollar_volume": "0",
         "maximum_spread_bps": "0",

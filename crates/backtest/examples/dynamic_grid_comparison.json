@@ -1,7 +1,7 @@
 {
   "instruments": {
-    "AAPL.SIM": "instuments/AAPL.json",
-    "MSFT.SIM": "instuments/MSFT.json",
+    "AAPL.SIM": "instuments/comparison/AAPL.json",
+    "MSFT.SIM": "instuments/comparison/MSFT.json",
     "NVDA.SIM": "instuments/NVDA.json",
     "TSLA.SIM": "instuments/TSLA.json",
     "AMZN.SIM": "instuments/AMZN.json",

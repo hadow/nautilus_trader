@@ -40,6 +40,7 @@ use super::{
     config::{GridConfig, RiskPolicy, StrategyMode, TrendPolicy},
     diagnostics::{CancelObservation, ObservationCount, RejectionObservation, ResetObservation},
     engine::{GridEngine, LevelStatus, floor_tick, spacing},
+    grid_scale::GridScaleMode,
     multi_asset::MultiAssetGridStrategy,
     orders::{GridOrder, OrderManager, OrderPhase, PositionComponent},
     position::{PositionTarget, position_delta, target_position},
@@ -195,7 +196,8 @@ impl GridStrategyEngine {
                 state: StrategyState::Initializing,
                 grid: None,
                 regime: RegimeDetector::default(),
-                regime_filter: RegimeFilter::enabled(&config.grid).then(RegimeFilter::default),
+                regime_filter: RegimeFilter::enabled(&config.grid)
+                    .then(|| RegimeFilter::new(&config.grid)),
                 orders: OrderManager::new(config.grid.capital),
                 risk: RiskManager::new(config.grid.capital),
                 generation: 0,
@@ -241,7 +243,7 @@ impl GridStrategyEngine {
                 .state
                 .regime_filter
                 .as_ref()
-                .is_some_and(RegimeFilter::entry_confirmed)
+                .is_some_and(|filter| filter.entry_confirmed(&self.config.grid))
     }
 
     fn stock_gate(&self, now: u64, price: Decimal) -> Option<StockGate> {
@@ -429,13 +431,23 @@ impl GridStrategyEngine {
         lot: Decimal,
         now: u64,
     ) -> anyhow::Result<PositionTarget> {
-        let target = target_position(
+        let mut target = target_position(
             &self.config.grid,
             self.regime(),
             snapshot.equity,
             price,
             lot,
         )?;
+        if self.adaptive_grid_budget() && self.regime() != MarketRegime::HighVolatility {
+            let budget = self
+                .state
+                .regime_filter
+                .as_ref()
+                .and_then(RegimeFilter::scale_snapshot)
+                .map_or(Decimal::ZERO, |s| s.budget);
+            target.grid = floor_tick(target.grid * budget, lot);
+            target.total = target.core + target.grid;
+        }
         if target != self.state.position_target {
             log::info!(
                 "POSITION_TARGET_CHANGED timestamp_ns={now} symbol={} regime={:?} price={price} core={} grid={} total={} previous_total={}",
@@ -449,6 +461,14 @@ impl GridStrategyEngine {
             self.state.position_target = target;
         }
         Ok(target)
+    }
+
+    fn adaptive_grid_budget(&self) -> bool {
+        self.config
+            .grid
+            .grid_scale_regime
+            .as_ref()
+            .is_some_and(|c| c.mode == GridScaleMode::Adaptive)
     }
 
     #[allow(
@@ -1157,7 +1177,21 @@ impl GridStrategyEngine {
         // Target Position 是股票适配层的唯一仓位目标；先减仓，再讨论新网格和新买单。
         if config.strategy_mode == StrategyMode::StockAdaptive && !stale {
             let target = self.update_position_target(&snapshot, price, lot, now)?;
-            if self.reduce_to_target(runtime, target, price, lot, now)? {
+            // 软预算只约束新增 Grid：超额待买单仍撤销，已成交库存保留覆盖止盈。
+            // Range 基础额度仍是强制持仓上限；高波动与显式风险政策不享受此豁免。
+            let mut reduction_target = target;
+            if self.adaptive_grid_budget() && regime != MarketRegime::HighVolatility {
+                let hard =
+                    target_position(&config, MarketRegime::Range, snapshot.equity, price, lot)?;
+                let current = self
+                    .state
+                    .orders
+                    .component_inventory(PositionComponent::Grid);
+                let hard_grid = hard.grid.min((hard.total - target.core).max(Decimal::ZERO));
+                reduction_target.grid = target.grid.max(current.min(hard_grid));
+                reduction_target.total = reduction_target.core + reduction_target.grid;
+            }
+            if self.reduce_to_target(runtime, reduction_target, price, lot, now)? {
                 self.state.state = StrategyState::Paused;
                 return runtime.persist_engine(self, None);
             }
@@ -1230,7 +1264,11 @@ impl GridStrategyEngine {
             }
             let volatility_changed =
                 (spacing - grid.spacing).abs() / grid.spacing >= config.volatility_reset_ratio;
-            let regime_changed = regime != self.state.grid_regime;
+            let regime_changed = regime != self.state.grid_regime
+                && config
+                    .grid_scale_regime
+                    .as_ref()
+                    .is_none_or(|c| c.mode == GridScaleMode::Shadow || c.reset_on_regime_change);
             if !config.enable_dynamic_reset && (breakout_up || breakout_down) {
                 self.state.risk.trip("Fixed grid boundary reached");
                 return self.drive(runtime, price, now);
@@ -1660,7 +1698,22 @@ impl GridStrategyEngine {
             .regime
             .update(&self.config.grid, observation(bar))?;
         if let Some(filter) = &mut self.state.regime_filter {
-            filter.update(&self.config.grid, bar)?;
+            let scale = if self.config.grid.grid_scale_regime.is_some() {
+                Some(match &self.state.grid {
+                    Some(grid) => grid.spacing,
+                    // 首次建网格前用此刻已知的 ATR 候选间距；绝不读取未来网格。
+                    None => spacing(
+                        &self.config.grid,
+                        Decimal::from_f64_retain(self.state.regime.snapshot.atr)
+                            .ok_or_else(|| anyhow::anyhow!("Nonfinite ATR"))?,
+                        bar.close.as_decimal(),
+                        Decimal::ONE,
+                    )?,
+                })
+            } else {
+                None
+            };
+            filter.update(&self.config.grid, bar, scale)?;
         }
         runtime.observe_close(
             self.config.instrument_id,

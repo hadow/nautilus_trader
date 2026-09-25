@@ -33,13 +33,13 @@ use super::config::{GridConfig, RegimeAverage, TrendPolicy};
 pub enum MarketRegime {
     /// 方向性较弱，且波动率处于允许范围。
     Range,
-    /// 方向强度和正斜率均达到上升趋势阈值。
+    /// 当前所选分类器确认上升方向；具体输入见分类源快照。
     TrendUp,
-    /// 方向强度和负斜率均达到下降趋势阈值。
+    /// 当前所选分类器确认下降方向；具体输入见分类源快照。
     TrendDown,
     /// ATR、布林带宽度或已实现波动率超过上限。
     HighVolatility,
-    /// 指标已预热，但 ATR/价格低于允许入场的下限。
+    /// 指标已预热，但分钟波动率或网格尺度波幅不足以支持入场。
     LowVolatility,
     /// 指标预热中、状态无法明确分类，或风险条件禁止交易。
     #[default]
@@ -376,6 +376,43 @@ fn classify(
 pub(super) fn is_fresh(ts_ns: u64, now: u64, max_age_secs: u64) -> bool {
     now.checked_sub(ts_ns)
         .is_some_and(|age| Duration::from_nanos(age) <= Duration::from_secs(max_age_secs))
+}
+
+// 原选股逻辑与网格尺度分类共用：只统计收盘反弹机会，不假造跳空跨越价位的成交。
+pub(super) fn rebound_opportunities(
+    closes: &[Decimal],
+    spacing: Decimal,
+) -> (usize, Option<f64>, usize) {
+    let Some(&first) = closes.first() else {
+        return (0, None, 0);
+    };
+    let mut high = first;
+    let mut low = high;
+    let mut down_since = None;
+    let mut rebounds = 0;
+    let mut duration = 0;
+    for (index, close) in closes.iter().copied().enumerate().skip(1) {
+        if let Some(start) = down_since {
+            low = low.min(close);
+            if close >= low * (Decimal::ONE + spacing) {
+                rebounds += 1;
+                duration += index - start;
+                down_since = None;
+                high = close;
+            }
+        } else {
+            high = high.max(close);
+            if close * (Decimal::ONE + spacing) <= high {
+                low = close;
+                down_since = Some(index);
+            }
+        }
+    }
+    (
+        rebounds,
+        (rebounds > 0).then(|| duration as f64 / rebounds as f64),
+        down_since.map_or(0, |start| closes.len() - 1 - start),
+    )
 }
 
 #[cfg(test)]

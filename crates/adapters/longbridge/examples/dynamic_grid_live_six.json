@@ -1,0 +1,17 @@
+{
+  "mode": "Live",
+  "portfolio_config": "../../../backtest/examples/dynamic_grid_comparison.json",
+  "instrument_mapping": {
+    "AAPL.SIM": "AAPL.US.LONGBRIDGE",
+    "MSFT.SIM": "MSFT.US.LONGBRIDGE",
+    "NVDA.SIM": "NVDA.US.LONGBRIDGE",
+    "TSLA.SIM": "TSLA.US.LONGBRIDGE",
+    "AMZN.SIM": "AMZN.US.LONGBRIDGE",
+    "META.SIM": "META.US.LONGBRIDGE"
+  },
+  "trader_id": "GRID-106",
+  "account_id": "LONGBRIDGE-001",
+  "state_path": "reports/multi-grid-six-live-state.json",
+  "report_path": "reports/multi-grid-six-live-report.json",
+  "sandbox_fee_per_share": null
+}
