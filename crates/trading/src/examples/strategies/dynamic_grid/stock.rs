@@ -42,6 +42,8 @@ pub(super) enum StockGate {
     LowDollarVolume,
     /// 实时报价买卖价差过宽。
     WideSpread,
+    /// Tick 执行模式缺少新鲜的可执行报价；成交打印不能替代盘口。
+    StaleQuote,
     /// 当前价格低于允许交易的最低价格。
     BelowMinimumPrice,
 }
@@ -54,6 +56,7 @@ impl StockGate {
             Self::LiquidityWarmup => "LIQUIDITY_WARMUP",
             Self::LowDollarVolume => "LOW_DOLLAR_VOLUME",
             Self::WideSpread => "WIDE_SPREAD",
+            Self::StaleQuote => "STALE_QUOTE",
             Self::BelowMinimumPrice => "BELOW_MINIMUM_PRICE",
         }
     }
@@ -67,6 +70,8 @@ pub(super) struct StockMarketState {
     dollar_volumes: VecDeque<Decimal>,
     average_dollar_volume: Decimal,
     spread_bps: Option<Decimal>,
+    #[serde(default)]
+    quote_ns: Option<u64>,
     pub(super) gap_pct: Decimal,
     pub(super) gap_atr: Decimal,
     gap_recovery_bars_remaining: u32,
@@ -96,6 +101,15 @@ impl StockMarketState {
             .to_datetime_utc()
             .to_zoned(NEW_YORK.clone());
         i16::from(local.hour()) * 60 + i16::from(local.minute())
+    }
+
+    /// 对齐已完成整分钟 Bar 的纽约 09:30 起点；拒绝开盘瞬间与盘外数据。
+    pub(super) fn session_open_ns(ts_ns: u64) -> Option<u64> {
+        let minute = Self::local_minute(ts_ns);
+        if !(9 * 60 + 31..=16 * 60).contains(&minute) || !ts_ns.is_multiple_of(60_000_000_000) {
+            return None;
+        }
+        ts_ns.checked_sub((minute - (9 * 60 + 30)) as u64 * 60_000_000_000)
     }
 
     /// 处理一根已完成的常规时段 K 线，并用真实开盘价检测相对前收盘的跳空。
@@ -157,10 +171,19 @@ impl StockMarketState {
     }
 
     /// 使用可执行买卖报价更新价差，不从 OHLC K 线虚构 spread。
-    pub(super) fn observe_quote(&mut self, bid: Decimal, ask: Decimal) {
+    pub(super) fn observe_quote(&mut self, bid: Decimal, ask: Decimal, ts_ns: u64) {
         let midpoint = (bid + ask) / Decimal::from(2);
         self.spread_bps = (midpoint > Decimal::ZERO && ask >= bid)
             .then(|| (ask - bid) / midpoint * Decimal::from(10_000));
+        self.quote_ns = self.spread_bps.map(|_| ts_ns);
+    }
+
+    pub(super) fn quote_gate(&self, config: &GridConfig, now: u64) -> Option<StockGate> {
+        (config.maximum_spread_bps > Decimal::ZERO
+            && self
+                .quote_ns
+                .is_none_or(|ts| !super::regime::is_fresh(ts, now, config.max_signal_age_secs)))
+        .then_some(StockGate::StaleQuote)
     }
 
     /// 按固定优先级返回当前第一个未通过的股票市场入场门槛。
@@ -259,6 +282,31 @@ mod tests {
 
     const OPEN_2025_01_02: u64 = 1_735_828_200_000_000_000;
     const DAY: u64 = 86_400_000_000_000;
+
+    #[rstest]
+    fn executable_quote_expires_independently_of_trade_marks() {
+        let config = GridConfig::default();
+        let mut state = StockMarketState::default();
+        let now = OPEN_2025_01_02;
+        assert_eq!(state.quote_gate(&config, now), Some(StockGate::StaleQuote));
+        state.observe_quote(dec!(100), dec!(100.01), now);
+        let deadline = now + config.max_signal_age_secs * 1_000_000_000;
+        assert_eq!(state.quote_gate(&config, deadline), None);
+        assert_eq!(
+            state.quote_gate(&config, deadline + 1),
+            Some(StockGate::StaleQuote)
+        );
+        assert_eq!(
+            state.quote_gate(&config, now - 1),
+            Some(StockGate::StaleQuote)
+        );
+        let restored: StockMarketState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            restored.quote_gate(&config, deadline + 1),
+            Some(StockGate::StaleQuote)
+        );
+    }
 
     #[rstest]
     #[case::minute_atr_spike(dec!(99), dec!(0.2), dec!(0.08), dec!(5), false)]

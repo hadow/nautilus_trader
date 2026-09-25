@@ -43,9 +43,10 @@ use super::{
     multi_asset::MultiAssetGridStrategy,
     orders::{GridOrder, OrderManager, OrderPhase, PositionComponent},
     position::{PositionTarget, position_delta, target_position},
-    regime::{MarketRegime, Observation, RegimeDetector, is_fresh},
+    regime::{MarketRegime, RegimeDetector, is_fresh},
+    regime_filter::{RegimeFilter, observation},
     risk::{RiskManager, RiskSnapshot},
-    stock::{BreakoutDirection, StockMarketState},
+    stock::{BreakoutDirection, StockGate, StockMarketState},
 };
 use crate::strategy::{Strategy, StrategyConfig, StrategyNative};
 
@@ -131,6 +132,9 @@ pub(super) struct GridState {
     pub(super) grid: Option<GridEngine>,
     /// 仅由已完成 K 线更新、可重放恢复的市场状态检测器。
     pub(super) regime: RegimeDetector,
+    /// `StockAdaptive` 必须恢复 15 分钟确认状态；仅 `LegacyDgt` 不使用此层。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) regime_filter: Option<RegimeFilter>,
     /// 订单、库存批次与周期盈亏的唯一策略账本。
     pub(super) orders: OrderManager,
     /// 单标的风险高水位、日损失和重置预算。
@@ -154,9 +158,6 @@ pub(super) struct GridState {
     /// 当前核心仓、网格仓及合计目标仓位。
     pub(super) position_target: PositionTarget,
     #[serde(default)]
-    /// 当前市场状态连续稳定的已完成 K 线数量。
-    pub(super) regime_confirmation_bars: u32,
-    #[serde(default)]
     /// 美股时段、跳空、流动性与突破确认状态。
     pub(super) stock: StockMarketState,
 }
@@ -169,6 +170,24 @@ pub(super) struct GridStrategyEngine {
     pub report: Rc<RefCell<PerformanceTracker>>,
 }
 
+impl GridState {
+    pub(super) fn validate_signal(
+        &self,
+        config: &GridConfig,
+        bar_type: BarType,
+    ) -> anyhow::Result<()> {
+        self.regime.validate(config)?;
+        anyhow::ensure!(
+            self.regime_filter.is_some() == RegimeFilter::enabled(config),
+            "Regime filter/configuration mismatch"
+        );
+        if let Some(filter) = &self.regime_filter {
+            filter.validate(config, bar_type, &self.regime.snapshot)?;
+        }
+        Ok(())
+    }
+}
+
 impl GridStrategyEngine {
     pub(super) fn new(config: DynamicGridConfig) -> Self {
         Self {
@@ -176,6 +195,7 @@ impl GridStrategyEngine {
                 state: StrategyState::Initializing,
                 grid: None,
                 regime: RegimeDetector::default(),
+                regime_filter: RegimeFilter::enabled(&config.grid).then(RegimeFilter::default),
                 orders: OrderManager::new(config.grid.capital),
                 risk: RiskManager::new(config.grid.capital),
                 generation: 0,
@@ -186,13 +206,57 @@ impl GridStrategyEngine {
                 last_tick_event_ns: 0,
                 completed_cycles: 0,
                 position_target: PositionTarget::default(),
-                regime_confirmation_bars: 0,
                 stock: StockMarketState::default(),
             },
             config,
             instrument: None,
             report: Rc::new(RefCell::new(PerformanceTracker::default())),
         }
+    }
+
+    /// 目标仓位、撤单、覆盖卖单和组合分配必须读取同一有效状态。
+    pub(super) fn regime(&self) -> MarketRegime {
+        self.state
+            .regime_filter
+            .as_ref()
+            .map_or(self.state.regime.snapshot.regime, |filter| {
+                filter.regime(&self.config.grid, &self.state.regime.snapshot)
+            })
+    }
+
+    fn signal_ready(&self, now: u64) -> bool {
+        let signal = &self.state.regime.snapshot;
+        self.state.regime_filter.as_ref().map_or_else(
+            || {
+                signal.initialized
+                    && is_fresh(signal.ts_ns, now, self.config.grid.max_signal_age_secs)
+            },
+            |filter| filter.ready(&self.config.grid, signal, now),
+        )
+    }
+
+    fn regime_confirmed(&self) -> bool {
+        self.config.grid.strategy_mode != StrategyMode::StockAdaptive
+            || self
+                .state
+                .regime_filter
+                .as_ref()
+                .is_some_and(RegimeFilter::entry_confirmed)
+    }
+
+    fn stock_gate(&self, now: u64, price: Decimal) -> Option<StockGate> {
+        if self.config.grid.strategy_mode != StrategyMode::StockAdaptive {
+            return None;
+        }
+        self.state
+            .stock
+            .gate(&self.config.grid, now, price)
+            .or_else(|| {
+                self.config
+                    .tick_execution
+                    .then(|| self.state.stock.quote_gate(&self.config.grid, now))
+                    .flatten()
+            })
     }
 
     /// 仅在操作员完成订单与库存对账后，显式解除已锁存的风险状态。
@@ -297,6 +361,8 @@ impl GridStrategyEngine {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Instrument unavailable"))?;
         let currency = instrument.quote_currency();
+        let (pending_buy_quantity, pending_buy_notional) =
+            self.state.orders.buy_reservations(&self.config.grid, mark);
 
         // 只读取账户当前值，避免复制持续增长的账户事件历史。
         let (account_id, free) = {
@@ -307,7 +373,13 @@ impl GridStrategyEngine {
             let free = account
                 .balance_free(Some(currency))
                 .ok_or_else(|| anyhow::anyhow!("Quote-currency cash unavailable"))?
-                .as_decimal();
+                .as_decimal()
+                + super::risk::reservation_overlap(
+                    &account,
+                    self.config.instrument_id,
+                    currency,
+                    pending_buy_notional,
+                );
             (account.id(), free)
         };
         let account_equity = runtime
@@ -333,8 +405,6 @@ impl GridStrategyEngine {
             broker_quantity == position,
             "Broker inventory changed outside the grid ledger"
         );
-        let (pending_buy_quantity, pending_buy_notional) =
-            self.state.orders.buy_reservations(&self.config.grid, mark);
         Ok(RiskSnapshot {
             equity: self.state.orders.cash + exposure,
             cash: self.state.orders.cash,
@@ -361,7 +431,7 @@ impl GridStrategyEngine {
     ) -> anyhow::Result<PositionTarget> {
         let target = target_position(
             &self.config.grid,
-            self.state.regime.snapshot.regime,
+            self.regime(),
             snapshot.equity,
             price,
             lot,
@@ -370,7 +440,7 @@ impl GridStrategyEngine {
             log::info!(
                 "POSITION_TARGET_CHANGED timestamp_ns={now} symbol={} regime={:?} price={price} core={} grid={} total={} previous_total={}",
                 self.config.instrument_id,
-                self.state.regime.snapshot.regime,
+                self.regime(),
                 target.core,
                 target.grid,
                 target.total,
@@ -460,32 +530,86 @@ impl GridStrategyEngine {
             return Ok(false);
         }
 
-        // 先撤掉同仓位分层的买单与远端限价卖单。CancelPending 仍占预留，终态确认前不重挂。
-        let conflicts: Vec<_> = self
+        let active: Vec<_> = self
             .state
             .orders
             .active_ids()
             .into_iter()
-            .filter(|id| {
-                let order = &self.state.orders.orders()[id];
-                order.component == component && (order.buy || order.limit.is_some())
-            })
+            .filter(|id| self.state.orders.orders()[id].component == component)
             .collect();
-        if !conflicts.is_empty() {
-            self.cancel_ids(runtime, conflicts, "POSITION_TARGET_REDUCTION")?;
+        // 目标只被待买量超出时，不动现有止盈。优先计入在途撤单，再撤最远的买入层。
+        let mut buy_excess = (current + pending_buys - target)
+            .min(pending_buys)
+            .max(Decimal::ZERO);
+        if buy_excess > Decimal::ZERO {
+            let mut buys: Vec<_> = active
+                .iter()
+                .filter(|id| self.state.orders.orders()[*id].buy)
+                .collect();
+            buys.sort_by_key(|id| {
+                let order = &self.state.orders.orders()[*id];
+                (
+                    !matches!(order.phase, OrderPhase::CancelPending | OrderPhase::Unknown),
+                    order.reference,
+                    *id,
+                )
+            });
+            let mut cancel = Vec::new();
+            for id in buys {
+                if buy_excess <= Decimal::ZERO {
+                    break;
+                }
+                let order = &self.state.orders.orders()[id];
+                buy_excess -= order.quantity - order.filled;
+                cancel.push(id.clone());
+            }
+            self.cancel_ids(runtime, cancel, "POSITION_TARGET_REDUCTION")?;
             return Ok(true);
         }
 
-        let (pending_buys, pending_sells) = self.state.orders.component_reservations(component);
-        let mut remaining = -position_delta(
-            target,
-            self.state.orders.component_inventory(component),
-            pending_buys,
-            pending_sells,
+        let (_, pending_sells) = self.state.orders.component_reservations(component);
+        let market_sells: Decimal = active
+            .iter()
+            .map(|id| &self.state.orders.orders()[id])
+            .filter(|order| !order.buy && order.limit.is_none())
+            .map(|order| order.quantity - order.filled)
+            .sum();
+        let mut remaining = floor_tick(
+            (current - target - market_sells).max(Decimal::ZERO),
             lot_size,
         );
         if remaining <= Decimal::ZERO {
             return Ok(false);
+        }
+        // 只释放本次减仓所需的库存；未被选中的覆盖卖单继续撮合。
+        let mut covered = remaining - (current - pending_sells);
+        if covered > Decimal::ZERO {
+            let mut sells: Vec<_> = active
+                .iter()
+                .filter(|id| {
+                    let order = &self.state.orders.orders()[*id];
+                    !order.buy && order.limit.is_some()
+                })
+                .collect();
+            sells.sort_by_key(|id| {
+                let order = &self.state.orders.orders()[*id];
+                (
+                    !matches!(order.phase, OrderPhase::CancelPending | OrderPhase::Unknown),
+                    std::cmp::Reverse(order.reference),
+                    *id,
+                )
+            });
+            let mut cancel = Vec::new();
+            for id in sells {
+                if covered <= Decimal::ZERO {
+                    break;
+                }
+                let order = &self.state.orders.orders()[id];
+                covered -= order.quantity - order.filled;
+                cancel.push(id.clone());
+            }
+            self.cancel_ids(runtime, cancel, "POSITION_TARGET_REDUCTION")?;
+            return Ok(true);
         }
         let namespace = self.namespace();
         for lot_id in self.state.orders.reduction_candidates(component) {
@@ -548,10 +672,16 @@ impl GridStrategyEngine {
     pub(super) fn recover(&mut self, runtime: &MultiAssetGridStrategy) -> anyhow::Result<()> {
         // 检查点只提供归属线索，必须与原生订单、成交、持仓逐项对账后才能恢复买入
         self.state.state = StrategyState::Recovering;
-        self.state.regime.validate(&self.config.grid)?;
+        self.state
+            .validate_signal(&self.config.grid, self.config.bar_type)?;
         let now = runtime.clock().timestamp_ns().as_u64();
         anyhow::ensure!(
             self.state.regime.snapshot.ts_ns <= now
+                && self
+                    .state
+                    .regime_filter
+                    .as_ref()
+                    .is_none_or(|filter| filter.latest_input_ns() <= now)
                 && self.state.last_market_ns <= now
                 && self.state.last_tick_event_ns <= now
                 && self.state.grid.as_ref().is_none_or(|g| g.created_ns <= now),
@@ -901,7 +1031,15 @@ impl GridStrategyEngine {
     ) -> anyhow::Result<()> {
         let namespace = self.namespace();
         // 只遍历尚有未预留库存的批次；完整历史仍保留在 OrderManager 中审计。
-        let lots = self.state.orders.exit_candidates();
+        let mut lots = self.state.orders.exit_candidates();
+        // 正常止盈只覆盖 Grid；强制清仓必须同时覆盖 Core，且沿用卖单预留防止重复卖出。
+        if flatten {
+            lots.extend(
+                self.state
+                    .orders
+                    .reduction_candidates(PositionComponent::Core),
+            );
+        }
         for id in lots {
             if self.state.orders.active_count() >= self.config.grid.max_orders {
                 break;
@@ -911,8 +1049,7 @@ impl GridStrategyEngine {
                 && self.state.risk.risk_off_reason.is_none()
                 && !runtime.portfolio_blocked()
                 && !self
-                    .state
-                    .regime
+                    .regime()
                     .permits_order(&self.config.grid, false, lot.level)
             {
                 continue;
@@ -998,17 +1135,14 @@ impl GridStrategyEngine {
             .into_iter()
             .filter(|id| {
                 let order = &self.state.orders.orders()[id];
-                !self
-                    .state
-                    .regime
-                    .permits_order(&config, order.buy, order.level)
+                !self.regime().permits_order(&config, order.buy, order.level)
             })
             .collect();
         self.cancel_ids(runtime, disallowed, "REGIME_ORDER_POLICY")?;
         let signal = self.state.regime.snapshot.clone();
-        let stale = !signal.initialized || !is_fresh(signal.ts_ns, now, config.max_signal_age_secs);
-        let regime = signal.regime;
-        let policy = self.state.regime.policy(&config);
+        let stale = !self.signal_ready(now);
+        let regime = self.regime();
+        let policy = regime.policy(&config);
         let instrument = self
             .instrument
             .as_ref()
@@ -1027,7 +1161,7 @@ impl GridStrategyEngine {
                 self.state.state = StrategyState::Paused;
                 return runtime.persist_engine(self, None);
             }
-            if let Some(gate) = self.state.stock.gate(&config, now, price) {
+            if let Some(gate) = self.stock_gate(now, price) {
                 self.cancel(runtime, true, gate.reason())?;
                 self.exits(runtime, now, false)?;
                 self.state.state = StrategyState::Paused;
@@ -1040,8 +1174,7 @@ impl GridStrategyEngine {
             }
         }
         // 这是行情准入而非最终下单许可，单标的风控、组合风控和原生 RiskEngine 仍可否决
-        let regime_confirmed = config.strategy_mode != StrategyMode::StockAdaptive
-            || self.state.regime_confirmation_bars >= config.regime_confirmation_bars;
+        let regime_confirmed = self.regime_confirmed();
         let can_buy = !stale
             && regime_confirmed
             && !matches!(
@@ -1193,14 +1326,15 @@ impl GridStrategyEngine {
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("Grid identity exhausted"))?;
-            let capital = (snapshot.equity * config.capital_allocation)
-                .min(snapshot.cash)
-                .max(Decimal::ZERO);
             let capital = if config.strategy_mode == StrategyMode::StockAdaptive {
-                capital * config.grid_max_pct
+                // 几何计划与 Target Position 使用同一预算；不再次乘 grid_max_pct。
+                // 历史库存和待成交买单仍在逐笔准入中扣除，不能凭 reset 获得新额度。
+                self.state.position_target.grid * price
             } else {
-                capital
-            };
+                snapshot.equity * config.capital_allocation
+            }
+            .min(snapshot.cash)
+            .max(Decimal::ZERO);
             let grid = GridEngine::build(
                 &config,
                 self.state.generation,
@@ -1241,8 +1375,7 @@ impl GridStrategyEngine {
                 continue;
             }
             if !self
-                .state
-                .regime
+                .regime()
                 .permits_order(&config, true, level.level_index)
             {
                 continue;
@@ -1452,7 +1585,7 @@ impl GridStrategyEngine {
             } else {
                 0.0
             },
-            regime: self.state.regime.snapshot.regime,
+            regime: self.regime(),
         };
         let mut report = self.report.borrow_mut();
         if report.equity.last().is_some_and(|p| p.ts_ns == now) {
@@ -1507,36 +1640,38 @@ impl GridStrategyEngine {
             (false, None)
         };
         if let Some(change) = opening_gap {
-            let pnl = self.state.orders.inventory() * change;
             let mut report = self.report.borrow_mut();
+            // 撮合引擎可能先处理开盘成交、再发布首根 Bar；不能把开盘新买数量算成隔夜持仓，
+            // 也不能让开盘卖出抹掉隔夜损失。复用已持久化的上一时段最后一次库存观测。
+            let inventory = report
+                .equity
+                .last()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Opening gap has no preceding inventory observation")
+                })?
+                .position;
+            let pnl = inventory * change;
             report.metrics.gap_pnl += pnl;
             report.metrics.gap_loss += (-pnl).max(Decimal::ZERO);
         }
-        let previous = self.state.regime.snapshot.regime;
+        let previous = self.regime();
         // 只消费已结束且时间递增的信号 K 线，Tick 模式同样不使用未收盘指标
-        self.state.regime.update(
-            &self.config.grid,
-            Observation {
-                ts_ns: bar.ts_event.as_u64(),
-                high: bar.high.as_f64(),
-                low: bar.low.as_f64(),
-                close: bar.close.as_f64(),
-            },
-        )?;
+        self.state
+            .regime
+            .update(&self.config.grid, observation(bar))?;
+        if let Some(filter) = &mut self.state.regime_filter {
+            filter.update(&self.config.grid, bar)?;
+        }
         runtime.observe_close(
             self.config.instrument_id,
             bar.ts_event.as_u64(),
             bar.close.as_decimal(),
         );
-        if previous == self.state.regime.snapshot.regime {
-            self.state.regime_confirmation_bars =
-                self.state.regime_confirmation_bars.saturating_add(1);
-        } else {
-            self.state.regime_confirmation_bars = 1;
+        if previous != self.regime() {
             log::info!(
                 "REGIME_CHANGED timestamp_ns={now} symbol={} from={previous:?} to={:?}",
                 self.config.instrument_id,
-                self.state.regime.snapshot.regime
+                self.regime()
             );
         }
         if stock_bar && let Some(grid) = &self.state.grid {
@@ -1551,13 +1686,7 @@ impl GridStrategyEngine {
                 atr,
             );
         }
-        let stock_gate = stock_adaptive
-            .then(|| {
-                self.state
-                    .stock
-                    .gate(&self.config.grid, now, bar.close.as_decimal())
-            })
-            .flatten();
+        let stock_gate = self.stock_gate(now, bar.close.as_decimal());
         let drive_result = if !self.config.tick_execution {
             self.drive(runtime, bar.close.as_decimal(), now)
         } else if self.state.last_price.is_none() {
@@ -1579,22 +1708,23 @@ impl GridStrategyEngine {
             Some(gate.reason().to_string())
         } else if !self.state.regime.snapshot.initialized {
             Some("SIGNAL_WARMUP".to_string())
-        } else if stock_adaptive
-            && self.state.regime_confirmation_bars < self.config.grid.regime_confirmation_bars
+        } else if self
+            .state
+            .regime_filter
+            .as_ref()
+            .is_some_and(|filter| !filter.source().initialized)
         {
+            Some("REGIME_WARMUP".to_string())
+        } else if !self.regime_confirmed() {
             Some("REGIME_CONFIRMATION".to_string())
-        } else if !is_fresh(
-            self.state.regime.snapshot.ts_ns,
-            now,
-            self.config.grid.max_signal_age_secs,
-        ) {
+        } else if !self.signal_ready(now) {
             Some("STALE_SIGNAL".to_string())
         } else if matches!(
-            self.state.regime.snapshot.regime,
+            self.regime(),
             MarketRegime::Disabled | MarketRegime::HighVolatility
         ) {
-            Some(format!("REGIME_{:?}", self.state.regime.snapshot.regime))
-        } else if self.state.regime.policy(&self.config.grid) == TrendPolicy::Disable {
+            Some(format!("REGIME_{:?}", self.regime()))
+        } else if self.regime().policy(&self.config.grid) == TrendPolicy::Disable {
             Some("TREND_POLICY_DISABLE".to_string())
         } else if self.state.reset_reason.is_some() {
             Some("RESET_RECONCILIATION".to_string())
@@ -1605,6 +1735,7 @@ impl GridStrategyEngine {
         report.diagnostics.observe_spacing(
             &self.config.grid,
             &self.state.regime,
+            self.state.regime_filter.as_ref(),
             bar.close.as_decimal(),
             self.state.grid.as_ref(),
         );
@@ -1612,7 +1743,8 @@ impl GridStrategyEngine {
             ObservationCount::record(&mut report.diagnostics.blocked_bars, &reason, now);
         }
         drop(report);
-        runtime.persist_engine(self, None)
+        // 外层 dispatch 在归还引擎并记录组合权益后统一落盘；订单提交/撤单前的持久化屏障不变。
+        Ok(())
     }
 
     pub(super) fn control(
@@ -1768,9 +1900,11 @@ impl GridStrategyEngine {
             }
             // 被拒绝的行情不能改变后续 TradeTick 使用的价差过滤状态。
             if self.config.grid.strategy_mode == StrategyMode::StockAdaptive {
-                self.state
-                    .stock
-                    .observe_quote(quote.bid_price.as_decimal(), quote.ask_price.as_decimal());
+                self.state.stock.observe_quote(
+                    quote.bid_price.as_decimal(),
+                    quote.ask_price.as_decimal(),
+                    quote.ts_event.as_u64(),
+                );
             }
             self.state.last_tick_event_ns = quote.ts_event.as_u64();
             self.drive(runtime, price, now)?;
@@ -1830,6 +1964,12 @@ impl GridStrategyEngine {
         ) {
             self.cancel(runtime, true, "STALE_MARK")?;
         }
+        if self.config.tick_execution
+            && self.config.grid.strategy_mode == StrategyMode::StockAdaptive
+            && let Some(gate) = self.state.stock.quote_gate(&self.config.grid, now)
+        {
+            self.cancel(runtime, true, gate.reason())?;
+        }
         Ok(())
     }
 
@@ -1837,16 +1977,23 @@ impl GridStrategyEngine {
         self.state
             .orders
             .timed_out(self.config.grid.order_timeout_secs, now)
-            || (!is_fresh(
+            || ((!is_fresh(
                 self.state.last_market_ns,
                 now,
                 self.config.grid.max_signal_age_secs,
-            ) && self
-                .state
-                .orders
-                .active_ids()
-                .iter()
-                .any(|id| self.state.orders.orders()[id].buy))
+            ) || (self.config.tick_execution
+                && self.config.grid.strategy_mode == StrategyMode::StockAdaptive
+                && self
+                    .state
+                    .stock
+                    .quote_gate(&self.config.grid, now)
+                    .is_some()))
+                && self
+                    .state
+                    .orders
+                    .active_ids()
+                    .iter()
+                    .any(|id| self.state.orders.orders()[id].buy))
     }
 
     pub(super) fn on_socket_state(

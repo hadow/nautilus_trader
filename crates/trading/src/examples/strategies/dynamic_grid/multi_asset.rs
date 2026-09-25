@@ -53,6 +53,7 @@ use super::{
     orders::{GridOrder, OrderPhase},
     portfolio::{InstrumentExposure, OrderDecision, PortfolioConfig, PortfolioRiskManager},
     regime::MarketRegime,
+    regime_filter::RegimeFilter,
     strategy::{DynamicGridConfig, GridState, GridStrategyEngine, StrategyState},
 };
 use crate::{
@@ -138,6 +139,7 @@ impl MultiAssetGridConfig {
         let mut total = Decimal::ZERO;
         for (id, instrument) in &self.instruments {
             instrument.grid.validate()?;
+            RegimeFilter::validate_bar_type(&instrument.grid, instrument.bar_type)?;
             anyhow::ensure!(
                 id.venue == venue && instrument.bar_type.instrument_id() == *id,
                 "Portfolio requires matching signal instruments on one account venue"
@@ -235,6 +237,24 @@ struct Checkpoint {
     instruments: BTreeMap<InstrumentId, InstrumentCheckpoint>,
     portfolio_risk: PortfolioRiskManager,
     portfolio_performance: PerformanceTracker,
+    orders: Vec<OrderAny>,
+    positions: Vec<Position>,
+}
+
+// 与读取格式保持一致；写盘借用策略账本和分析历史，不为每次 fsync 克隆全部历史。
+#[derive(Serialize)]
+struct InstrumentCheckpointRef<'a> {
+    state: &'a GridState,
+    performance: &'a RefCell<PerformanceTracker>,
+}
+
+#[derive(Serialize)]
+struct CheckpointRef<'a> {
+    version: u32,
+    config: &'a MultiAssetGridConfig,
+    instruments: BTreeMap<InstrumentId, InstrumentCheckpointRef<'a>>,
+    portfolio_risk: &'a PortfolioRiskManager,
+    portfolio_performance: &'a PerformanceTracker,
     orders: Vec<OrderAny>,
     positions: Vec<Position>,
 }
@@ -457,7 +477,7 @@ impl MultiAssetGridStrategy {
                     exposure,
                     pending: e.state.orders.buy_reservations(&e.config.grid, mark).1,
                     net_pnl: e.state.orders.cash + exposure - e.config.grid.capital,
-                    regime: e.state.regime.snapshot.regime,
+                    regime: e.regime(),
                     atr_pct: if mark > Decimal::ZERO {
                         Decimal::from_f64_retain(e.state.regime.snapshot.atr)
                             .unwrap_or(Decimal::ZERO)
@@ -520,6 +540,26 @@ impl MultiAssetGridStrategy {
             .balance_free(Some(instrument.quote_currency()))
             .ok_or_else(|| anyhow::anyhow!("Account cash unavailable"))?
             .as_decimal();
+        let overlap: Decimal = self
+            .engines
+            .values()
+            .filter(|e| e.config.instrument_id != current.config.instrument_id)
+            .chain(std::iter::once(current))
+            .map(|e| {
+                super::risk::reservation_overlap(
+                    &account,
+                    e.config.instrument_id,
+                    instrument.quote_currency(),
+                    e.state
+                        .orders
+                        .buy_reservations(
+                            &e.config.grid,
+                            e.state.last_price.unwrap_or(Decimal::ZERO),
+                        )
+                        .1,
+                )
+            })
+            .sum();
         let account_id = account.id();
         drop(account);
         drop(cache);
@@ -529,7 +569,7 @@ impl MultiAssetGridStrategy {
             .get(&instrument.quote_currency())
             .ok_or_else(|| anyhow::anyhow!("Account equity unavailable"))?
             .as_decimal();
-        Ok((free, equity))
+        Ok((free + overlap, equity))
     }
 
     pub(super) fn gate(
@@ -701,11 +741,11 @@ impl MultiAssetGridStrategy {
             .close(&self.config.portfolio, id, now, price);
     }
 
-    fn checkpoint(
-        &self,
-        current: Option<&GridStrategyEngine>,
+    fn checkpoint<'a>(
+        &'a self,
+        current: Option<&'a GridStrategyEngine>,
         pending: Option<&OrderAny>,
-    ) -> Checkpoint {
+    ) -> CheckpointRef<'a> {
         let mut orders = self.cache().orders(
             None,
             None,
@@ -728,19 +768,19 @@ impl MultiAssetGridStrategy {
             .map(|e| {
                 (
                     e.config.instrument_id,
-                    InstrumentCheckpoint {
-                        state: e.state.clone(),
-                        performance: e.report.borrow().clone(),
+                    InstrumentCheckpointRef {
+                        state: &e.state,
+                        performance: &e.report,
                     },
                 )
             })
             .collect();
-        Checkpoint {
+        CheckpointRef {
             version: 6,
-            config: self.config.clone(),
+            config: &self.config,
             instruments,
-            portfolio_risk: self.portfolio_risk.clone(),
-            portfolio_performance: self.portfolio_performance.clone(),
+            portfolio_risk: &self.portfolio_risk,
+            portfolio_performance: &self.portfolio_performance,
             orders,
             positions: self.cache().positions_open(
                 None,
@@ -1422,10 +1462,8 @@ impl Checkpoint {
         let mut ids = BTreeSet::new();
         for (id, saved) in &self.instruments {
             saved.state.orders.validate()?;
-            saved
-                .state
-                .regime
-                .validate(&expected.instruments[id].grid)?;
+            let config = &expected.instruments[id];
+            saved.state.validate_signal(&config.grid, config.bar_type)?;
             anyhow::ensure!(
                 saved.state.completed_cycles <= saved.state.orders.cycles.len(),
                 "Invalid cycle cursor"

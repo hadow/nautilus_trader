@@ -32,6 +32,8 @@ use super::{
     engine::{GridEngine, spacing},
     portfolio::{PortfolioConfig, PortfolioRiskManager},
     regime::{MarketRegime, Observation, RegimeDetector, RegimeSnapshot},
+    regime_filter::RegimeFilter,
+    stock::StockMarketState,
 };
 
 const DAY_NS: u64 = 86_400_000_000_000;
@@ -167,7 +169,7 @@ pub struct GridSelectionMetrics {
     pub gap_share: f64,
     /// 四项等权分数：往返次数、非方向性、成本余量、库存路径质量。
     pub score_components: [f64; 4],
-    /// 生产信号周期的 ATR/ADX 等状态；不把日线 ATR 偷换成分钟 ATR。
+    /// 分类周期快照：股票模式为 15 分钟，LegacyDgt 为原信号周期；间距仍使用分钟 ATR。
     pub regime: RegimeSnapshot,
 }
 
@@ -435,7 +437,14 @@ fn assess(
         "INSUFFICIENT_DOLLAR_VOLUME"
     );
     let mut detector = RegimeDetector::default();
-    for bar in signal {
+    let mut filter = RegimeFilter::enabled(&input.grid).then(RegimeFilter::default);
+    if filter.is_some() {
+        RegimeFilter::validate_bar_type(&input.grid, last.bar_type)?;
+    }
+    for bar in &signal {
+        if filter.is_some() && !StockMarketState::is_regular_session_bar(bar.ts_event.as_u64()) {
+            continue;
+        }
         detector.update(
             &input.grid,
             Observation {
@@ -445,9 +454,27 @@ fn assess(
                 close: bar.close.as_f64(),
             },
         )?;
+        if let Some(filter) = &mut filter {
+            filter.update(&input.grid, bar)?;
+        }
     }
     anyhow::ensure!(detector.snapshot.initialized, "INDICATOR_WARMUP");
-    let multiplier = if detector.policy(&input.grid) == TrendPolicy::WiderGrid {
+    let regime = if let Some(filter) = &filter {
+        anyhow::ensure!(
+            filter.ready(&input.grid, &detector.snapshot, last.ts_event.as_u64())
+                && filter.entry_confirmed(),
+            "REGIME_CONFIRMATION_WARMUP"
+        );
+        let mut snapshot = filter.source().clone();
+        snapshot.regime = filter.regime(&input.grid, &detector.snapshot);
+        if snapshot.regime != filter.source().regime {
+            snapshot.reason = Some("EFFECTIVE_REGIME_OVERRIDE".to_string());
+        }
+        snapshot
+    } else {
+        detector.snapshot.clone()
+    };
+    let multiplier = if regime.regime.policy(&input.grid) == TrendPolicy::WiderGrid {
         input.grid.trend_spacing_multiplier
     } else {
         Decimal::ONE
@@ -543,7 +570,7 @@ fn assess(
         maximum_drawdown,
         gap_share,
         score_components: components,
-        regime: detector.snapshot,
+        regime,
     })
 }
 
@@ -720,6 +747,43 @@ mod tests {
         };
         let rejected = select_grid_candidates(&config, &[input], now).unwrap();
         assert_eq!(rejected.ranked[0].reasons, ["GRID_DISABLED_BY_COST"]);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn candidate_scoring_requires_completed_stock_regime_confirmation(#[case] ready: bool) {
+        let (mut input, now) = input("A");
+        input.grid.strategy_mode = super::super::config::StrategyMode::StockAdaptive;
+        let open = 1_735_828_200_000_000_000_u64;
+        let signal_type = input.signal_bars[0].bar_type;
+        input.signal_bars = (1..=390)
+            .map(|minute| bar(signal_type, 100, open + minute * 60_000_000_000))
+            .collect();
+        if ready {
+            input.signal_bars.extend(
+                (1..=240)
+                    .map(|minute| bar(signal_type, 100, open + DAY_NS + minute * 60_000_000_000)),
+            );
+        }
+        let shift = input.signal_bars.last().unwrap().ts_event.as_u64() - now;
+        for bar in &mut input.daily_bars {
+            bar.ts_event = (bar.ts_event.as_u64() + shift).into();
+            bar.ts_init = bar.ts_event;
+        }
+        let now = now + shift;
+        input.quote.as_mut().unwrap().ts_event = now.into();
+        input.quote.as_mut().unwrap().ts_init = now.into();
+        let report =
+            select_grid_candidates(&GridSelectionConfig::default(), &[input], now).unwrap();
+        if ready {
+            let metrics = report.ranked[0].metrics.as_ref().unwrap();
+            assert_eq!(metrics.regime.regime, MarketRegime::Range);
+            assert_eq!(metrics.regime.ts_ns, now);
+            assert_eq!(metrics.effective_spacing, dec!(0.02));
+        } else {
+            assert_eq!(report.ranked[0].reasons, ["REGIME_CONFIRMATION_WARMUP"]);
+        }
     }
 
     #[rstest]

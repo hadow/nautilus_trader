@@ -15,6 +15,11 @@
 
 //! 纳入账户容量的最坏情形资金预留，以及触发后保持锁定的亏损限制。
 
+use nautilus_model::{
+    accounts::{Account, AccountAny},
+    identifiers::InstrumentId,
+    types::Currency,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +33,39 @@ fn unknown_daily_resets() -> u32 {
     u32::MAX
 }
 
+/// 仅抵扣可证明已计入 free 的原生订单冻结；券商汇总冻结额可能含结算款，不能猜测释放。
+pub(super) fn reservation_overlap(
+    account: &AccountAny,
+    instrument: InstrumentId,
+    currency: Currency,
+    pending: Decimal,
+) -> Decimal {
+    let AccountAny::Cash(cash) = account else {
+        return Decimal::ZERO;
+    };
+    if !cash.calculate_account_state {
+        return Decimal::ZERO;
+    }
+    let total: Decimal = cash
+        .balances_locked
+        .iter()
+        .filter(|((_, c), _)| *c == currency)
+        .map(|(_, money)| money.as_decimal())
+        .sum();
+    if account
+        .balance_locked(Some(currency))
+        .map(|money| money.as_decimal())
+        != Some(total)
+    {
+        return Decimal::ZERO;
+    }
+    cash.balances_locked
+        .get(&(instrument, currency))
+        .map_or(Decimal::ZERO, |money| {
+            money.as_decimal().min(pending).max(Decimal::ZERO)
+        })
+}
+
 /// 当前策略与券商账户的按市值计价容量，不包含任何假设成交。
 #[derive(Clone, Debug, Default)]
 pub struct RiskSnapshot {
@@ -37,7 +75,7 @@ pub struct RiskSnapshot {
     pub cash: Decimal,
     /// 券商账户按市值计价权益，用于约束单标的分配。
     pub account_equity: Decimal,
-    /// 券商可用现金，不包含已被券商冻结的资金。
+    /// 可用现金加已验证的本标的原生订单冻结；之后统一扣除本地预留，避免双扣。
     pub account_free: Decimal,
     /// 实际多头持仓数量。
     pub position: Decimal,

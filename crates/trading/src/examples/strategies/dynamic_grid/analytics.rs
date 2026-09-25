@@ -146,7 +146,7 @@ pub struct GridMetrics {
     /// 归属于未卖库存的按市值盈亏，包含其剩余入场成本。
     #[serde(default)]
     pub unrealized_pnl: Decimal,
-    /// 常规交易时段开盘跳空造成的按市值盈亏。
+    /// 开盘价差乘上一时段最后观测库存的归因盈亏；不是与净盈亏相加的独立现金流。
     #[serde(default)]
     pub gap_pnl: Decimal,
     /// 常规交易时段开盘跳空中亏损部分的绝对值。

@@ -30,6 +30,8 @@ pub mod selection;
 pub mod stock;
 pub mod strategy;
 
+mod regime_filter;
+
 pub use multi_asset::{
     InstrumentConfig, MultiAssetGridConfig, MultiAssetGridStrategy,
     MultiAssetGridStrategy as DynamicGridStrategy, PortfolioReport,

@@ -1,6 +1,6 @@
 {
   "grid_template": "../../../backtest/examples/instuments/AAPL.json",
-  "signal_history_bars": 400,
+  "signal_history_bars": 1000,
   "selection": {
     "lookback_sessions": 60,
     "max_candidates": 5,

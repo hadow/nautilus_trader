@@ -230,27 +230,28 @@ Monte Carlo 固定 seed：
 
 `grid: {}` 使用保守默认值；未知字段拒绝解析；Decimal 建议使用字符串。
 
-| 参数 | 默认 |
-| --- | --- |
-| grid_levels / position_sizing | 10 每侧 / Equal |
-| spacing_mode / atr_period / atr_multiplier | Atr / 14 / 0.75 |
-| strategy_mode / core_target_pct / grid_max_pct | LegacyDgt / 0.40 / 0.60 |
-| min_spacing_pct / max_spacing_pct | 0.005 / 0.03 |
-| capital / capital_allocation | 100000 / 0.20 |
-| max_position / max_position_pct | 1000 股 / 0.20 |
-| max_notional / max_grid_exposure | 20000 / 20000 |
-| max_asset_ratio / max_capital_utilization / reserve_capital | 0.20 / 0.50 / 0.50 |
-| max_drawdown / max_daily_loss / max_unrealized_loss | 0.10 / 0.03 / 0.08 |
-| max_consecutive_resets / max_orders / max_grid_levels | 5 / 40 / 30 |
-| minimum_reset_distance / minimum_reset_interval_secs | 0.01 / 300 |
-| breakout_confirmation_bars / regime_confirmation_bars | 2 / 3 |
-| adx_range_max / adx_trend_min | 20 / 25 |
-| trend_up_policy / trend_down_policy | ReduceGrid / Disable |
-| enable_dynamic_reset / enable_trend_filter / enable_volatility_filter | true / true / true |
-| initial_inventory_fraction / risk_policy | 0 / Hold |
-| regular_session_only / max_gap_pct / gap_recovery_bars | true / 0.08 / 5 |
-| maker_fee / taker_fee / commission / slippage | 0.0008 / 0.001 / 0 / 0.0005 |
-| minimum_profit_margin / order_timeout_secs / max_signal_age_secs | 0.0005 / 30 / 180 |
+| 参数                                                                  | 默认                        |
+| --------------------------------------------------------------------- | --------------------------- |
+| grid_levels / position_sizing                                         | 10 每侧 / Equal             |
+| spacing_mode / atr_period / atr_multiplier                            | Atr / 14 / 0.75             |
+| strategy_mode / core_target_pct / grid_max_pct                        | LegacyDgt / 0.40 / 0.60     |
+| min_spacing_pct / max_spacing_pct                                     | 0.005 / 0.03                |
+| capital / capital_allocation                                          | 100000 / 0.20               |
+| max_position / max_position_pct                                       | 1000 股 / 0.20              |
+| max_notional / max_grid_exposure                                      | 20000 / 20000               |
+| max_asset_ratio / max_capital_utilization / reserve_capital           | 0.20 / 0.50 / 0.50          |
+| max_drawdown / max_daily_loss / max_unrealized_loss                   | 0.10 / 0.03 / 0.08          |
+| max_consecutive_resets / max_orders / max_grid_levels                 | 5 / 40 / 30                 |
+| minimum_reset_distance / minimum_reset_interval_secs                  | 0.01 / 300                  |
+| breakout_confirmation_bars / regime_confirmation_bars                 | 2 / 8                       |
+| regime_bar_minutes                                                    | 15（StockAdaptive 固定）    |
+| adx_range_max / adx_trend_min                                         | 20 / 25                     |
+| trend_up_policy / trend_down_policy                                   | ReduceGrid / Disable        |
+| enable_dynamic_reset / enable_trend_filter / enable_volatility_filter | true / true / true          |
+| initial_inventory_fraction / risk_policy                              | 0 / Hold                    |
+| regular_session_only / max_gap_pct / gap_recovery_bars                | true / 0.08 / 5             |
+| maker_fee / taker_fee / commission / slippage                         | 0.0008 / 0.001 / 0 / 0.0005 |
+| minimum_profit_margin / order_timeout_secs / max_signal_age_secs      | 0.0005 / 30 / 180           |
 
 其余指标阈值、周期与验证规则见 config.rs。默认费率不是当前 Longbridge 费率的承诺。
 默认 USD、AAPL 整股和固定 tick；用户应核对标的、交易时段、账户币种、预算与真实费表。
@@ -339,22 +340,22 @@ Paper/Sandbox 配置只读验证均已通过；错误的 Paper --run --live 组�
 2025-01-02 至 2025-03-31，60 个完整交易日、23400 根 1 分钟 Bar，初始 USD 100000；seed=42。
 文件：reports/dynamic-grid-aapl-2025-q1.json，包含完整权益曲线、cycle 和执行假设。
 
-| 指标 | Buy & Hold | Traditional Fixed | Dynamic |
-| --- | ---: | ---: | ---: |
-| Total Return | -10.63218% | -0.69796% | +0.04582% |
-| CAGR | -37.20880% | -2.85793% | +0.18982% |
-| MDD | 16.45218% | 0.74293% | 0.39392% |
-| Sharpe | -1.5073 | -2.2954 | 0.2834 |
-| Sortino | -1.8941 | -2.4246 | 0.4236 |
-| Fees (USD) | 99.78 | 44.52 | 9.38 |
-| Signed slippage (USD) | 8.04 | -29.28 | -25.92 |
-| Net PnL (USD) | -10632.18 | -697.96 | 45.82 |
-| 平均资金利用率 | 99.8664% | 3.9749% | 1.9327% |
-| Capital efficiency | -10.6464% | -17.5592% | 2.3708% |
-| 最大库存敞口 (USD) | 100399.50 | 14307.84 | 5813.52 |
-| 最大股数 | 402 | 64 | 24 |
-| 交易执行次数 / 完整 cycles | 1 / 0 | 28 / 14 | 6 / 3 |
-| 最大回撤持续时间 (秒) | 4331820 | 7187460 | 2007060 |
+| 指标                       | Buy & Hold | Traditional Fixed | Dynamic   |
+| -------------------------- | ---------- | ----------------- | --------- |
+| Total Return               | -10.63218% | -0.69796%         | +0.04582% |
+| CAGR                       | -37.20880% | -2.85793%         | +0.18982% |
+| MDD                        | 16.45218%  | 0.74293%          | 0.39392%  |
+| Sharpe                     | -1.5073    | -2.2954           | 0.2834    |
+| Sortino                    | -1.8941    | -2.4246           | 0.4236    |
+| Fees (USD)                 | 99.78      | 44.52             | 9.38      |
+| Signed slippage (USD)      | 8.04       | -29.28            | -25.92    |
+| Net PnL (USD)              | -10632.18  | -697.96           | 45.82     |
+| 平均资金利用率             | 99.8664%   | 3.9749%           | 1.9327%   |
+| Capital efficiency         | -10.6464%  | -17.5592%         | 2.3708%   |
+| 最大库存敞口 (USD)         | 100399.50  | 14307.84          | 5813.52   |
+| 最大股数                   | 402        | 64                | 24        |
+| 交易执行次数 / 完整 cycles | 1 / 0      | 28 / 14           | 6 / 3     |
+| 最大回撤持续时间 (秒)      | 4331820    | 7187460           | 2007060   |
 
 动态策略最终触发 Maximum consecutive resets；不是持续整个季度正常开仓。
 三个 cycles 的胜率 100%、平均净收益 USD 15.27，不足以评价胜率或稳定性。
@@ -369,11 +370,11 @@ USD 45.82 净收益中含 USD 25.92 的模型价格改善；必须在真实 Tick
 
 1000 次、seed=42、ruin 阈值为初始权益的 50%：
 
-| 方法 | MDD 5% / 50% / 95% | Return 5% / 50% / 95% | 亏损比例 | ruin 比例 |
-| --- | --- | --- | ---: | ---: |
-| Trade Shuffle | 0 / 0 / 0 | 0.08188% / 0.08188% / 0.08188% | 0% | 0% |
-| Return Shuffle | 0.08337% / 0.12717% / 0.17928% | -0.04922% / -0.04922% / -0.04922% | 100% | 0% |
-| Return Bootstrap | 0.04676% / 0.11836% / 0.27929% | -0.25608% / -0.03959% / 0.14533% | 64.6% | 0% |
+| 方法             | MDD 5% / 50% / 95%             | Return 5% / 50% / 95%             | 亏损比例 | ruin 比例 |
+| ---------------- | ------------------------------ | --------------------------------- | -------- | --------- |
+| Trade Shuffle    | 0 / 0 / 0                      | 0.08188% / 0.08188% / 0.08188%    | 0%       | 0%        |
+| Return Shuffle   | 0.08337% / 0.12717% / 0.17928% | -0.04922% / -0.04922% / -0.04922% | 100%     | 0%        |
+| Return Bootstrap | 0.04676% / 0.11836% / 0.27929% | -0.25608% / -0.03959% / 0.14533%  | 64.6%    | 0%        |
 
 Trade Shuffle 的乐观结果遗漏了未售库存，而 marked-return 方法包含它，二者反差是重要风险提示。
 0% ruin 只是低敞口、稀疏样本在这个阈值下的模拟结果，不是未来破产概率为零。

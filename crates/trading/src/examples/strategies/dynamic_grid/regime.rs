@@ -68,6 +68,9 @@ pub struct RegimeSnapshot {
     pub initialized: bool,
     /// 当前市场状态分类。
     pub regime: MarketRegime,
+    /// 首个决定分类的条件；旧检查点缺失时保持 None，不虚构历史归因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// 以价格单位表示的 ATR。
     pub atr: f64,
     /// 取值范围为 0–100 的 ADX。
@@ -118,7 +121,11 @@ impl RegimeDetector {
         anyhow::ensure!(
             actual.ts_ns == expected.ts_ns
                 && actual.initialized == expected.initialized
-                && actual.regime == expected.regime,
+                && actual.regime == expected.regime
+                && actual
+                    .reason
+                    .as_ref()
+                    .is_none_or(|reason| Some(reason) == expected.reason.as_ref()),
             "Recovered regime metadata differs from completed observations"
         );
         for (a, b) in [
@@ -142,22 +149,7 @@ impl RegimeDetector {
     /// 对未完成订单和新订单意图应用同一套趋势限制。
     #[must_use]
     pub fn permits_order(&self, config: &GridConfig, buy: bool, level: i32) -> bool {
-        let policy = self.policy(config);
-        if buy && policy == TrendPolicy::Disable {
-            return false;
-        }
-        let up = self.snapshot.regime == MarketRegime::TrendUp;
-        let down = self.snapshot.regime == MarketRegime::TrendDown;
-        if up && !buy && policy == TrendPolicy::LongOnly {
-            return false;
-        }
-        // ReduceGrid 限制的是逆趋势方向：上涨时减少卖出层，下跌时减少买入层
-        if policy == TrendPolicy::ReduceGrid && ((up && !buy) || (down && buy)) {
-            let levels = config.grid_levels;
-            return Decimal::from(level.unsigned_abs())
-                <= (Decimal::from(levels as u64) * config.trend_level_fraction).ceil();
-        }
-        true
+        self.snapshot.regime.permits_order(config, buy, level)
     }
 
     /// 只接受时间戳严格递增的已完成 K 线。
@@ -263,6 +255,7 @@ impl RegimeDetector {
             ts_ns: bar.ts_ns,
             initialized,
             regime: MarketRegime::Disabled,
+            reason: None,
             atr: atr.value,
             adx: adx.value,
             bollinger_width: width,
@@ -275,40 +268,10 @@ impl RegimeDetector {
             },
             realized_volatility: volatility,
         };
-        // 波动率先于趋势过滤，无法明确归类的行情保持 Disabled，不能当作震荡市
-        if initialized {
-            snapshot.regime = if config.enable_volatility_filter
-                && (atr.value / bar.close > config.atr_pct_max
-                    || volatility > config.realized_volatility_max
-                    || width > config.bollinger_width_max)
-            {
-                MarketRegime::HighVolatility
-            } else if config.enable_volatility_filter && atr.value / bar.close < config.atr_pct_min
-            {
-                MarketRegime::LowVolatility
-            } else if !config.enable_trend_filter {
-                MarketRegime::Range
-            } else if adx.value >= config.adx_trend_min
-                && slope > config.ma_slope_threshold
-                && (!config.require_price_ma_confirmation
-                    || snapshot.price_ma_distance > config.price_ma_confirmation_pct)
-            {
-                MarketRegime::TrendUp
-            } else if adx.value >= config.adx_trend_min
-                && slope < -config.ma_slope_threshold
-                && (!config.require_price_ma_confirmation
-                    || snapshot.price_ma_distance < -config.price_ma_confirmation_pct)
-            {
-                MarketRegime::TrendDown
-            } else if adx.value <= config.adx_range_max
-                && slope.abs() <= config.ma_slope_threshold
-                && (bb.lower..=bb.upper).contains(&bar.close)
-            {
-                MarketRegime::Range
-            } else {
-                MarketRegime::Disabled
-            };
-        }
+        // 判定与归因共用同一入口，不在报告层另写一套近似分类器
+        let (regime, reason) = classify(config, &snapshot, bar.close, bb.lower, bb.upper);
+        snapshot.regime = regime;
+        snapshot.reason = Some(reason.to_string());
         self.snapshot = snapshot;
         Ok(&self.snapshot)
     }
@@ -316,17 +279,216 @@ impl RegimeDetector {
     /// 最近一次信号对应的实际趋势策略。
     #[must_use]
     pub fn policy(&self, config: &GridConfig) -> TrendPolicy {
-        match self.snapshot.regime {
-            MarketRegime::TrendUp => config.trend_up_policy,
-            MarketRegime::TrendDown => config.trend_down_policy,
-            MarketRegime::Range => TrendPolicy::Continue,
+        self.snapshot.regime.policy(config)
+    }
+}
+
+impl MarketRegime {
+    pub(super) fn policy(self, config: &GridConfig) -> TrendPolicy {
+        match self {
+            Self::TrendUp => config.trend_up_policy,
+            Self::TrendDown => config.trend_down_policy,
+            Self::Range => TrendPolicy::Continue,
             _ => TrendPolicy::Disable,
         }
     }
+
+    pub(super) fn permits_order(self, config: &GridConfig, buy: bool, level: i32) -> bool {
+        let policy = self.policy(config);
+        if buy && policy == TrendPolicy::Disable {
+            return false;
+        }
+        let up = self == Self::TrendUp;
+        let down = self == Self::TrendDown;
+        if up && !buy && policy == TrendPolicy::LongOnly {
+            return false;
+        }
+        // 原始分类与确认状态复用相同订单政策，避免只修新买单而遗漏撤单/覆盖卖出。
+        if policy == TrendPolicy::ReduceGrid && ((up && !buy) || (down && buy)) {
+            return Decimal::from(level.unsigned_abs())
+                <= (Decimal::from(config.grid_levels as u64) * config.trend_level_fraction).ceil();
+        }
+        true
+    }
+}
+
+// 保持原判定优先级；Disabled 只是未分类，不应在研究中全部当作“危险行情”
+fn classify(
+    config: &GridConfig,
+    signal: &RegimeSnapshot,
+    close: f64,
+    lower: f64,
+    upper: f64,
+) -> (MarketRegime, &'static str) {
+    if !signal.initialized {
+        return (MarketRegime::Disabled, "WARMUP");
+    }
+    if config.enable_volatility_filter {
+        if signal.atr / close > config.atr_pct_max {
+            return (MarketRegime::HighVolatility, "HIGH_ATR");
+        }
+        if signal.realized_volatility > config.realized_volatility_max {
+            return (MarketRegime::HighVolatility, "HIGH_REALIZED_VOLATILITY");
+        }
+        if signal.bollinger_width > config.bollinger_width_max {
+            return (MarketRegime::HighVolatility, "WIDE_BOLLINGER_BANDS");
+        }
+        if signal.atr / close < config.atr_pct_min {
+            return (MarketRegime::LowVolatility, "LOW_ATR");
+        }
+    }
+    if !config.enable_trend_filter {
+        return (MarketRegime::Range, "TREND_FILTER_DISABLED");
+    }
+    if signal.adx >= config.adx_trend_min {
+        let up = signal.ma_slope > config.ma_slope_threshold;
+        let down = signal.ma_slope < -config.ma_slope_threshold;
+        if !up && !down {
+            return (MarketRegime::Disabled, "TREND_SLOPE_TOO_SMALL");
+        }
+        let confirmed = if up {
+            signal.price_ma_distance > config.price_ma_confirmation_pct
+        } else {
+            signal.price_ma_distance < -config.price_ma_confirmation_pct
+        };
+        if config.require_price_ma_confirmation && !confirmed {
+            return (MarketRegime::Disabled, "PRICE_MA_CONFLICT");
+        }
+        return if up {
+            (MarketRegime::TrendUp, "TREND_UP")
+        } else {
+            (MarketRegime::TrendDown, "TREND_DOWN")
+        };
+    }
+    if signal.adx.is_nan() || signal.adx > config.adx_range_max {
+        return (MarketRegime::Disabled, "ADX_TRANSITION");
+    }
+    if signal.ma_slope.is_nan() || signal.ma_slope.abs() > config.ma_slope_threshold {
+        return (MarketRegime::Disabled, "RANGE_SLOPE_TOO_LARGE");
+    }
+    if !(lower..=upper).contains(&close) {
+        return (MarketRegime::Disabled, "OUTSIDE_BOLLINGER_BANDS");
+    }
+    (MarketRegime::Range, "RANGE")
 }
 
 // 使用完整纳秒年龄，避免整秒截断多放行近一秒；未来时间戳也不能作为当前信号
 pub(super) fn is_fresh(ts_ns: u64, now: u64, max_age_secs: u64) -> bool {
     now.checked_sub(ts_ns)
         .is_some_and(|age| Duration::from_nanos(age) <= Duration::from_secs(max_age_secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(20.0, 0.001, 100.0, MarketRegime::Range, "RANGE")]
+    #[case(21.0, 0.0, 100.0, MarketRegime::Disabled, "ADX_TRANSITION")]
+    #[case(24.99, 0.002, 100.0, MarketRegime::Disabled, "ADX_TRANSITION")]
+    #[case(25.0, 0.001, 100.0, MarketRegime::Disabled, "TREND_SLOPE_TOO_SMALL")]
+    #[case(30.0, -0.0002, 100.0, MarketRegime::Disabled, "TREND_SLOPE_TOO_SMALL")]
+    #[case(25.0, 0.0011, 100.0, MarketRegime::TrendUp, "TREND_UP")]
+    #[case(25.0, -0.0011, 100.0, MarketRegime::TrendDown, "TREND_DOWN")]
+    #[case(20.0, 0.0011, 100.0, MarketRegime::Disabled, "RANGE_SLOPE_TOO_LARGE")]
+    #[case(20.0, 0.0, 98.0, MarketRegime::Disabled, "OUTSIDE_BOLLINGER_BANDS")]
+    fn regime_research_classification_boundaries(
+        #[case] adx: f64,
+        #[case] slope: f64,
+        #[case] close: f64,
+        #[case] expected: MarketRegime,
+        #[case] reason: &str,
+    ) {
+        let signal = RegimeSnapshot {
+            initialized: true,
+            atr: 0.2,
+            adx,
+            ma_slope: slope,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&GridConfig::default(), &signal, close, 99.0, 101.0),
+            (expected, reason)
+        );
+    }
+
+    #[rstest]
+    fn regime_research_volatility_and_price_confirmation_remain_independent() {
+        let config = GridConfig {
+            require_price_ma_confirmation: true,
+            ..Default::default()
+        };
+        let mut signal = RegimeSnapshot {
+            initialized: true,
+            atr: 0.2,
+            adx: 30.0,
+            ma_slope: -0.002,
+            price_ma_distance: 0.001,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&config, &signal, 100.0, 99.0, 101.0),
+            (MarketRegime::Disabled, "PRICE_MA_CONFLICT")
+        );
+        signal.atr = 6.0;
+        assert_eq!(
+            classify(&config, &signal, 100.0, 99.0, 101.0),
+            (MarketRegime::HighVolatility, "HIGH_ATR")
+        );
+        signal.initialized = false;
+        assert_eq!(
+            classify(&config, &signal, 100.0, 99.0, 101.0),
+            (MarketRegime::Disabled, "WARMUP")
+        );
+    }
+
+    #[rstest]
+    fn regime_research_diagnostics_preserve_recovery_and_do_not_change_decisions() {
+        use rust_decimal_macros::dec;
+
+        use super::super::diagnostics::GridDiagnostics;
+
+        let config = GridConfig::default();
+        let mut detector = RegimeDetector::default();
+        let mut diagnostics = GridDiagnostics::default();
+        for ts_ns in 1..=200 {
+            detector
+                .update(
+                    &config,
+                    Observation {
+                        ts_ns,
+                        high: 100.1,
+                        low: 99.9,
+                        close: 100.0,
+                    },
+                )
+                .unwrap();
+            let before = serde_json::to_value(&detector).unwrap();
+            diagnostics.observe_spacing(&config, &detector, None, dec!(100), None);
+            assert_eq!(before, serde_json::to_value(&detector).unwrap());
+        }
+        let recorded = diagnostics.spacing.last().unwrap().regime.as_ref().unwrap();
+        assert_eq!(recorded.ts_ns, detector.snapshot.ts_ns);
+        assert_eq!(recorded.reason.as_deref(), Some("RANGE"));
+        let mut legacy = serde_json::to_value(&detector).unwrap();
+        legacy["snapshot"].as_object_mut().unwrap().remove("reason");
+        let mut restored: RegimeDetector = serde_json::from_value(legacy).unwrap();
+        restored.validate(&config).unwrap();
+        let next = Observation {
+            ts_ns: 201,
+            high: 100.2,
+            low: 100.0,
+            close: 100.1,
+        };
+        detector.update(&config, next).unwrap();
+        restored.update(&config, next).unwrap();
+        assert_eq!(
+            serde_json::to_value(&detector).unwrap(),
+            serde_json::to_value(&restored).unwrap()
+        );
+        restored.snapshot.reason = Some("FORGED".to_string());
+        assert!(restored.validate(&config).is_err());
+    }
 }

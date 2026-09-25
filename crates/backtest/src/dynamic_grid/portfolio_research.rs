@@ -210,7 +210,7 @@ pub struct PortfolioResearchReport {
 /// Runs train → validation → frozen test using complete configurations and one native account.
 ///
 /// Candidates may vary allocations, grids and risk, but not data, capital, costs or execution seeds.
-/// Every partition starts flat and warms up causally within that partition; no future data is used.
+/// Every partition starts flat and warms indicators from its own completed bars.
 ///
 /// # Errors
 ///

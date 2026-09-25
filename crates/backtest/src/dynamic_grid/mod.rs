@@ -115,7 +115,7 @@ pub struct GridBacktestConfig {
     pub random_seed: u64,
     /// Probability of a one-tick adverse fill, where the matching engine permits it.
     pub slippage_probability: f64,
-    /// Inclusive start timestamp, applied before warm-up and decisions.
+    /// Inclusive replay start; portfolio daily-regime warmup uses strictly earlier source bars.
     pub start_ns: Option<u64>,
     /// Exclusive end timestamp.
     pub end_ns: Option<u64>,
@@ -366,6 +366,10 @@ pub fn run_grid_backtest(
                 }
                 Benchmark::Fixed => {
                     strategy_config.grid.strategy_mode = StrategyMode::LegacyDgt;
+                    set_strategy_mode_preserving_atr_spacing(
+                        &mut strategy_config.grid,
+                        StrategyMode::LegacyDgt,
+                    )?;
                     strategy_config.grid.enable_dynamic_reset = false;
                     strategy_config.grid.spacing_mode = SpacingMode::Percentage;
                     strategy_config.grid.enable_trend_filter = false;

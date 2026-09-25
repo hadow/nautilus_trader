@@ -158,8 +158,10 @@ pub struct GridConfig {
     pub minimum_reset_atr_multiple: Decimal,
     /// 股票自适应模式重置前，要求连续收在网格外的已完成 K 线数。
     pub breakout_confirmation_bars: u32,
-    /// 股票自适应模式恢复入场前，市场状态需连续稳定的已完成 K 线数。
+    /// 股票方案固定 8 根完整分类 Bar 确认；显式保留用于配置与检查点审计。
     pub regime_confirmation_bars: u32,
+    /// 股票方案固定 15 分钟，从常规时段一分钟 Bar 聚合；不改变分钟 ATR 与硬风控。
+    pub regime_bar_minutes: usize,
     /// 两次网格重置之间的最短秒数。
     pub minimum_reset_interval_secs: u64,
     /// 触发波动率重置所需的相对间距变化。
@@ -200,7 +202,8 @@ pub struct GridConfig {
     pub adx_range_max: f64,
     /// 趋势市场要求的 ADX 下限。
     pub adx_trend_min: f64,
-    /// 单根 K 线归一化均线斜率的绝对阈值。
+    /// 原信号 Bar 的均线比例斜率阈值；慢分类按 `regime_bar_minutes` 换算。
+    /// 15 分钟层若要每根 0.1%，此处填写 `0.001 / 15`；不改变 ATR 或指标窗口。
     pub ma_slope_threshold: f64,
     /// 允许创建网格所需的最小 ATR/价格。
     pub atr_pct_min: f64,
@@ -284,7 +287,8 @@ impl Default for GridConfig {
             minimum_reset_distance: Decimal::new(1, 2),
             minimum_reset_atr_multiple: Decimal::ZERO,
             breakout_confirmation_bars: 2,
-            regime_confirmation_bars: 3,
+            regime_confirmation_bars: 8,
+            regime_bar_minutes: 15,
             minimum_reset_interval_secs: 300,
             volatility_reset_ratio: Decimal::new(5, 1),
             enable_dynamic_reset: true,
@@ -337,6 +341,13 @@ impl GridConfig {
     ///
     /// 周期无效、信号参数非有限值，或风险/成本边界相互矛盾时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.strategy_mode != StrategyMode::StockAdaptive
+                || (self.regular_session_only
+                    && self.regime_bar_minutes == 15
+                    && self.regime_confirmation_bars == 8),
+            "StockAdaptive requires regular sessions, 15-minute regime bars and 8 confirmations"
+        );
         anyhow::ensure!(
             self.grid_levels > 0
                 && self.grid_levels <= self.max_grid_levels
@@ -459,6 +470,7 @@ impl GridConfig {
             self.adx_range_max,
             self.adx_trend_min,
             self.ma_slope_threshold,
+            self.ma_slope_threshold * self.regime_bar_minutes as f64,
             self.price_ma_confirmation_pct,
             self.atr_pct_min,
             self.atr_pct_max,
@@ -506,6 +518,39 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    #[case(15, 8, true)]
+    #[case(1, 8, false)]
+    #[case(5, 8, false)]
+    #[case(30, 8, false)]
+    #[case(15, 3, false)]
+    #[case(15, 5, false)]
+    fn stock_regime_is_frozen_at_fifteen_minutes_and_eight_closes(
+        #[case] minutes: usize,
+        #[case] confirmations: u32,
+        #[case] valid: bool,
+    ) {
+        let config = GridConfig {
+            strategy_mode: StrategyMode::StockAdaptive,
+            regime_bar_minutes: minutes,
+            regime_confirmation_bars: confirmations,
+            ..Default::default()
+        };
+        assert_eq!(config.validate().is_ok(), valid);
+    }
+
+    #[rstest]
+    #[case("daily_regime", serde_json::json!(null))]
+    #[case("confirm_regime_changes", serde_json::json!(false))]
+    fn retired_regime_configuration_is_not_silently_ignored(
+        #[case] field: &str,
+        #[case] value: serde_json::Value,
+    ) {
+        let mut document = serde_json::to_value(GridConfig::default()).unwrap();
+        document[field] = value;
+        assert!(serde_json::from_value::<GridConfig>(document).is_err());
+    }
 
     #[rstest]
     fn gap_simplification_reads_but_does_not_write_retired_atr_threshold() {

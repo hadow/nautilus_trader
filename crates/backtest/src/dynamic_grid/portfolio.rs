@@ -140,6 +140,10 @@ pub fn portfolio_benchmark_config(
             }
             PortfolioBenchmark::Fixed => {
                 asset.strategy.grid.strategy_mode = StrategyMode::LegacyDgt;
+                set_strategy_mode_preserving_atr_spacing(
+                    &mut asset.strategy.grid,
+                    StrategyMode::LegacyDgt,
+                )?;
                 asset.strategy.grid.enable_dynamic_reset = false;
             }
             PortfolioBenchmark::Dynamic | PortfolioBenchmark::EqualWeightBuyHold => {}

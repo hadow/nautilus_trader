@@ -53,7 +53,7 @@ pub struct GridInstrumentFile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GridPortfolioFile {
-    /// 以 InstrumentId 为键的多标的配置，而非单一全局 symbol。
+    /// 以 `InstrumentId` 为键的多标的配置，而非单一全局 symbol。
     pub instruments: BTreeMap<InstrumentId, GridInstrumentFile>,
     /// 共享组合风险与初始资金配置。
     pub portfolio: PortfolioConfig,

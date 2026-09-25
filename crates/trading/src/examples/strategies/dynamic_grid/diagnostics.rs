@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use super::{
     config::{GridConfig, TrendPolicy},
     engine::{GridEngine, spacing_components},
-    regime::RegimeDetector,
+    regime::{MarketRegime, RegimeDetector, RegimeSnapshot},
+    regime_filter::RegimeFilter,
 };
 
 /// 随既有报告与检查点保存的单标的诊断数据，不构成第二套交易账本。
@@ -85,6 +86,15 @@ impl ObservationCount {
 /// 有意将前瞻候选间距与当前网格冻结间距分开记录。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpacingObservation {
+    /// 与本根间距观测同时可知的完整分类输入；旧报告缺失时为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime: Option<RegimeSnapshot>,
+    /// 实验启用后实际用于仓位/订单决策的状态，可能不同于原始分钟分类。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_regime: Option<MarketRegime>,
+    /// 分类源刚收盘时才记录其原始指标，未收盘桶不产生观测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regime_source: Option<RegimeSnapshot>,
     /// 已完成信号 K 线时间戳。
     pub ts_ns: u64,
     /// 该时刻已经可知的 ATR，不包含未来 K 线。
@@ -157,6 +167,7 @@ impl GridDiagnostics {
         &mut self,
         config: &GridConfig,
         regime: &RegimeDetector,
+        filter: Option<&RegimeFilter>,
         price: Decimal,
         grid: Option<&GridEngine>,
     ) {
@@ -164,16 +175,24 @@ impl GridDiagnostics {
         if !signal.initialized {
             return;
         }
-        let multiplier = if regime.policy(config) == TrendPolicy::WiderGrid {
-            config.trend_spacing_multiplier
-        } else {
-            Decimal::ONE
-        };
+        let decision = filter.map(|filter| filter.regime(config, signal));
+        let multiplier =
+            if decision.unwrap_or(signal.regime).policy(config) == TrendPolicy::WiderGrid {
+                config.trend_spacing_multiplier
+            } else {
+                Decimal::ONE
+            };
         // 与执行层共用计算函数；这里只观察已完成 K 线，不改变冻结网格或传播诊断错误。
         if let Some(atr) = Decimal::from_f64_retain(signal.atr)
             && let Ok((raw, effective)) = spacing_components(config, atr, price, multiplier)
         {
             self.spacing.push(SpacingObservation {
+                regime: Some(signal.clone()),
+                decision_regime: decision,
+                regime_source: filter
+                    .map(RegimeFilter::source)
+                    .filter(|source| source.ts_ns == signal.ts_ns)
+                    .cloned(),
                 ts_ns: signal.ts_ns,
                 atr,
                 price,

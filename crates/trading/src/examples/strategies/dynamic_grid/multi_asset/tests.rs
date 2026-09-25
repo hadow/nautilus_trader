@@ -39,6 +39,193 @@ use rust_decimal_macros::dec;
 use super::{DynamicGridConfig, GridStrategyEngine, MultiAssetGridStrategy};
 
 #[rstest]
+#[case::native_locks(true, dec!(100000))]
+#[case::broker_snapshot(false, dec!(94000))]
+fn cash_capacity_only_credits_proven_native_reservations(
+    #[case] calculate: bool,
+    #[case] expected: Decimal,
+) {
+    use super::super::engine::GridEngine;
+
+    let (runtime, mut engine, cache) = runtime(1);
+    let grid = GridEngine::build(
+        &engine.config.grid,
+        1,
+        dec!(100),
+        dec!(0.02),
+        dec!(10000),
+        dec!(0.01),
+        dec!(1),
+        0,
+    )
+    .unwrap();
+    engine.state.last_price = Some(dec!(100));
+    engine
+        .state
+        .orders
+        .entry("cash-test", 1, &grid.levels[0], dec!(70), None, 1)
+        .unwrap();
+    let mut account = CashAccount::new(account_event(dec!(100000), dec!(0), 1), calculate, false);
+    account.update_balance_locked(engine.config.instrument_id, Money::from("6000 USD"));
+    cache
+        .borrow_mut()
+        .update_account_owned(AccountAny::Cash(account))
+        .unwrap();
+
+    assert_eq!(
+        engine.snapshot(&runtime, dec!(100)).unwrap().account_free,
+        expected
+    );
+    assert_eq!(runtime.account_capacity(&engine).unwrap().0, expected);
+}
+
+#[rstest]
+fn regime_clocks_are_independent_and_recover_through_native_bar_routing() {
+    use nautilus_common::actor::DataActor;
+    use nautilus_model::data::Bar;
+
+    use super::super::{
+        config::StrategyMode,
+        regime::{Observation, RegimeDetector},
+    };
+
+    let (mut runtime, original, cache) = runtime(1);
+    let aapl = original.config.instrument_id;
+    let msft = InstrumentId::from("MSFT.SIM");
+    let mut second = runtime.config.instruments[&aapl].clone();
+    second.bar_type = "MSFT.SIM-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+    runtime.config.instruments.insert(msft, second);
+    for (id, c) in &mut runtime.config.instruments {
+        c.capital_allocation = dec!(0.4);
+        c.grid.strategy_mode = StrategyMode::StockAdaptive;
+        let mut config = DynamicGridConfig::new(*id, c.bar_type);
+        config.grid = c.grid.clone();
+        config.grid.capital = runtime.config.portfolio.capital * c.capital_allocation;
+        let mut engine = GridStrategyEngine::new(config);
+        let instrument = InstrumentAny::Equity(
+            Equity::builder()
+                .instrument_id(*id)
+                .raw_symbol(Symbol::from(id.symbol.as_str()))
+                .currency(Currency::USD())
+                .price_precision(2)
+                .price_increment(Price::from("0.01"))
+                .lot_size(Quantity::from(1))
+                .ts_event(0.into())
+                .ts_init(0.into())
+                .build()
+                .unwrap(),
+        );
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        engine.instrument = Some(instrument);
+        runtime.engines.insert(*id, engine);
+    }
+    runtime.config.validate().unwrap();
+    let open = 1_735_828_200_000_000_000_u64;
+    let mut fast = RegimeDetector::default();
+    for minute in 1..=44_u64 {
+        let now = open + minute * 60_000_000_000;
+        runtime
+            .core
+            .clock_mut()
+            .as_any_mut()
+            .downcast_mut::<TestClock>()
+            .unwrap()
+            .advance_time(now.into(), true);
+        for id in [aapl, msft] {
+            // MSFT 故意只收到第一桶，不能借 AAPL 的分钟事件推进它的慢时钟。
+            if id == msft && minute > 15 {
+                continue;
+            }
+            let price = if id == aapl { "100.00" } else { "200.00" };
+            let bar = Bar::new(
+                runtime.config.instruments[&id].bar_type,
+                Price::from(price),
+                Price::from(price),
+                Price::from(price),
+                Price::from(price),
+                Quantity::from(100),
+                now.into(),
+                now.into(),
+            );
+            runtime.on_bar(&bar).unwrap();
+            if id == aapl {
+                fast.update(
+                    &runtime.config.instruments[&id].grid,
+                    Observation {
+                        ts_ns: now,
+                        high: 100.0,
+                        low: 100.0,
+                        close: 100.0,
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&fast).unwrap(),
+                    serde_json::to_value(&runtime.engines[&id].state.regime).unwrap()
+                );
+                let before = serde_json::to_value(&runtime.engines[&id].state).unwrap();
+                runtime.on_bar(&bar).unwrap();
+                assert_eq!(
+                    before,
+                    serde_json::to_value(&runtime.engines[&id].state).unwrap()
+                );
+            }
+        }
+    }
+    for (id, minute) in [(aapl, 30), (msft, 15)] {
+        let engine = &runtime.engines[&id];
+        engine
+            .state
+            .validate_signal(&engine.config.grid, engine.config.bar_type)
+            .unwrap();
+        assert_eq!(
+            engine.state.regime_filter.as_ref().unwrap().source().ts_ns,
+            open + minute * 60_000_000_000
+        );
+    }
+    let checkpoint = runtime.checkpoint(None, None);
+    let checkpoint: super::Checkpoint =
+        serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    checkpoint.validate(&runtime.config).unwrap();
+    let mut restored = MultiAssetGridStrategy::new(runtime.config.clone()).unwrap();
+    restored.on_load(runtime.on_save().unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&runtime.engines[&aapl].state).unwrap(),
+        serde_json::to_value(&restored.engines[&aapl].state).unwrap()
+    );
+    let mut corrupt = checkpoint;
+    corrupt
+        .instruments
+        .get_mut(&aapl)
+        .unwrap()
+        .state
+        .regime_filter = None;
+    assert!(corrupt.validate(&runtime.config).is_err());
+}
+
+#[rstest]
+fn regime_research_defaults_restore_old_checkpoints_without_enabling_new_behavior() {
+    let (runtime, _, _) = runtime(1);
+    let mut document = serde_json::to_value(runtime.checkpoint(None, None)).unwrap();
+    let grid = document["config"]["instruments"]["AAPL.SIM"]["grid"]
+        .as_object_mut()
+        .unwrap();
+    grid.remove("regime_bar_minutes");
+    grid.remove("regime_confirmation_bars");
+    let saved: super::Checkpoint = serde_json::from_value(document).unwrap();
+    saved.validate(&runtime.config).unwrap();
+    assert!(
+        saved.instruments[&InstrumentId::from("AAPL.SIM")]
+            .state
+            .regime_filter
+            .is_none()
+    );
+}
+
+#[rstest]
 fn gap_simplification_restores_old_config_without_loosening_active_limits() {
     let (runtime, _, _) = runtime(1);
     let mut document = serde_json::to_value(runtime.checkpoint(None, None)).unwrap();
@@ -116,7 +303,7 @@ fn review_rejected_quote_cannot_change_spread_gate(#[case] offset: i64, #[case] 
     engine.config.tick_execution = true;
     engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
     engine.state.last_tick_event_ns = now;
-    engine.state.stock.observe_quote(dec!(99), dec!(101));
+    engine.state.stock.observe_quote(dec!(99), dec!(101), now);
     let quote = QuoteTick::new(
         engine.config.instrument_id,
         Price::from("99.99"),
@@ -134,7 +321,11 @@ fn review_rejected_quote_cannot_change_spread_gate(#[case] offset: i64, #[case] 
 }
 
 #[rstest]
-fn review_target_reduction_replaces_distant_take_profit_only_after_cancel() {
+#[case::reduce_filled_inventory(false)]
+#[case::trim_pending_buys_only(true)]
+fn review_target_reduction_replaces_distant_take_profit_only_after_cancel(
+    #[case] pending_only: bool,
+) {
     use nautilus_common::{
         messages::execution::TradingCommand,
         msgbus::{self, TypedIntoHandler, switchboard::MessagingSwitchboard},
@@ -159,7 +350,6 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel() {
     let (mut runtime, mut engine, cache) = runtime(1);
     runtime.recovering = false;
     engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
-    engine.config.grid.regular_session_only = false;
     engine.state.state = super::StrategyState::GridActive;
     engine.state.regime.snapshot.initialized = true;
     engine.state.regime.snapshot.regime = MarketRegime::TrendDown;
@@ -228,6 +418,55 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel() {
         .borrow_mut()
         .add_order(order, None, None, false)
         .unwrap();
+    let mut buys = Vec::new();
+    if pending_only {
+        engine.state.regime.snapshot.regime = MarketRegime::Range;
+        engine.config.grid.capital_allocation = dec!(0.017);
+        for (index, qty) in [(2, 3), (4, 5)] {
+            let buy = engine
+                .state
+                .orders
+                .entry(
+                    "901-AAPL.SIM",
+                    1,
+                    &grid.levels[index],
+                    Decimal::from(qty),
+                    None,
+                    1,
+                )
+                .unwrap();
+            engine
+                .state
+                .orders
+                .transition(&buy.id, OrderPhase::Accepted, 1);
+            let buy_id = ClientOrderId::from(buy.id.as_str());
+            let mut native = OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(engine.config.instrument_id)
+                .strategy_id(StrategyId::from("DYNAMIC-GRID-901"))
+                .client_order_id(buy_id)
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from(qty))
+                .price(Price::from_decimal_dp(buy.reference, 2).unwrap())
+                .build();
+            native
+                .apply(OrderEventAny::Accepted(
+                    OrderAcceptedSpec::builder()
+                        .instrument_id(engine.config.instrument_id)
+                        .strategy_id(StrategyId::from("DYNAMIC-GRID-901"))
+                        .client_order_id(buy_id)
+                        .venue_order_id(nautilus_model::identifiers::VenueOrderId::from(
+                            buy.id.as_str(),
+                        ))
+                        .build(),
+                ))
+                .unwrap();
+            cache
+                .borrow_mut()
+                .add_order(native, None, None, false)
+                .unwrap();
+            buys.push(buy);
+        }
+    }
     let commands = Rc::new(RefCell::new(Vec::new()));
     let received = Rc::clone(&commands);
     msgbus::register_trading_command_endpoint(
@@ -235,6 +474,32 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel() {
         TypedIntoHandler::from(move |command: TradingCommand| received.borrow_mut().push(command)),
     );
     engine.drive(&mut runtime, dec!(100), 1).unwrap();
+    if pending_only {
+        assert_eq!(engine.state.position_target.grid, dec!(10));
+        assert_eq!(
+            engine.state.orders.orders()[&sell.id].phase,
+            OrderPhase::Accepted
+        );
+        assert_eq!(
+            engine.state.orders.orders()[&buys[0].id].phase,
+            OrderPhase::Accepted
+        );
+        assert_eq!(
+            engine.state.orders.orders()[&buys[1].id].phase,
+            OrderPhase::CancelPending
+        );
+        assert_eq!(commands.borrow().len(), 1);
+        engine.drive(&mut runtime, dec!(100), 1).unwrap();
+        assert_eq!(commands.borrow().len(), 1);
+        assert_eq!(
+            engine
+                .state
+                .orders
+                .component_reservations(PositionComponent::Grid),
+            (dec!(8), dec!(5))
+        );
+        return;
+    }
     assert_eq!(
         engine.state.orders.orders()[&sell.id].phase,
         OrderPhase::CancelPending
@@ -297,6 +562,308 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel() {
 }
 
 #[rstest]
+#[case::core_only(false)]
+#[case::core_and_grid(true)]
+fn flatten_covers_core_and_grid_without_duplicating_partial_exits(#[case] mixed: bool) {
+    use nautilus_common::{
+        messages::execution::TradingCommand,
+        msgbus::{self, TypedIntoHandler, switchboard::MessagingSwitchboard},
+    };
+
+    use super::super::{
+        engine::GridEngine,
+        orders::{OrderPhase, PositionComponent},
+    };
+
+    let (mut runtime, mut engine, _) = runtime(1);
+    runtime.recovering = false;
+    let grid = GridEngine::build(
+        &engine.config.grid,
+        1,
+        dec!(100),
+        dec!(0.02),
+        dec!(10000),
+        dec!(0.01),
+        dec!(1),
+        0,
+    )
+    .unwrap();
+    engine.state.last_price = Some(dec!(90));
+    for component in [PositionComponent::Core, PositionComponent::Grid] {
+        if component == PositionComponent::Grid && !mixed {
+            continue;
+        }
+        let mut level = grid.levels[0].clone();
+        if component == PositionComponent::Core {
+            level.level_index = 0;
+        }
+        let order = engine
+            .state
+            .orders
+            .entry_component("901-AAPL.SIM", 1, &level, dec!(8), None, component, 0)
+            .unwrap();
+        engine
+            .state
+            .orders
+            .fill(&order.id, "buy", dec!(8), dec!(98), dec!(0), false, 0)
+            .unwrap();
+    }
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let received = Rc::clone(&commands);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::risk_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: TradingCommand| received.borrow_mut().push(command)),
+    );
+    engine.exits(&mut runtime, 1, true).unwrap();
+    let exits: Vec<_> = engine
+        .state
+        .orders
+        .orders()
+        .values()
+        .filter(|order| !order.buy)
+        .cloned()
+        .collect();
+    assert_eq!(exits.len(), if mixed { 2 } else { 1 });
+    assert!(exits.iter().all(|order| order.limit.is_none()));
+    for order in &exits {
+        engine
+            .state
+            .orders
+            .fill(&order.id, "partial", dec!(3), dec!(90), dec!(0), false, 2)
+            .unwrap();
+        engine
+            .state
+            .orders
+            .transition(&order.id, OrderPhase::CancelPending, 2);
+    }
+    engine.exits(&mut runtime, 3, true).unwrap();
+    assert_eq!(
+        engine
+            .state
+            .orders
+            .orders()
+            .values()
+            .filter(|order| !order.buy)
+            .count(),
+        exits.len()
+    );
+    assert_eq!(commands.borrow().len(), exits.len());
+    for order in &exits {
+        engine
+            .state
+            .orders
+            .fill(&order.id, "rest", dec!(5), dec!(90), dec!(0), false, 4)
+            .unwrap();
+    }
+    assert_eq!(engine.state.orders.inventory(), Decimal::ZERO);
+}
+
+#[rstest]
+#[case::bar_budget(false)]
+#[case::tick_requires_quote(true)]
+fn stock_grid_plan_uses_the_position_target_budget(#[case] tick_execution: bool) {
+    use nautilus_model::data::Bar;
+
+    use super::super::{
+        config::StrategyMode,
+        regime_filter::{RegimeFilter, observation},
+    };
+    let (mut runtime, mut engine, _) = runtime(1);
+    runtime.recovering = false;
+    engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
+    engine.config.tick_execution = tick_execution;
+    engine.config.grid.regular_session_only = true;
+    engine.config.grid.minimum_average_dollar_volume = Decimal::ZERO;
+    engine.config.grid.core_target_pct = Decimal::ZERO;
+    engine.config.grid.grid_max_pct = Decimal::ONE;
+    engine.config.grid.initial_inventory_fraction = Decimal::ZERO;
+    engine.state.state = super::StrategyState::WaitingForRange;
+    engine.config.grid.atr_period = 2;
+    engine.config.grid.adx_period = 2;
+    engine.config.grid.ma_period = 2;
+    engine.config.grid.slope_period = 2;
+    engine.config.grid.volatility_period = 2;
+    engine.config.grid.enable_trend_filter = false;
+    engine.config.grid.enable_volatility_filter = false;
+    let mut filter = RegimeFilter::default();
+    let mut now = 0;
+    for minute in 1..=375 {
+        now = 1_735_828_200_000_000_000 + minute * 60_000_000_000;
+        let bar = Bar::new(
+            engine.config.bar_type,
+            Price::from("100"),
+            Price::from("101"),
+            Price::from("99"),
+            Price::from("100"),
+            Quantity::from(1000),
+            now.into(),
+            now.into(),
+        );
+        filter.update(&engine.config.grid, &bar).unwrap();
+        engine
+            .state
+            .regime
+            .update(&engine.config.grid, observation(&bar))
+            .unwrap();
+    }
+    engine.state.regime_filter = Some(filter);
+    // 与生产 with_engine 一致：当前引擎执行期间从组合映射临时移出。
+    runtime.engines.remove(&engine.config.instrument_id);
+    runtime
+        .core
+        .clock_mut()
+        .as_any_mut()
+        .downcast_mut::<TestClock>()
+        .unwrap()
+        .advance_time(now.into(), true);
+    engine.drive(&mut runtime, dec!(100), now).unwrap();
+    if tick_execution {
+        assert!(
+            engine.state.orders.active_ids().is_empty(),
+            "Trade-only marks cannot establish executable spread"
+        );
+        return;
+    }
+    let grid = engine.state.grid.as_ref().unwrap();
+    let planned: Decimal = grid.levels.iter().map(|level| level.quantity).sum();
+    assert!(planned > Decimal::ZERO);
+    assert!(
+        planned <= engine.state.position_target.grid,
+        "Plan {planned} exceeds target {:?}",
+        engine.state.position_target
+    );
+}
+
+#[rstest]
+#[case::opening_buy(true)]
+#[case::opening_sell(false)]
+fn gap_pnl_uses_inventory_observed_before_the_open(#[case] opening_buy: bool) {
+    use nautilus_model::data::Bar;
+
+    use super::super::{config::StrategyMode, engine::GridEngine};
+    let (mut runtime, mut engine, _) = runtime(1);
+    let grid = GridEngine::build(
+        &engine.config.grid,
+        1,
+        dec!(100),
+        dec!(0.02),
+        dec!(10000),
+        dec!(0.01),
+        dec!(1),
+        0,
+    )
+    .unwrap();
+    let entry = engine
+        .state
+        .orders
+        .entry("gap", 1, &grid.levels[0], dec!(5), None, 0)
+        .unwrap();
+    engine
+        .state
+        .orders
+        .fill(&entry.id, "old", dec!(5), dec!(100), dec!(0), false, 0)
+        .unwrap();
+    engine.config.grid.strategy_mode = StrategyMode::StockAdaptive;
+    let close_ns = 1_735_851_600_000_000_000_u64;
+    for (ts, price) in [(close_ns, "100"), (close_ns + 63_060_000_000_000, "90")] {
+        if ts != close_ns {
+            let order = if opening_buy {
+                engine
+                    .state
+                    .orders
+                    .entry("gap", 1, &grid.levels[2], dec!(5), None, ts)
+                    .unwrap()
+            } else {
+                engine
+                    .state
+                    .orders
+                    .exit("gap", &entry.id, Some(dec!(90)), ts)
+                    .unwrap()
+            };
+            engine
+                .state
+                .orders
+                .fill(&order.id, "open", dec!(5), dec!(90), dec!(0), false, ts)
+                .unwrap();
+        }
+        runtime
+            .core
+            .clock_mut()
+            .as_any_mut()
+            .downcast_mut::<TestClock>()
+            .unwrap()
+            .advance_time(ts.into(), true);
+        let bar = Bar::new(
+            engine.config.bar_type,
+            Price::from(price),
+            Price::from(price),
+            Price::from(price),
+            Price::from(price),
+            Quantity::from(1000),
+            ts.into(),
+            ts.into(),
+        );
+        engine.on_bar(&mut runtime, &bar).unwrap();
+    }
+    assert_eq!(engine.report.borrow().metrics.gap_pnl, dec!(-50));
+    assert_eq!(engine.report.borrow().metrics.gap_loss, dec!(50));
+}
+
+#[rstest]
+fn bar_checkpoint_contains_both_instrument_and_portfolio_observations() {
+    use nautilus_common::actor::DataActor;
+    use nautilus_model::data::Bar;
+    let (mut runtime, engine, _) = runtime(1);
+    runtime
+        .engines
+        .get_mut(&engine.config.instrument_id)
+        .unwrap()
+        .instrument = engine.instrument.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("grid.json");
+    runtime.config.state_path = Some(path.clone());
+    let now = 1_735_828_260_000_000_000_u64;
+    runtime
+        .core
+        .clock_mut()
+        .as_any_mut()
+        .downcast_mut::<TestClock>()
+        .unwrap()
+        .advance_time(now.into(), true);
+    let bar = Bar::new(
+        engine.config.bar_type,
+        Price::from("100"),
+        Price::from("100"),
+        Price::from("100"),
+        Price::from("100"),
+        Quantity::from(1000),
+        now.into(),
+        now.into(),
+    );
+    runtime.on_bar(&bar).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let saved: super::Checkpoint = serde_json::from_slice(&bytes).unwrap();
+    saved.validate(&runtime.config).unwrap();
+    assert_eq!(
+        saved.instruments[&engine.config.instrument_id]
+            .performance
+            .equity
+            .last()
+            .unwrap()
+            .ts_ns,
+        now
+    );
+    assert_eq!(
+        saved.portfolio_performance.equity.last().unwrap().ts_ns,
+        now
+    );
+    assert_eq!(
+        serde_json::to_value(&saved).unwrap(),
+        serde_json::to_value(runtime.checkpoint(None, None)).unwrap()
+    );
+}
+
+#[rstest]
 fn recovery_checks_exact_grid_geometry_against_native_instrument() {
     use super::super::engine::GridEngine;
 
@@ -348,6 +915,10 @@ fn checkpoint_restores_geometry_and_rejects_corrupt_levels() {
     let saved = runtime.checkpoint(None, None);
     let recovered: super::Checkpoint =
         serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&saved).unwrap(),
+        serde_json::to_value(&recovered).unwrap()
+    );
     recovered.validate(&runtime.config).unwrap();
     for mutation in ["index", "duplicate", "quantity"] {
         let mut corrupt = recovered.clone();

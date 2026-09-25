@@ -144,7 +144,13 @@ impl GridEngine {
                     buy > Decimal::ZERO && sell > buy,
                     "Grid levels collapse at instrument tick size"
                 );
-                let quantity = floor_tick(allocation * fraction / buy, lot);
+                // 股票目标是按当前价定义的总股数；低价层不能把同一目标预算换成更多计划股数。
+                let reference = if config.strategy_mode == StrategyMode::StockAdaptive {
+                    center.max(buy)
+                } else {
+                    buy
+                };
+                let quantity = floor_tick(allocation * fraction / reference, lot);
                 levels.push(GridLevel {
                     level_index: index,
                     price: buy,
