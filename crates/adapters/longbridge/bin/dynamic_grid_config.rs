@@ -55,6 +55,12 @@ pub(super) struct AppConfig {
     /// Explicit per-share cash commission for the local simulator, not a broker fee quote.
     #[serde(default)]
     pub(super) sandbox_fee_per_share: Option<Decimal>,
+    /// 显式隔离整个标的：仅估值和计入组合风险，不认领、交易或自动平仓。
+    #[serde(default)]
+    pub(super) isolated_instruments: BTreeSet<InstrumentId>,
+    /// 仅模拟账户可豁免冻结资金归因门禁，不增加可用现金或跳过其他对账。
+    #[serde(default)]
+    pub(super) paper_allow_unattributed_frozen_cash: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -153,6 +159,10 @@ impl AppConfig {
 
     pub(super) fn strategy(&self) -> anyhow::Result<MultiAssetGridConfig> {
         anyhow::ensure!(
+            !self.paper_allow_unattributed_frozen_cash || self.mode == Mode::Paper,
+            "paper_allow_unattributed_frozen_cash requires mode=Paper"
+        );
+        anyhow::ensure!(
             self.report_path != self.state_path
                 && self.report_path != self.state_path.with_extension("lock")
                 && self.report_path != self.state_path.with_extension("next"),
@@ -179,7 +189,11 @@ impl AppConfig {
         let first = *self.instruments.keys().next().expect("Nonempty universe");
         let mut base =
             DynamicGridConfig::new(first, self.instruments[&first].strategy.bar_type).base;
-        base.external_order_claims = Some(self.instruments.keys().copied().collect());
+        // 有隔离持仓时不做按标的盲目认领；检查点恢复的原生订单已自带策略归属。
+        base.external_order_claims = self
+            .isolated_instruments
+            .is_empty()
+            .then(|| self.instruments.keys().copied().collect());
         let mut instruments: BTreeMap<_, _> = self
             .instruments
             .iter()
@@ -198,6 +212,7 @@ impl AppConfig {
                 "{:?}:{}:{}",
                 self.mode, self.trader_id, self.account_id
             )),
+            isolated_instruments: self.isolated_instruments.clone(),
         };
         config.validate()?;
         Ok(config)

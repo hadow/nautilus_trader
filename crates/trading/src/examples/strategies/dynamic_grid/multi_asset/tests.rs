@@ -38,6 +38,240 @@ use rust_decimal_macros::dec;
 
 use super::{DynamicGridConfig, GridStrategyEngine, MultiAssetGridStrategy};
 
+#[path = "entry_tests.rs"]
+mod entries;
+
+fn isolated_runtime() -> (MultiAssetGridStrategy, Rc<RefCell<Cache>>, InstrumentId) {
+    let (original, engine, cache) = runtime(1);
+    let id = InstrumentId::from("MSFT.SIM");
+    let mut config = original.config.clone();
+    let mut external = config.instruments[&engine.config.instrument_id].clone();
+    external.bar_type = "MSFT.SIM-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+    external.capital_allocation = dec!(0.4);
+    external.sector = Some("Technology".into());
+    config
+        .instruments
+        .get_mut(&engine.config.instrument_id)
+        .unwrap()
+        .capital_allocation = dec!(0.4);
+    config
+        .instruments
+        .get_mut(&engine.config.instrument_id)
+        .unwrap()
+        .sector = external.sector.clone();
+    config.instruments.insert(id, external);
+    config.isolated_instruments.insert(id);
+    let instrument = InstrumentAny::Equity(
+        Equity::builder()
+            .instrument_id(id)
+            .raw_symbol(Symbol::from("MSFT"))
+            .currency(Currency::USD())
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .lot_size(Quantity::from(1))
+            .ts_event(0.into())
+            .ts_init(0.into())
+            .build()
+            .unwrap(),
+    );
+    cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let fill = OrderFilledSpec::builder()
+        .instrument_id(id)
+        .strategy_id(StrategyId::from("EXTERNAL"))
+        .account_id(AccountId::from("SIM-001"))
+        .position_id(PositionId::from("MSFT.SIM-EXTERNAL"))
+        .order_side(OrderSide::Buy)
+        .last_qty(Quantity::from(200))
+        .last_px(Price::from("80.00"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_position(&Position::new(&instrument, fill), OmsType::Netting)
+        .unwrap();
+    let mut strategy = MultiAssetGridStrategy::new(config).unwrap();
+    strategy.core = original.core;
+    strategy.core.clock_mut().register_default_handler(
+        nautilus_common::timer::TimeEventCallback::from(|_: nautilus_common::timer::TimeEvent| {}),
+    );
+    (strategy, cache, id)
+}
+
+fn external_quote(
+    strategy: &mut MultiAssetGridStrategy,
+    cache: &Rc<RefCell<Cache>>,
+    id: InstrumentId,
+    price: &str,
+    ts: u64,
+) {
+    use nautilus_common::actor::DataActor;
+    use nautilus_model::data::QuoteTick;
+    let quote = QuoteTick::new(
+        id,
+        Price::from(price),
+        Price::from(price),
+        Quantity::from(10),
+        Quantity::from(10),
+        ts.into(),
+        ts.into(),
+    );
+    strategy
+        .core
+        .clock_mut()
+        .as_any_mut()
+        .downcast_mut::<TestClock>()
+        .unwrap()
+        .advance_time(ts.into(), true);
+    cache.borrow_mut().add_quote(quote).unwrap();
+    strategy.on_quote(&quote).unwrap();
+}
+
+#[rstest]
+fn isolated_inventory_is_risk_only_and_never_generates_orders() {
+    use nautilus_common::{
+        actor::DataActor,
+        messages::execution::TradingCommand,
+        msgbus::{self, TypedIntoHandler, switchboard::MessagingSwitchboard},
+    };
+    let (mut strategy, cache, id) = isolated_runtime();
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let received = Rc::clone(&commands);
+    msgbus::register_trading_command_endpoint(
+        MessagingSwitchboard::risk_engine_queue_execute(),
+        TypedIntoHandler::from(move |command: TradingCommand| received.borrow_mut().push(command)),
+    );
+    strategy.on_start().unwrap();
+    assert!(!strategy.external_ready(1));
+    external_quote(&mut strategy, &cache, id, "100.00", 100_000_000_000);
+    let views = strategy.exposures(None);
+    let external = views.iter().find(|v| v.id == id).unwrap();
+    assert_eq!(external.exposure, dec!(20000));
+    assert_eq!(external.net_pnl, dec!(0)); // 旧持仓成本 80，不是本策略启动风险基线。
+    assert!(!strategy.engines.contains_key(&id));
+    assert!(strategy.external_ready(100_000_000_000));
+    assert!(!strategy.external_ready(1_000_000_000_000));
+    external_quote(&mut strategy, &cache, id, "90.00", 101_000_000_000);
+    assert_eq!(strategy.portfolio_risk.last_equity, dec!(98000));
+    assert_eq!(
+        strategy.portfolio_performance.equity.last().unwrap().equity,
+        dec!(100000)
+    );
+    strategy.kill_switch("test isolation").unwrap();
+    strategy.on_stop().unwrap();
+    assert!(commands.borrow().is_empty());
+    assert_eq!(
+        cache
+            .borrow()
+            .positions_open(None, Some(&id), None, None, None)[0]
+            .quantity
+            .as_decimal(),
+        dec!(200)
+    );
+    assert!(strategy.report.borrow().instruments.get(&id).is_none());
+    assert!(
+        cache
+            .borrow()
+            .orders(None, None, None, None, None)
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[case::total("total")]
+#[case::sector("sector")]
+#[case::correlation("correlation")]
+fn isolated_inventory_consumes_shared_risk_capacity(#[case] limit: &str) {
+    use nautilus_common::actor::DataActor;
+    let (mut strategy, cache, id) = isolated_runtime();
+    match limit {
+        "total" => strategy.config.portfolio.max_total_exposure = dec!(0.21),
+        "sector" => strategy.config.portfolio.max_sector_exposure = dec!(0.21),
+        _ => strategy.config.portfolio.max_correlated_exposure = dec!(0.21),
+    }
+    strategy.on_start().unwrap();
+    external_quote(&mut strategy, &cache, id, "100.00", 100_000_000_000);
+    let tradable = InstrumentId::from("AAPL.SIM");
+    let allowed = strategy
+        .with_engine(tradable, |engine, runtime| {
+            runtime.buy_quantity(engine, dec!(100), dec!(100), Some(dec!(100)), false)
+        })
+        .unwrap();
+    assert!(allowed > dec!(0) && allowed <= dec!(10));
+    let views = strategy.exposures(None);
+    assert_eq!(views.iter().map(|v| v.cash_delta).sum::<Decimal>(), dec!(0));
+}
+
+#[rstest]
+fn isolated_checkpoint_keeps_baseline_but_requires_new_prices_and_matching_broker_quantity() {
+    use nautilus_common::actor::DataActor;
+    let (mut strategy, cache, id) = isolated_runtime();
+    strategy.on_start().unwrap();
+    external_quote(&mut strategy, &cache, id, "100.00", 100_000_000_000);
+    external_quote(&mut strategy, &cache, id, "200.00", 101_000_000_000);
+    let saved = strategy.on_save().unwrap();
+    let (mut restored, restored_cache, _) = isolated_runtime();
+    restored.on_load(saved.clone()).unwrap();
+    restored.on_start().unwrap();
+    assert!(!restored.external_ready(100_000_000_000));
+    assert_eq!(restored.portfolio_risk.last_equity, dec!(120000));
+    assert!(restored.portfolio_risk.risk_off_reason.is_none());
+    assert_eq!(
+        restored.external_positions[&id].reference_price,
+        Some(dec!(100))
+    );
+    assert_eq!(restored.external_positions[&id].quantity, dec!(200));
+    let mut position = restored_cache
+        .borrow()
+        .positions_open(None, Some(&id), None, None, None)[0]
+        .clone();
+    position.apply(
+        &OrderFilledSpec::builder()
+            .instrument_id(id)
+            .strategy_id(StrategyId::from("EXTERNAL"))
+            .account_id(AccountId::from("SIM-001"))
+            .position_id(position.id)
+            .trade_id(nautilus_model::identifiers::TradeId::from("MANUAL-CHANGE"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from("100.00"))
+            .build(),
+    );
+    restored_cache
+        .borrow_mut()
+        .update_position(&position)
+        .unwrap();
+    assert!(
+        restored
+            .on_start()
+            .unwrap_err()
+            .to_string()
+            .contains("Isolated inventory changed")
+    );
+    let engine = restored.engines.values().next().unwrap();
+    assert!(restored.account_capacity(engine).is_err());
+    let mut changed_config = strategy.config.clone();
+    changed_config.isolated_instruments.clear();
+    let mut changed = MultiAssetGridStrategy::new(changed_config).unwrap();
+    assert!(changed.on_load(saved).is_err()); // 不允许重启时静默接管原隔离库存。
+}
+
+#[rstest]
+fn isolated_config_rejects_claims_unknown_symbols_and_empty_tradable_universe() {
+    let (strategy, _, id) = isolated_runtime();
+    let mut config = strategy.config.clone();
+    config.base.external_order_claims = Some(vec![id]);
+    assert!(config.validate().is_err());
+    config.base.external_order_claims = None;
+    config
+        .isolated_instruments
+        .insert(InstrumentId::from("UNKNOWN.SIM"));
+    assert!(config.validate().is_err());
+    config.isolated_instruments = config.instruments.keys().copied().collect();
+    assert!(config.validate().is_err());
+}
+
 #[rstest]
 #[case::native_locks(true, dec!(100000))]
 #[case::broker_snapshot(false, dec!(94000))]
@@ -393,7 +627,7 @@ fn review_target_reduction_replaces_distant_take_profit_only_after_cancel(
         .last_qty(Quantity::from(5))
         .last_px(Price::from("107.84"))
         .build();
-    engine.apply_fill(&fill).unwrap();
+    engine.apply_fill(&fill, fill.ts_init.as_u64()).unwrap();
     let position = Position::new(engine.instrument.as_ref().unwrap(), fill);
     cache
         .borrow_mut()

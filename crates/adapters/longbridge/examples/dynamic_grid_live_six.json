@@ -1,5 +1,6 @@
 {
   "mode": "Live",
+  "isolated_instruments": ["AAPL.US.LONGBRIDGE"],
   "portfolio_config": "../../../backtest/examples/dynamic_grid_comparison.json",
   "instrument_mapping": {
     "AAPL.SIM": "AAPL.US.LONGBRIDGE",

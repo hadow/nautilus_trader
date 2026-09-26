@@ -1,0 +1,21 @@
+{
+  "settings": {},
+  "candidates": [
+    {
+      "name": "AllLevels",
+      "grid_overrides": {
+        "entry_mode": "AllLevels"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    },
+    {
+      "name": "Sequential",
+      "grid_overrides": {
+        "entry_mode": "Sequential"
+      },
+      "instrument_overrides": {},
+      "portfolio_overrides": {}
+    }
+  ]
+}

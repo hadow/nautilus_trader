@@ -1,0 +1,16 @@
+{
+  "settings": {},
+  "candidates": [
+    {
+      "name": "Sequential",
+      "grid_overrides": { "entry_mode": "Sequential" }
+    },
+    {
+      "name": "SequentialEqualLots",
+      "grid_overrides": {
+        "entry_mode": "Sequential",
+        "position_sizing": "EqualLots"
+      }
+    }
+  ]
+}

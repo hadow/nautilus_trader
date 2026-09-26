@@ -1,0 +1,33 @@
+{
+  "settings": {},
+  "candidates": [
+    {
+      "name": "Sequential",
+      "grid_overrides": { "entry_mode": "Sequential" }
+    },
+    {
+      "name": "SequentialRequote",
+      "grid_overrides": {
+        "entry_mode": "Sequential",
+        "sequential_requote_bars": 2
+      }
+    },
+    {
+      "name": "SequentialDoubleFees",
+      "grid_overrides": {
+        "entry_mode": "Sequential",
+        "maker_fee": "0.0016",
+        "taker_fee": "0.0020"
+      }
+    },
+    {
+      "name": "SequentialRequoteDoubleFees",
+      "grid_overrides": {
+        "entry_mode": "Sequential",
+        "sequential_requote_bars": 2,
+        "maker_fee": "0.0016",
+        "taker_fee": "0.0020"
+      }
+    }
+  ]
+}

@@ -37,9 +37,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     analytics::{EquityPoint, PerformanceTracker, number},
-    config::{GridConfig, RiskPolicy, StrategyMode, TrendPolicy},
-    diagnostics::{CancelObservation, ObservationCount, RejectionObservation, ResetObservation},
-    engine::{GridEngine, LevelStatus, floor_tick, spacing},
+    config::{GridConfig, GridEntryMode, RiskPolicy, StrategyMode, TrendPolicy},
+    diagnostics::{
+        CancelObservation, ExitTargetObservation, ObservationCount, RejectionObservation,
+        ResetObservation,
+    },
+    engine::{GridEngine, GridLevel, LevelStatus, floor_tick, spacing},
     grid_scale::GridScaleMode,
     multi_asset::MultiAssetGridStrategy,
     orders::{GridOrder, OrderManager, OrderPhase, PositionComponent},
@@ -153,6 +156,9 @@ pub(super) struct GridState {
     #[serde(default)]
     /// 最近一次 Tick 驱动决策的事件时间戳，用于事件去重。
     pub(super) last_tick_event_ns: u64,
+    /// 单层模式最近一次 Grid 买单提交、成交或终结时间；须等之后收盘的信号 Bar 才可补单。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) grid_entry_after_ns: Option<u64>,
     /// 已经纳入风险连续重置判断的完成周期数量。
     pub(super) completed_cycles: usize,
     #[serde(default)]
@@ -169,6 +175,16 @@ pub(super) struct GridStrategyEngine {
     pub state: GridState,
     pub instrument: Option<InstrumentAny>,
     pub report: Rc<RefCell<PerformanceTracker>>,
+    // 不持久化未完成的换层确认：重启/对账后重新观察，不凭旧候选立即撤挂。
+    requote: Option<RequoteCandidate>,
+}
+
+#[derive(Debug)]
+struct RequoteCandidate {
+    order_id: String,
+    level: i32,
+    bar_ns: u64,
+    bars: u32,
 }
 
 impl GridState {
@@ -184,6 +200,22 @@ impl GridState {
         );
         if let Some(filter) = &self.regime_filter {
             filter.validate(config, bar_type, &self.regime.snapshot)?;
+        }
+        if config.entry_mode == GridEntryMode::Sequential {
+            let buys: Vec<_> = self
+                .orders
+                .orders()
+                .values()
+                .filter(|order| order.buy && order.component == PositionComponent::Grid)
+                .collect();
+            anyhow::ensure!(
+                buys.is_empty() || self.grid_entry_after_ns.is_some(),
+                "Sequential grid checkpoint is missing entry pacing"
+            );
+            anyhow::ensure!(
+                buys.iter().filter(|order| !order.phase.terminal()).count() <= 1,
+                "Sequential grid checkpoint contains multiple active buys"
+            );
         }
         Ok(())
     }
@@ -206,6 +238,7 @@ impl GridStrategyEngine {
                 last_price: None,
                 last_market_ns: 0,
                 last_tick_event_ns: 0,
+                grid_entry_after_ns: None,
                 completed_cycles: 0,
                 position_target: PositionTarget::default(),
                 stock: StockMarketState::default(),
@@ -213,6 +246,7 @@ impl GridStrategyEngine {
             config,
             instrument: None,
             report: Rc::new(RefCell::new(PerformanceTracker::default())),
+            requote: None,
         }
     }
 
@@ -471,6 +505,13 @@ impl GridStrategyEngine {
             .is_some_and(|c| c.mode == GridScaleMode::Adaptive)
     }
 
+    fn defer_grid_entry(&mut self, now: u64) {
+        if self.config.grid.entry_mode == GridEntryMode::Sequential {
+            self.state.grid_entry_after_ns =
+                Some(self.state.grid_entry_after_ns.unwrap_or(0).max(now));
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "explicit target, venue increments and current risk snapshot"
@@ -690,6 +731,7 @@ impl GridStrategyEngine {
     }
 
     pub(super) fn recover(&mut self, runtime: &MultiAssetGridStrategy) -> anyhow::Result<()> {
+        self.requote = None;
         // 检查点只提供归属线索，必须与原生订单、成交、持仓逐项对账后才能恢复买入
         self.state.state = StrategyState::Recovering;
         self.state
@@ -704,6 +746,10 @@ impl GridStrategyEngine {
                     .is_none_or(|filter| filter.latest_input_ns() <= now)
                 && self.state.last_market_ns <= now
                 && self.state.last_tick_event_ns <= now
+                && self
+                    .state
+                    .grid_entry_after_ns
+                    .is_none_or(|timestamp| timestamp <= now)
                 && self.state.grid.as_ref().is_none_or(|g| g.created_ns <= now),
             "Recovered market state contains future timestamps"
         );
@@ -772,7 +818,7 @@ impl GridStrategyEngine {
             found.insert(id.clone());
             for event in order.events() {
                 if let OrderEventAny::Filled(fill) = event {
-                    self.apply_fill(fill)?;
+                    self.apply_fill(fill, now)?;
                 }
             }
             anyhow::ensure!(
@@ -780,8 +826,7 @@ impl GridStrategyEngine {
                 "Fill history mismatch for {id}"
             );
             let phase = phase(order.status());
-            let now = runtime.clock().timestamp_ns().as_u64();
-            self.state.orders.transition(&id, phase, now);
+            self.apply_order_phase(&id, phase, now);
         }
         for id in self.state.orders.active_ids() {
             anyhow::ensure!(
@@ -941,6 +986,9 @@ impl GridStrategyEngine {
             )
         };
         // 先持久化稳定订单身份再发单；进程崩溃后对账，不能把未知结果当作未下单
+        if intent.buy && intent.component == PositionComponent::Grid {
+            self.defer_grid_entry(runtime.clock().timestamp_ns().as_u64());
+        }
         runtime.persist_engine(self, Some(&order))?;
         runtime.submit_order(order, None, None, None)?;
         log::info!(
@@ -1079,6 +1127,112 @@ impl GridStrategyEngine {
             self.submit(runtime, &order)?;
         }
         Ok(())
+    }
+
+    // 候选层只判断几何、库存占位、方向和成本；数量仍必须经过原单标的及组合风控。
+    fn entry_levels(&self, grid: &GridEngine, price: Decimal) -> Vec<(GridLevel, bool)> {
+        let config = &self.config.grid;
+        let sequential = config.entry_mode == GridEntryMode::Sequential;
+        let mut levels: Vec<_> = grid
+            .levels
+            .iter()
+            .filter_map(|level| {
+                if self.state.orders.slot_busy(grid.grid_id, level.level_index)
+                    || level.quantity <= Decimal::ZERO
+                    || !self.regime().permits_order(config, true, level.level_index)
+                {
+                    return None;
+                }
+                let seeded = level.level_index > 0
+                    && !self.state.orders.orders().values().any(|o| {
+                        o.buy && o.grid_id == grid.grid_id && o.level == level.level_index
+                    });
+                if (sequential && seeded && price < grid.center)
+                    || (!seeded && level.price >= price)
+                {
+                    return None;
+                }
+                let reference = if seeded { price } else { level.price };
+                (level.exit_price / reference - Decimal::ONE >= config.cost_floor())
+                    .then(|| (level.clone(), seeded))
+            })
+            .collect();
+        if sequential {
+            levels.sort_by_key(|(level, _)| {
+                (
+                    std::cmp::Reverse(level.price.min(price)),
+                    level.level_index.unsigned_abs(),
+                )
+            });
+        }
+        levels
+    }
+
+    fn observe_entry(&self, reason: &str) {
+        if self.config.grid.entry_mode == GridEntryMode::Sequential {
+            self.report
+                .borrow_mut()
+                .diagnostics
+                .observe_sequential(reason, self.state.regime.snapshot.ts_ns);
+        }
+    }
+
+    fn requote_level(&self, grid: &GridEngine, price: Decimal) -> Option<(String, i32)> {
+        let order = self.state.orders.active_ids().iter().find_map(|id| {
+            let order = &self.state.orders.orders()[id];
+            (order.buy && order.component == PositionComponent::Grid).then_some(order)
+        })?;
+        let limit = order.limit?;
+        if order.phase != OrderPhase::Accepted
+            || order.filled > Decimal::ZERO
+            || order.grid_id != grid.grid_id
+            || limit >= price
+        {
+            return None;
+        }
+        self.entry_levels(grid, price)
+            .into_iter()
+            .find(|(level, seeded)| !seeded && level.price > limit)
+            .map(|(level, _)| (order.id.clone(), level.level_index))
+    }
+
+    fn observe_requote(&mut self, bar: &Bar, allowed: bool) {
+        if self.config.grid.sequential_requote_bars.is_none() {
+            return;
+        }
+        let candidate = allowed
+            .then(|| {
+                self.state
+                    .grid
+                    .as_ref()
+                    .and_then(|grid| self.requote_level(grid, bar.close.as_decimal()))
+            })
+            .flatten();
+        let Some((order_id, level)) = candidate else {
+            self.requote = None;
+            return;
+        };
+        let ts = bar.ts_event.as_u64();
+        let spec = bar.bar_type.spec();
+        let interval = spec
+            .is_time_aggregated()
+            .then(|| u64::try_from(spec.timedelta().as_nanos()).ok())
+            .flatten();
+        let bars = self
+            .requote
+            .as_ref()
+            .filter(|prior| {
+                prior.order_id == order_id
+                    && prior.level == level
+                    && interval.is_some_and(|n| prior.bar_ns.checked_add(n) == Some(ts))
+            })
+            .map_or(1, |prior| prior.bars.saturating_add(1));
+        self.requote = Some(RequoteCandidate {
+            order_id,
+            level,
+            bar_ns: ts,
+            bars,
+        });
     }
 
     pub(super) fn drive(
@@ -1406,34 +1560,52 @@ impl GridStrategyEngine {
         }
         self.exits(runtime, now, false)?;
         let namespace = self.namespace();
-        for level in grid.levels {
-            if self.state.orders.slot_busy(grid.grid_id, level.level_index)
-                || level.quantity <= Decimal::ZERO
+        let sequential = config.entry_mode == GridEntryMode::Sequential;
+        if sequential
+            && self
+                .state
+                .grid_entry_after_ns
+                .is_some_and(|last| signal.ts_ns <= last)
+        {
+            self.observe_entry("WAIT_NEW_BAR");
+            return Ok(());
+        }
+        let levels = self.entry_levels(&grid, price);
+        if sequential
+            && let Some(order) = self.state.orders.active_ids().iter().find_map(|id| {
+                let order = &self.state.orders.orders()[id];
+                (order.buy && order.component == PositionComponent::Grid).then_some(order)
+            })
+        {
+            // 这里只观察更近的限价候选，不假定撤单后组合一定有足够预算。
+            let nearer = levels.iter().any(|(level, seeded)| {
+                !seeded && order.limit.is_some_and(|limit| level.price > limit)
+            });
+            self.observe_entry(if nearer {
+                "WORKING_BUY_NEARER_LEVEL"
+            } else {
+                "WORKING_BUY"
+            });
+            if let Some(required) = config.sequential_requote_bars
+                && let Some(candidate) = &self.requote
+                && candidate.bars >= required
+                && candidate.bar_ns == signal.ts_ns
+                && self.requote_level(&grid, price)
+                    == Some((candidate.order_id.clone(), candidate.level))
             {
-                continue;
+                // 只撤旧单；仍计入现金预留。确认终态且出现新 Bar 后重新选层和做金额风控。
+                self.cancel_ids(
+                    runtime,
+                    vec![candidate.order_id.clone()],
+                    "SEQUENTIAL_REQUOTE",
+                )?;
+                self.requote = None;
             }
-            if !self
-                .regime()
-                .permits_order(&config, true, level.level_index)
-            {
-                continue;
-            }
-            // 正层首次通过市价买入准备卖出库存，比例来自 initial_inventory_fraction
-            // 同代同层已有买单历史就不再 seed，库存清空后仅按该层限价重新参与。
-            let seeded =
-                level.level_index > 0
-                    && !self.state.orders.orders().values().any(|o| {
-                        o.buy && o.grid_id == grid.grid_id && o.level == level.level_index
-                    });
-            if !seeded && level.price >= price {
-                continue;
-            }
+            return Ok(());
+        }
+        let mut outcome = "NO_ELIGIBLE_LEVEL";
+        for (level, seeded) in levels {
             let reference = if seeded { price } else { level.price };
-
-            // 初始库存用当前市价而非上方层价计算成本，预期价差须覆盖双边成本和利润下限
-            if level.exit_price / reference - Decimal::ONE < config.cost_floor() {
-                continue;
-            }
             let snapshot = self.snapshot(runtime, price)?;
             let desired = if config.strategy_mode == StrategyMode::StockAdaptive {
                 let current = self
@@ -1465,6 +1637,7 @@ impl GridStrategyEngine {
                 lot,
             );
             if quantity <= Decimal::ZERO {
+                outcome = "INSTRUMENT_SIZING";
                 ObservationCount::record(
                     &mut self.report.borrow_mut().diagnostics.zero_admissions,
                     "INSTRUMENT_SIZING",
@@ -1480,6 +1653,7 @@ impl GridStrategyEngine {
                 false,
             )?;
             if quantity <= Decimal::ZERO {
+                outcome = "PORTFOLIO_SIZING";
                 ObservationCount::record(
                     &mut self.report.borrow_mut().diagnostics.zero_admissions,
                     "PORTFOLIO_SIZING",
@@ -1505,11 +1679,20 @@ impl GridStrategyEngine {
                 slot.status = LevelStatus::Active;
             }
             self.submit(runtime, &intent)?;
+            outcome = if self.state.orders.orders().contains_key(&intent.id) {
+                "SUBMITTED"
+            } else {
+                "FINAL_ORDER_GATE"
+            };
+            if sequential {
+                break;
+            }
         }
+        self.observe_entry(outcome);
         Ok(())
     }
 
-    pub(super) fn apply_fill(&mut self, fill: &OrderFilled) -> anyhow::Result<()> {
+    pub(super) fn apply_fill(&mut self, fill: &OrderFilled, now: u64) -> anyhow::Result<()> {
         anyhow::ensure!(
             fill.instrument_id == self.config.instrument_id,
             "Unexpected instrument fill"
@@ -1524,6 +1707,7 @@ impl GridStrategyEngine {
             order.buy == (fill.order_side == OrderSide::Buy),
             "Fill side differs from intent"
         );
+        let grid_buy = order.buy && order.component == PositionComponent::Grid;
         let quantity = fill.last_qty.as_decimal();
         let price = fill.last_px.as_decimal();
         let estimated =
@@ -1551,6 +1735,35 @@ impl GridStrategyEngine {
             fill.ts_event.as_u64(),
         )?;
         if applied {
+            if grid_buy {
+                // 迟到成交按接收时钟隔开下一次入场；重复成交不延长屏障
+                self.defer_grid_entry(now.max(fill.ts_event.as_u64()));
+                if self.config.grid.fill_cost_exits
+                    && let Some(grid) = &self.state.grid
+                    && let Some((previous, target)) = self.state.orders.adapt_exit_target(
+                        fill.client_order_id.as_str(),
+                        grid,
+                        &self.config.grid,
+                    )
+                {
+                    self.report
+                        .borrow_mut()
+                        .diagnostics
+                        .exit_target_changes
+                        .push(ExitTargetObservation {
+                            ts_ns: now,
+                            entry_order_id: fill.client_order_id.to_string(),
+                            previous,
+                            target,
+                        });
+                    log::info!(
+                        "GRID_EXIT_TARGET_CHANGED timestamp_ns={now} symbol={} grid_id={} order_id={} previous={previous} target={target}",
+                        self.config.instrument_id,
+                        grid.grid_id,
+                        fill.client_order_id
+                    );
+                }
+            }
             let order = &self.state.orders.orders()[fill.client_order_id.as_str()];
             let event = if order.phase == OrderPhase::Filled {
                 "ORDER_FILLED"
@@ -1740,6 +1953,14 @@ impl GridStrategyEngine {
             );
         }
         let stock_gate = self.stock_gate(now, bar.close.as_decimal());
+        self.observe_requote(
+            bar,
+            stock_gate.is_none()
+                && !runtime.portfolio_blocked()
+                && self.state.risk.risk_off_reason.is_none()
+                && self.regime_confirmed()
+                && self.state.state == StrategyState::GridActive,
+        );
         let drive_result = if !self.config.tick_execution {
             self.drive(runtime, bar.close.as_decimal(), now)
         } else if self.state.last_price.is_none() {
@@ -1800,6 +2021,17 @@ impl GridStrategyEngine {
         Ok(())
     }
 
+    fn apply_order_phase(&mut self, id: &str, phase: OrderPhase, now: u64) {
+        let grid_buy = self.state.orders.orders().get(id).is_some_and(|order| {
+            order.buy && order.component == PositionComponent::Grid && !order.phase.terminal()
+        });
+        self.state.orders.transition(id, phase, now);
+        if grid_buy && self.state.orders.orders()[id].phase.terminal() {
+            // 重复终态不延长等待；恢复时新发现的终态也不能触发即时补单。
+            self.defer_grid_entry(now);
+        }
+    }
+
     pub(super) fn control(
         &mut self,
         runtime: &mut MultiAssetGridStrategy,
@@ -1807,7 +2039,7 @@ impl GridStrategyEngine {
         phase: OrderPhase,
     ) {
         let now = runtime.clock().timestamp_ns().as_u64();
-        self.state.orders.transition(id, phase, now);
+        self.apply_order_phase(id, phase, now);
         if let Some(order) = self.state.orders.orders().get(id) {
             log::info!(
                 "GRID_ORDER_EVENT timestamp_ns={now} symbol={} grid_id={} level={} order_id={id} observed={phase:?} state={:?} filled={} position={}",

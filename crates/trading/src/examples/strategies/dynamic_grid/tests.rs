@@ -956,6 +956,7 @@ fn reset_requires_time_and_distance() {
 
 #[rstest]
 #[case(PositionSizing::Equal)]
+#[case(PositionSizing::EqualLots)]
 #[case(PositionSizing::Progressive)]
 #[case(PositionSizing::Inverse)]
 #[case(PositionSizing::VolatilityAdjusted)]
@@ -974,7 +975,7 @@ fn sizing_respects_allocated_capital(#[case] sizing: PositionSizing) {
             assert!(far.quantity * far.price > near.quantity * near.price);
         }
         PositionSizing::Inverse => assert!(far.quantity * far.price < near.quantity * near.price),
-        PositionSizing::Equal | PositionSizing::VolatilityAdjusted => {
+        PositionSizing::Equal | PositionSizing::EqualLots | PositionSizing::VolatilityAdjusted => {
             assert!((far.quantity * far.price - near.quantity * near.price).abs() < dec!(100));
         }
     }

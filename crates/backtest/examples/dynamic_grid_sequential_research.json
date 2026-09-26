@@ -1,0 +1,23 @@
+{
+  "settings": {},
+  "candidates": [
+    {
+      "name": "Sequential",
+      "grid_overrides": { "entry_mode": "Sequential" }
+    },
+    {
+      "name": "SequentialRequote",
+      "grid_overrides": {
+        "entry_mode": "Sequential",
+        "sequential_requote_bars": 2
+      }
+    },
+    {
+      "name": "SequentialFillCost",
+      "grid_overrides": {
+        "entry_mode": "Sequential",
+        "fill_cost_exits": true
+      }
+    }
+  ]
+}

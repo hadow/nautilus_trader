@@ -60,6 +60,25 @@ pub struct GridDiagnostics {
     pub blocked_bars: BTreeMap<String, ObservationCount>,
     /// 被仓位计算或准入缩减为零的尝试次数，不等同于券商拒单或独立信号数。
     pub zero_admissions: BTreeMap<String, ObservationCount>,
+    /// 通过上游门禁后，每根信号 Bar 首次 Sequential 入场决策；Tick 不重复计数。
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sequential_entries: BTreeMap<String, ObservationCount>,
+    /// 成本感知止盈实际改变的目标；不代表卖单已经成交。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exit_target_changes: Vec<ExitTargetObservation>,
+}
+
+/// 全额买入成交后、首次覆盖卖单前发生的目标调整。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExitTargetObservation {
+    /// 调整时的本地时间戳。
+    pub ts_ns: u64,
+    /// 原始入场订单；同时确定标的、网格代次、层级与库存归属。
+    pub entry_order_id: String,
+    /// 调整前的止盈价。
+    pub previous: Decimal,
+    /// 调整后的原网格价格。
+    pub target: Decimal,
 }
 
 /// 统计观测次数，不把连续 K 线错误当作相互独立的交易机会。
@@ -167,6 +186,17 @@ pub struct RejectionObservation {
 }
 
 impl GridDiagnostics {
+    pub(super) fn observe_sequential(&mut self, reason: &str, bar_ns: u64) {
+        if self
+            .sequential_entries
+            .values()
+            .any(|v| v.last_ns >= bar_ns)
+        {
+            return;
+        }
+        ObservationCount::record(&mut self.sequential_entries, reason, bar_ns);
+    }
+
     pub(super) fn observe_spacing(
         &mut self,
         config: &GridConfig,

@@ -17,14 +17,19 @@
 
 mod dynamic_grid_config;
 
-use std::{fs::File, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    path::Path,
+    time::Duration,
+};
 
 use dynamic_grid_config::{AppConfig, Mode};
 use longbridge::{
     TradeContext,
     trade::{
-        AccountBalance, GetTodayExecutionsOptions, GetTodayOrdersOptions, Order,
-        StockPositionsResponse,
+        AccountBalance, GetHistoryOrdersOptions, GetTodayExecutionsOptions, GetTodayOrdersOptions,
+        Order, StockPositionsResponse,
     },
 };
 use nautilus_common::{actor::registry::try_get_actor_unchecked, enums::Environment};
@@ -237,9 +242,26 @@ async fn query_snapshot(app: &AppConfig) -> anyhow::Result<serde_json::Value> {
         let balances = trade_api_call(context.account_balance(None)).await?;
         let positions = trade_api_call(context.stock_positions(None)).await?;
         let orders = trade_api_call(context.today_orders(GetTodayOrdersOptions::new())).await?;
+        // 今日无委托不代表没有跨日 GTC 委托；沿用 Adapter 的今日+历史去重方式。
+        // 历史接口有查询窗口，本诊断不把“没查到”宣称为冻结额已归因。
+        let history =
+            trade_api_call(context.history_orders(GetHistoryOrdersOptions::new())).await?;
+        let today_count = orders.len();
+        let history_count = history.len();
+        let orders: Vec<_> = history
+            .into_iter()
+            .chain(orders)
+            .map(|order| (order.order_id.clone(), order))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect();
         let executions =
             trade_api_call(context.today_executions(GetTodayExecutionsOptions::new())).await?;
-        broker_snapshot(app, &balances, &positions, &orders, executions.len())
+        let mut snapshot = broker_snapshot(app, &balances, &positions, &orders, executions.len())?;
+        snapshot["today_orders"] = today_count.into();
+        snapshot["history_order_records"] = history_count.into();
+        snapshot["order_query_scope"] = "TODAY_PLUS_HISTORY_API_WINDOW".into();
+        Ok(snapshot)
     })
     .await
     .map_err(|_| anyhow::anyhow!("Broker preflight timed out; no orders submitted"))?
@@ -250,6 +272,12 @@ fn require_startup_ready(snapshot: &serde_json::Value) -> anyhow::Result<()> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Missing broker startup diagnostics"))?;
     anyhow::ensure!(blockers.is_empty(), "Broker startup blocked: {blockers:?}");
+
+    if let Some(warnings) = snapshot["startup_warnings"].as_array()
+        && !warnings.is_empty()
+    {
+        eprintln!("Broker startup warnings: {warnings:?}");
+    }
     Ok(())
 }
 
@@ -265,6 +293,9 @@ fn broker_snapshot(
     let (native_balances, _) = parse_account_state(balances)?;
     let mut active_orders = 0;
     let mut outside_universe_orders = 0;
+    let mut isolated_orders = 0;
+    let mut pending_buy_notional = Decimal::ZERO;
+    let mut active_order_details = Vec::new();
 
     for order in orders {
         let report = parse_order_status_report(order, app.account_id, None, 0.into())?;
@@ -273,11 +304,28 @@ fn broker_snapshot(
             active_orders += 1;
             outside_universe_orders +=
                 usize::from(!app.instruments.contains_key(&report.instrument_id));
+            isolated_orders +=
+                usize::from(app.isolated_instruments.contains(&report.instrument_id));
+            if order.side == longbridge::trade::OrderSide::Buy
+                && order.currency == app.currency.code.as_str()
+            {
+                pending_buy_notional += (order.quantity - order.executed_quantity)
+                    .max(Decimal::ZERO)
+                    * order.price.unwrap_or(Decimal::ZERO);
+            }
+            active_order_details.push(serde_json::json!({
+                "instrument_id": report.instrument_id, "status": report.order_status,
+                "quantity": order.quantity, "filled_quantity": order.executed_quantity,
+            }));
         }
     }
     let mut position_records = 0;
     let mut nonflat_positions = 0;
     let mut outside_universe_positions = 0;
+    let mut holdings = Vec::new();
+    let mut isolated_positions = 0;
+    let mut unsupported_isolation = false;
+    let mut isolated_ids = BTreeSet::new();
 
     for position in positions
         .channels
@@ -288,12 +336,26 @@ fn broker_snapshot(
         position_records += 1;
 
         if !position.quantity.is_zero() {
+            if app.isolated_instruments.contains(&report.instrument_id) {
+                isolated_positions += 1;
+                unsupported_isolation |= position.quantity < Decimal::ZERO
+                    || position.currency != app.currency.code.as_str()
+                    || !isolated_ids.insert(report.instrument_id);
+            }
+            holdings.push(serde_json::json!({
+                "instrument_id": report.instrument_id,
+                "quantity": position.quantity,
+                "available_quantity": position.available_quantity,
+                "currency": position.currency,
+                "isolated": app.isolated_instruments.contains(&report.instrument_id),
+            }));
             nonflat_positions += 1;
             outside_universe_positions +=
                 usize::from(!app.instruments.contains_key(&report.instrument_id));
         }
     }
     let mut blockers = Vec::new();
+    let mut warnings = Vec::new();
 
     if outside_universe_positions > 0 {
         blockers.push("OUTSIDE_UNIVERSE_POSITIONS");
@@ -302,9 +364,15 @@ fn broker_snapshot(
     if outside_universe_orders > 0 {
         blockers.push("OUTSIDE_UNIVERSE_ORDERS");
     }
+    if isolated_orders > 0 {
+        blockers.push("ORDERS_ON_ISOLATED_INSTRUMENT");
+    }
+    if unsupported_isolation {
+        blockers.push("UNSUPPORTED_ISOLATED_POSITION");
+    }
 
     // 标的属于配置不代表仓位属于策略；只读快照不能代替检查点与原生执行引擎的对账
-    if !resuming && (nonflat_positions > 0 || active_orders > 0) {
+    if !resuming && (nonflat_positions > isolated_positions || active_orders > 0) {
         blockers.push("BROKER_STATE_WITHOUT_CHECKPOINT");
     }
     let cash = native_balances
@@ -321,6 +389,14 @@ fn broker_snapshot(
     }
     let mut frozen_cash_present = false;
     let mut settling_cash_present = false;
+    let mut frozen = Decimal::ZERO;
+    let mut settling = Decimal::ZERO;
+    let frozen_fees: Decimal = balances
+        .iter()
+        .flat_map(|balance| &balance.frozen_transaction_fees)
+        .filter(|fee| fee.currency == app.currency.code.as_str())
+        .map(|fee| fee.frozen_transaction_fee)
+        .sum();
 
     for cash in balances
         .iter()
@@ -329,22 +405,34 @@ fn broker_snapshot(
     {
         frozen_cash_present |= !cash.frozen_cash.is_zero();
         settling_cash_present |= !cash.settling_cash.is_zero();
+        frozen += cash.frozen_cash;
+        settling += cash.settling_cash;
     }
 
     if !resuming && frozen_cash_present {
-        blockers.push("UNATTRIBUTED_FROZEN_CASH");
+        // 仅豁免模拟盘的归因门禁；冻结额不释放，现金预算、订单及持仓核对保持不变
+        if app.mode == Mode::Paper && app.paper_allow_unattributed_frozen_cash {
+            warnings.push("PAPER_UNATTRIBUTED_FROZEN_CASH_WAIVED");
+        } else {
+            blockers.push("UNATTRIBUTED_FROZEN_CASH");
+        }
     }
 
-    // 不输出余额、账户编号或持仓明细；只报告门禁结果，不把连通性称为成交验收
+    // 金额和持仓用于操作员核对；不输出账户编号、渠道编号或凭证。
     Ok(serde_json::json!({
         "account_records": balances.len(), "position_records": position_records,
         "nonflat_positions": nonflat_positions, "today_orders": orders.len(),
+        "holdings": holdings,
         "active_orders": active_orders, "today_executions": executions,
+        "active_order_details": active_order_details,
+        "isolated_positions": isolated_positions,
+        "isolated_instruments": app.isolated_instruments,
         "native_snapshot_parsing": "PASS",
-        "fresh_account_candidate": !resuming && nonflat_positions == 0 && active_orders == 0 && blockers.is_empty(),
+        "fresh_account_candidate": !resuming && nonflat_positions == 0 && active_orders == 0 && !frozen_cash_present && blockers.is_empty(),
         "outside_universe_positions": outside_universe_positions,
         "outside_universe_orders": outside_universe_orders,
         "startup_blockers": blockers,
+        "startup_warnings": warnings,
         "startup_reconciliation": "NOT_RUN",
         "cash_check": {
             "currency": app.currency.to_string(),
@@ -353,6 +441,13 @@ fn broker_snapshot(
             "configured_capital_covered_by_free_cash": available >= app.portfolio.capital,
             "frozen_cash_present": frozen_cash_present,
             "settling_cash_present": settling_cash_present,
+            "available_cash": available,
+            "frozen_cash": frozen,
+            "settling_cash": settling,
+            "frozen_transaction_fees": frozen_fees,
+            "frozen_cash_matches_reported_fees": frozen > Decimal::ZERO && frozen == frozen_fees,
+            "pending_buy_limit_notional": pending_buy_notional,
+            "freeze_attribution": if frozen.is_zero() { "NONE" } else { "UNVERIFIED" },
             // 汇总冻结额没有订单归属和原子快照证据；本检查不验证或释放本地预留
             "reservation_overlap_verification": "NOT_PERFORMED",
         },
@@ -545,6 +640,98 @@ mod tests {
     }
 
     #[rstest::rstest]
+    fn isolation_does_not_claim_inventory_or_release_frozen_cash() {
+        let mut app = app();
+        let id = "AAPL.US.LONGBRIDGE".parse().unwrap();
+        app.isolated_instruments.insert(id);
+        let positions = StockPositionsResponse {
+            channels: vec![StockPositionChannel {
+                account_channel: "test".into(),
+                positions: vec![StockPosition {
+                    symbol: "AAPL.US".into(),
+                    symbol_name: "AAPL".into(),
+                    quantity: Decimal::from(20),
+                    available_quantity: Decimal::from(20),
+                    currency: "USD".into(),
+                    cost_price: Decimal::from(100),
+                    market: Market::US,
+                    init_quantity: None,
+                }],
+            }],
+        };
+        let mut balances = balances();
+        let result = broker_snapshot(&app, &balances, &positions, &[], 0).unwrap();
+        require_startup_ready(&result).unwrap();
+        assert_eq!(result["isolated_positions"], 1);
+        assert!(app.strategy().unwrap().base.external_order_claims.is_none());
+        balances[0].cash_infos[0].frozen_cash = Decimal::from(10386);
+        balances[0]
+            .frozen_transaction_fees
+            .push(longbridge::trade::FrozenTransactionFee {
+                currency: "USD".into(),
+                frozen_transaction_fee: Decimal::from(4),
+            });
+        let result = broker_snapshot(&app, &balances, &positions, &[], 0).unwrap();
+        assert_eq!(
+            result["startup_blockers"],
+            serde_json::json!(["UNATTRIBUTED_FROZEN_CASH"])
+        );
+        assert_eq!(result["cash_check"]["available_cash"], "100000.00");
+        assert_eq!(result["cash_check"]["frozen_cash"], "10386");
+        assert_eq!(result["cash_check"]["frozen_transaction_fees"], "4");
+        assert_eq!(result["cash_check"]["freeze_attribution"], "UNVERIFIED");
+        assert_eq!(
+            result["cash_check"]["frozen_cash_matches_reported_fees"],
+            false
+        );
+        assert!(require_startup_ready(&result).is_err());
+
+        let mut duplicate = positions.clone();
+        duplicate.channels.push(positions.channels[0].clone());
+        let result = broker_snapshot(&app, &balances, &duplicate, &[], 0).unwrap();
+        assert!(
+            result["startup_blockers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("UNSUPPORTED_ISOLATED_POSITION"))
+        );
+        let mut short = positions;
+        short.channels[0].positions[0].quantity = Decimal::NEGATIVE_ONE;
+        let result = broker_snapshot(&app, &balances, &short, &[], 0).unwrap();
+        assert!(
+            result["startup_blockers"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("UNSUPPORTED_ISOLATED_POSITION"))
+        );
+    }
+
+    #[rstest::rstest]
+    fn isolation_does_not_allow_manual_orders_even_with_a_checkpoint() {
+        let mut app = app();
+        app.isolated_instruments
+            .insert("AAPL.US.LONGBRIDGE".parse().unwrap());
+        app.state_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut order: Order =
+            serde_json::from_str(include_str!("../test_data/order_reconciliation.json")).unwrap();
+        order.status = longbridge::trade::OrderStatus::PendingCancel;
+        order.symbol = "AAPL.US".into();
+        let result = broker_snapshot(
+            &app,
+            &balances(),
+            &StockPositionsResponse { channels: vec![] },
+            &[order],
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            result["startup_blockers"],
+            serde_json::json!(["ORDERS_ON_ISOLATED_INSTRUMENT"])
+        );
+        assert!(require_startup_ready(&result).is_err());
+    }
+
+    #[rstest::rstest]
     fn fresh_start_requires_funded_budget_without_unattributed_locks() {
         let positions = StockPositionsResponse {
             channels: Vec::new(),
@@ -565,6 +752,81 @@ mod tests {
             result["startup_blockers"],
             serde_json::json!(["UNATTRIBUTED_FROZEN_CASH"])
         );
+    }
+
+    #[rstest::rstest]
+    #[case(Mode::Paper, false, false)]
+    #[case(Mode::Paper, true, true)]
+    #[case(Mode::Live, false, false)]
+    #[case(Mode::Live, true, false)]
+    fn frozen_cash_waiver_is_explicit_and_paper_only(
+        #[case] mode: Mode,
+        #[case] opted_in: bool,
+        #[case] allowed: bool,
+    ) {
+        let mut app = app();
+        assert!(!app.paper_allow_unattributed_frozen_cash);
+        app.mode = mode;
+        app.paper_allow_unattributed_frozen_cash = opted_in;
+        assert_eq!(app.strategy().is_ok(), !opted_in || mode == Mode::Paper);
+        let mut balances = balances();
+        balances[0].cash_infos[0].frozen_cash = Decimal::from(10_386);
+        let result = broker_snapshot(
+            &app,
+            &balances,
+            &StockPositionsResponse { channels: vec![] },
+            &[],
+            0,
+        )
+        .unwrap();
+        assert_eq!(require_startup_ready(&result).is_ok(), allowed);
+        assert_eq!(
+            result["startup_blockers"],
+            if allowed {
+                serde_json::json!([])
+            } else {
+                serde_json::json!(["UNATTRIBUTED_FROZEN_CASH"])
+            }
+        );
+        assert_eq!(
+            result["startup_warnings"],
+            if allowed {
+                serde_json::json!(["PAPER_UNATTRIBUTED_FROZEN_CASH_WAIVED"])
+            } else {
+                serde_json::json!([])
+            }
+        );
+        assert_eq!(result["cash_check"]["available_cash"], "100000.00");
+        assert_eq!(result["cash_check"]["frozen_cash"], "10386");
+        assert_eq!(result["cash_check"]["freeze_attribution"], "UNVERIFIED");
+        assert_eq!(result["fresh_account_candidate"], false);
+    }
+
+    #[rstest::rstest]
+    fn paper_frozen_cash_waiver_keeps_cash_and_order_gates() {
+        let mut app = app();
+        app.paper_allow_unattributed_frozen_cash = true;
+        let positions = StockPositionsResponse { channels: vec![] };
+        let mut balances = balances();
+        balances[0].cash_infos[0].frozen_cash = Decimal::from(100_000);
+        balances[0].cash_infos[0].available_cash = app.portfolio.capital - Decimal::ONE;
+        let result = broker_snapshot(&app, &balances, &positions, &[], 0).unwrap();
+        assert_eq!(
+            result["startup_blockers"],
+            serde_json::json!(["INSUFFICIENT_STARTING_CASH"])
+        );
+        assert!(require_startup_ready(&result).is_err());
+
+        balances[0].cash_infos[0].available_cash = app.portfolio.capital;
+        let mut order: Order =
+            serde_json::from_str(include_str!("../test_data/order_reconciliation.json")).unwrap();
+        order.status = longbridge::trade::OrderStatus::PendingCancel;
+        let result = broker_snapshot(&app, &balances, &positions, &[order], 0).unwrap();
+        assert_eq!(
+            result["startup_blockers"],
+            serde_json::json!(["BROKER_STATE_WITHOUT_CHECKPOINT"])
+        );
+        assert!(require_startup_ready(&result).is_err());
     }
 
     #[rstest::rstest]

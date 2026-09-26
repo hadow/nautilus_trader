@@ -115,6 +115,14 @@ impl GridEngine {
         let mut lower = center;
         let mut upper = center;
         let mut levels = Vec::new();
+        // 股票低价层仍按中心价预算，不能把同一目标仓位换成更多股数
+        let reference = |buy: Decimal| {
+            if config.strategy_mode == StrategyMode::StockAdaptive {
+                center.max(buy)
+            } else {
+                buy
+            }
+        };
         let total_weight: Decimal = (1..=config.grid_levels)
             .map(|i| weight(config, i, config.grid_levels))
             .sum();
@@ -144,13 +152,7 @@ impl GridEngine {
                     buy > Decimal::ZERO && sell > buy,
                     "Grid levels collapse at instrument tick size"
                 );
-                // 股票目标是按当前价定义的总股数；低价层不能把同一目标预算换成更多计划股数。
-                let reference = if config.strategy_mode == StrategyMode::StockAdaptive {
-                    center.max(buy)
-                } else {
-                    buy
-                };
-                let quantity = floor_tick(allocation * fraction / reference, lot);
+                let quantity = floor_tick(allocation * fraction / reference(buy), lot);
                 levels.push(GridLevel {
                     level_index: index,
                     price: buy,
@@ -164,6 +166,35 @@ impl GridEngine {
             }
             lower = next_lower;
             upper = next_upper;
+        }
+        if config.position_sizing == PositionSizing::EqualLots {
+            // 仅分配取整余款；两侧预算不互借，不改几何，也不因后续信号重复补发数量。
+            // 每层最多补一个 lot，未用完的零头留现金；订单提交时仍扣除库存、预留和费用。
+            for (lower_side, fraction) in [
+                (true, Decimal::ONE - config.initial_inventory_fraction),
+                (false, config.initial_inventory_fraction),
+            ] {
+                let spent: Decimal = levels
+                    .iter()
+                    .filter(|level| (level.level_index < 0) == lower_side)
+                    .map(|level| level.quantity * reference(level.price))
+                    .sum();
+                let mut remaining = capital * fraction - spent;
+                anyhow::ensure!(
+                    remaining >= Decimal::ZERO,
+                    "Grid allocation exceeds side budget"
+                );
+                for level in levels
+                    .iter_mut()
+                    .filter(|level| (level.level_index < 0) == lower_side)
+                {
+                    let cost = reference(level.price) * lot;
+                    if cost <= remaining {
+                        level.quantity += lot;
+                        remaining -= cost;
+                    }
+                }
+            }
         }
         let mut buys: Vec<_> = levels
             .iter()
@@ -289,8 +320,158 @@ pub(super) fn ceil_tick(value: Decimal, increment: Decimal) -> Decimal {
 
 fn weight(config: &GridConfig, index: usize, levels: usize) -> Decimal {
     Decimal::from(match config.position_sizing {
-        PositionSizing::Equal | PositionSizing::VolatilityAdjusted => 1,
+        PositionSizing::Equal | PositionSizing::EqualLots | PositionSizing::VolatilityAdjusted => 1,
         PositionSizing::Progressive => index,
         PositionSizing::Inverse => levels + 1 - index,
     } as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[rstest]
+    fn equal_lots_funds_whole_shares_without_moving_grid_prices() {
+        let mut config = GridConfig {
+            strategy_mode: StrategyMode::StockAdaptive,
+            grid_levels: 8,
+            initial_inventory_fraction: dec!(0.2),
+            ..Default::default()
+        };
+        let original = GridEngine::build(
+            &config,
+            1,
+            dec!(600),
+            dec!(0.005),
+            dec!(3000),
+            dec!(0.01),
+            dec!(1),
+            0,
+        )
+        .unwrap();
+        config.position_sizing = PositionSizing::EqualLots;
+        let funded = GridEngine::build(
+            &config,
+            1,
+            dec!(600),
+            dec!(0.005),
+            dec!(3000),
+            dec!(0.01),
+            dec!(1),
+            0,
+        )
+        .unwrap();
+        let funded_indices: Vec<_> = funded
+            .levels
+            .iter()
+            .filter(|l| l.quantity > Decimal::ZERO)
+            .map(|l| (l.level_index, l.quantity))
+            .collect();
+
+        assert!(original.levels.iter().all(|l| l.quantity.is_zero()));
+        assert_eq!(
+            funded_indices,
+            vec![
+                (-1, dec!(1)),
+                (1, dec!(1)),
+                (-2, dec!(1)),
+                (-3, dec!(1)),
+                (-4, dec!(1))
+            ]
+        );
+        assert_eq!(original.lower_bound, funded.lower_bound);
+        assert_eq!(original.upper_bound, funded.upper_bound);
+        for (old, new) in original.levels.iter().zip(&funded.levels) {
+            assert_eq!(
+                (old.level_index, old.price, old.exit_price),
+                (new.level_index, new.price, new.exit_price)
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(StrategyMode::StockAdaptive, dec!(1))]
+    #[case(StrategyMode::StockAdaptive, dec!(0.1))]
+    #[case(StrategyMode::LegacyDgt, dec!(1))]
+    fn equal_lots_preserves_both_side_budgets_and_lot_increments(
+        #[case] mode: StrategyMode,
+        #[case] lot: Decimal,
+    ) {
+        for capital in [
+            dec!(0),
+            dec!(0.4),
+            dec!(100),
+            dec!(101),
+            dec!(2999.99),
+            dec!(10000),
+        ] {
+            for seed in [dec!(0), dec!(0.2), dec!(0.99)] {
+                let mut config = GridConfig {
+                    strategy_mode: mode,
+                    grid_levels: 8,
+                    initial_inventory_fraction: seed,
+                    ..Default::default()
+                };
+                let old = GridEngine::build(
+                    &config,
+                    1,
+                    dec!(100),
+                    dec!(0.02),
+                    capital,
+                    dec!(0.01),
+                    lot,
+                    0,
+                )
+                .unwrap();
+                config.position_sizing = PositionSizing::EqualLots;
+                let grid = GridEngine::build(
+                    &config,
+                    1,
+                    dec!(100),
+                    dec!(0.02),
+                    capital,
+                    dec!(0.01),
+                    lot,
+                    0,
+                )
+                .unwrap();
+                for (lower, fraction) in [(true, Decimal::ONE - seed), (false, seed)] {
+                    let used: Decimal = grid
+                        .levels
+                        .iter()
+                        .filter(|l| (l.level_index < 0) == lower)
+                        .map(|l| {
+                            l.quantity
+                                * if mode == StrategyMode::StockAdaptive {
+                                    dec!(100).max(l.price)
+                                } else {
+                                    l.price
+                                }
+                        })
+                        .sum();
+                    assert!(
+                        used <= capital * fraction,
+                        "{mode:?}, {lot}, {capital}, {seed}"
+                    );
+                }
+                for (before, after) in old.levels.iter().zip(&grid.levels) {
+                    assert_eq!(after.quantity % lot, Decimal::ZERO);
+                    assert!((Decimal::ZERO..=lot).contains(&(after.quantity - before.quantity)));
+                    assert_eq!(
+                        (before.price, before.exit_price),
+                        (after.price, after.exit_price)
+                    );
+                }
+                let recovered: GridEngine =
+                    serde_json::from_value(serde_json::to_value(&grid).unwrap()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(recovered).unwrap(),
+                    serde_json::to_value(grid).unwrap()
+                );
+            }
+        }
+    }
 }

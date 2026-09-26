@@ -16,12 +16,14 @@
 //! Live Longbridge market-data client backed by the official Rust SDK.
 
 use std::{
+    collections::BTreeMap,
     fmt::Debug,
     future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use ahash::{AHashMap, AHashSet};
@@ -29,7 +31,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use jiff::Timestamp;
 use longbridge::quote::{
-    AdjustType, Period, PushEventDetail, QuoteContext, SubFlags, TradeSessions,
+    AdjustType, Candlestick, Period, PushCandlestick, PushEventDetail, QuoteContext, SubFlags,
+    TradeSessions,
 };
 use nautilus_common::{
     clients::DataClient,
@@ -64,7 +67,7 @@ use crate::{
         consts::LONGBRIDGE_VENUE,
         parse::{
             instrument_id, parse_bar_with_price_precision, parse_completed_minute_bar, parse_depth,
-            parse_instrument, parse_trades, period_from_bar_type,
+            parse_instrument, parse_trades, period_from_bar_type, unix_nanos,
         },
         rate_limit::{
             MAX_QUOTE_SUBSCRIPTION_SYMBOLS, QuoteConnectionGuard, history_api_call_with_retry,
@@ -73,6 +76,16 @@ use crate::{
     },
     config::LongbridgeDataClientConfig,
 };
+
+// 只容忍亚秒级时钟差；不是允许提前消费未来数据，超出一秒仍拒绝
+const MAX_CONFIRMED_BAR_EARLY_NS: u64 = 1_000_000_000;
+
+#[derive(Debug)]
+struct PendingMinute {
+    candle: Candlestick,
+    end: UnixNanos,
+    received_at: UnixNanos,
+}
 
 #[derive(Debug, Default)]
 struct SubscriptionState {
@@ -83,9 +96,153 @@ struct SubscriptionState {
     reserved_symbols: AHashSet<String>,
     applied_flags: AHashMap<String, SubFlags>,
     applied_bars: AHashMap<(String, i32), Period>,
+    pending_minutes: BTreeMap<BarType, PendingMinute>,
+    last_confirmed: AHashMap<BarType, UnixNanos>,
 }
 
 impl SubscriptionState {
+    fn handle_candlestick(
+        &mut self,
+        symbol: &str,
+        update: PushCandlestick,
+        ts_init: UnixNanos,
+        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    ) {
+        self.publish_due_minutes(ts_init, sender);
+        let key = (symbol.to_string(), update.period as i32);
+        let bar_subscription = self.bars.get(&key).copied();
+
+        if let Some((bar_type, price_precision)) = bar_subscription {
+            match parse_bar_with_price_precision(
+                bar_type,
+                update.candlestick,
+                ts_init,
+                price_precision,
+            ) {
+                Ok(bar) => {
+                    if update.is_confirmed && update.period == Period::OneMinute {
+                        match self.queue_confirmed_minute(bar_type, update.candlestick, ts_init) {
+                            Ok(()) => self.publish_due_minutes(ts_init, sender),
+                            Err(e) => {
+                                log::error!(
+                                    "Invalid confirmed Longbridge VWAP bar: symbol={symbol}, bar_type={bar_type}, source_start={}, received_at={ts_init}: {e:#}",
+                                    update.candlestick.timestamp,
+                                );
+                            }
+                        }
+                    }
+                    if let Err(e) = sender.send(DataEvent::Data(Data::Bar(bar))) {
+                        log::error!("Failed to dispatch Longbridge bar: {e}");
+                    }
+                }
+                Err(e) => log::warn!("Failed to parse Longbridge bar: {e:#}"),
+            }
+        }
+    }
+
+    fn queue_confirmed_minute(
+        &mut self,
+        bar_type: BarType,
+        candle: Candlestick,
+        received_at: UnixNanos,
+    ) -> anyhow::Result<()> {
+        let end = unix_nanos(candle.timestamp)?
+            .checked_add(60_000_000_000_u64)
+            .context("minute timestamp overflow")?;
+        let early_ns = end.as_u64().saturating_sub(received_at.as_u64());
+        anyhow::ensure!(
+            early_ns <= MAX_CONFIRMED_BAR_EARLY_NS,
+            "confirmed bar is ahead of receiver clock: bar_end={end}, early_ns={early_ns}, maximum_early_ns={MAX_CONFIRMED_BAR_EARLY_NS}"
+        );
+        if self
+            .last_confirmed
+            .get(&bar_type)
+            .is_some_and(|last| *last >= end)
+        {
+            return Ok(());
+        }
+        if let Some(pending) = self.pending_minutes.get(&bar_type) {
+            if pending.end >= end {
+                return Ok(());
+            }
+            anyhow::bail!("another confirmed minute is still pending: bar_end={end}");
+        }
+        if early_ns > 0 {
+            log::debug!(
+                "Delaying confirmed Longbridge VWAP bar: symbol={}, source_start={}, bar_end={end}, received_at={received_at}, early_ns={early_ns}",
+                bar_type.instrument_id().symbol,
+                candle.timestamp,
+            );
+        }
+        // 每个订阅至多缓存一根；已确认重复回报不覆盖原快照，也不重复发布
+        self.pending_minutes.insert(
+            bar_type,
+            PendingMinute {
+                candle,
+                end,
+                received_at,
+            },
+        );
+        Ok(())
+    }
+
+    fn next_minute_delay(&self, now: UnixNanos) -> Option<Duration> {
+        self.pending_minutes
+            .values()
+            .map(|pending| Duration::from_nanos(pending.end.as_u64().saturating_sub(now.as_u64())))
+            .min()
+    }
+
+    fn publish_due_minutes(
+        &mut self,
+        now: UnixNanos,
+        sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    ) {
+        let mut ready: Vec<_> = self
+            .pending_minutes
+            .iter()
+            .filter(|(_, pending)| {
+                pending.end <= now
+                    || pending.end.as_u64().saturating_sub(now.as_u64())
+                        > MAX_CONFIRMED_BAR_EARLY_NS
+            })
+            .map(|(kind, pending)| (pending.end, *kind))
+            .collect();
+        ready.sort_unstable();
+        for (_, kind) in ready {
+            let Some(pending) = self.pending_minutes.remove(&kind) else {
+                continue;
+            };
+            // 定时器只负责唤醒，真正发布前再次校验时钟；不将 ts_init 伪造为未来时间
+            match parse_completed_minute_bar(kind, pending.candle, now) {
+                Ok(value) => {
+                    let data = CustomData::from_arc(Arc::new(value));
+                    if let Err(e) = sender.send(DataEvent::Data(Data::Custom(data))) {
+                        log::error!("Failed to dispatch confirmed Longbridge VWAP bar: {e}");
+                    } else {
+                        self.last_confirmed.insert(kind, pending.end);
+                    }
+                }
+                Err(e) => {
+                    log::error!(
+                        "Invalid confirmed Longbridge VWAP bar: symbol={}, source_start={}, bar_end={}, received_at={}, dispatch_at={now}: {e:#}",
+                        kind.instrument_id().symbol,
+                        pending.candle.timestamp,
+                        pending.end,
+                        pending.received_at,
+                    );
+                }
+            }
+        }
+    }
+
+    fn remove_bar_subscription(&mut self, symbol: &str, period: Period) {
+        if let Some((kind, _)) = self.bars.remove(&(symbol.to_string(), period as i32)) {
+            self.pending_minutes.remove(&kind);
+            self.last_confirmed.remove(&kind);
+        }
+    }
+
     fn release_acknowledged(&mut self, symbol: &str) {
         let id = instrument_id(symbol);
         if !self.quotes.contains(&id)
@@ -295,6 +452,11 @@ impl LongbridgeDataClient {
         if let Some(handle) = self.stream_handle.take() {
             handle.abort();
         }
+        self.subscriptions
+            .lock()
+            .expect(MUTEX_POISONED)
+            .pending_minutes
+            .clear();
         if let Some(sender) = &self.context_sender {
             sender.send_replace(None);
         }
@@ -561,8 +723,18 @@ impl DataClient for LongbridgeDataClient {
 
         self.stream_handle = Some(get_runtime().spawn(async move {
             loop {
+                let delay = {
+                    let mut state = subscriptions.lock().expect(MUTEX_POISONED);
+                    if cancellation.is_cancelled() { break; }
+                    let now = clock.get_time_ns();
+                    state.publish_due_minutes(now, &sender);
+                    state.next_minute_delay(now)
+                };
                 tokio::select! {
+                    biased;
                     () = cancellation.cancelled() => break,
+                    // 空队列不轮询；等待不占用行情分支，也不创建脱离连接生命周期的任务
+                    () = tokio::time::sleep(delay.unwrap_or_default()), if delay.is_some() => {},
                     event = receiver.recv() => {
                         let Some(event) = event else { break };
                         let ts_init = clock.get_time_ns();
@@ -609,46 +781,15 @@ impl DataClient for LongbridgeDataClient {
                                 }
                             }
                             PushEventDetail::Candlestick(update) => {
-                                let key = (event.symbol.clone(), update.period as i32);
-                                let bar_subscription = subscriptions
-                                    .lock()
-                                    .expect(MUTEX_POISONED)
-                                    .bars
-                                    .get(&key)
-                                    .copied();
-
-                                if let Some((bar_type, price_precision)) = bar_subscription {
-                                    match parse_bar_with_price_precision(
-                                        bar_type,
-                                        update.candlestick,
-                                        ts_init,
-                                        price_precision,
-                                    ) {
-                                        Ok(bar) => {
-                                            if update.is_confirmed && update.period == Period::OneMinute {
-                                                match parse_completed_minute_bar(bar_type,update.candlestick,ts_init) {
-                                                    Ok(value) => {
-                                                        let data = CustomData::from_arc(Arc::new(value));
-                                                        if let Err(e) = sender.send(DataEvent::Data(Data::Custom(data))) {
-                                                            log::error!("Failed to dispatch confirmed Longbridge VWAP bar: {e}");
-                                                        }
-                                                    }
-                                                    Err(e) => log::error!("Invalid confirmed Longbridge VWAP bar: {e:#}"),
-                                                }
-                                            }
-                                            if let Err(e) = sender.send(DataEvent::Data(Data::Bar(bar))) {
-                                                log::error!("Failed to dispatch Longbridge bar: {e}");
-                                            }
-                                        }
-                                        Err(e) => log::warn!("Failed to parse Longbridge bar: {e:#}"),
-                                    }
-                                }
+                                subscriptions.lock().expect(MUTEX_POISONED)
+                                    .handle_candlestick(&event.symbol, update, ts_init, &sender);
                             }
                             PushEventDetail::Quote(_) | PushEventDetail::Brokers(_) => {}
                         }
                     }
                 }
             }
+            subscriptions.lock().expect(MUTEX_POISONED).pending_minutes.clear();
         }));
 
         if let Some(sender) = &self.context_sender {
@@ -810,8 +951,7 @@ impl DataClient for LongbridgeDataClient {
         self.subscriptions
             .lock()
             .expect(MUTEX_POISONED)
-            .bars
-            .remove(&(symbol.clone(), period as i32));
+            .remove_bar_subscription(&symbol, period);
         self.reconcile_subscriptions(symbol)
     }
 
@@ -958,15 +1098,238 @@ impl DataClient for LongbridgeDataClient {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_common::live::runner::replace_data_event_sender;
     use nautilus_model::{
-        data::{BarSpecification, BarType},
+        data::{BarSpecification, BarType, bar_vwap::BarWithVwap},
         enums::{AggregationSource, BarAggregation, PriceType},
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
     use time::macros::{date, datetime, time};
 
     use super::*;
     use crate::common::parse::instrument_id;
+
+    fn confirmed_minute() -> PushCandlestick {
+        // 合成边界输入：复现确认事件在分钟结束前 402ms 到达，不代表券商原始推送
+        PushCandlestick {
+            period: Period::OneMinute,
+            is_confirmed: true,
+            candlestick: serde_json::from_value(serde_json::json!({
+                "open":"123.4567","high":"123.5000","low":"123.4000","close":"123.4789",
+                "volume":1000,"turnover":"123456.78","timestamp":"2026-09-25T15:14:00Z",
+                "trade_session":"Intraday","open_updated":false
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[rstest]
+    fn test_early_confirmed_minute_is_delivered_after_close() {
+        let mut state = SubscriptionState::default();
+        let kind: BarType = "AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        state
+            .bars
+            .insert(("AAPL.US".into(), Period::OneMinute as i32), (kind, 2));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut update = confirmed_minute();
+        let end = crate::common::parse::unix_nanos(update.candlestick.timestamp).unwrap()
+            + 60_000_000_000_u64;
+        state.handle_candlestick("AAPL.US", update, end - 402_000_000_u64, &sender);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            DataEvent::Data(Data::Bar(_))
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        update.is_confirmed = false;
+        state.handle_candlestick("AAPL.US", update, end, &sender);
+        let first = receiver.try_recv().unwrap();
+        assert!(
+            matches!(first, DataEvent::Data(Data::Custom(_))),
+            "Early confirmed minute was lost: {first:?}"
+        );
+        let DataEvent::Data(Data::Custom(data)) = first else {
+            unreachable!()
+        };
+        let value = data.data.as_any().downcast_ref::<BarWithVwap>().unwrap();
+        assert_eq!(value.bar.ts_event, end);
+        assert_eq!(value.bar.ts_init, end);
+        assert_eq!(value.bar.open.as_decimal(), update.candlestick.open);
+        assert_eq!(value.vwap, Decimal::new(12_345_678, 5));
+        assert!(state.pending_minutes.is_empty());
+    }
+
+    #[rstest]
+    #[case(0, true)]
+    #[case(1, true)]
+    #[case(80_000_000, true)]
+    #[case(402_000_000, true)]
+    #[case(1_000_000_000, true)]
+    #[case(1_000_000_001, false)]
+    #[case(60_000_000_000, false)]
+    fn test_confirmed_minute_delay_boundary(#[case] early_ns: u64, #[case] accepted: bool) {
+        let mut state = SubscriptionState::default();
+        let kind: BarType = "AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        let candle = confirmed_minute().candlestick;
+        let end = unix_nanos(candle.timestamp).unwrap() + 60_000_000_000_u64;
+        let now = end - early_ns;
+        let result = state.queue_confirmed_minute(kind, candle, now);
+        assert_eq!(result.is_ok(), accepted);
+        assert_eq!(
+            state.next_minute_delay(now),
+            accepted.then_some(Duration::from_nanos(early_ns))
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        if early_ns > 0 {
+            state.publish_due_minutes(now, &sender);
+            assert!(receiver.try_recv().is_err());
+        }
+        state.publish_due_minutes(end, &sender);
+        assert_eq!(receiver.try_recv().is_ok(), accepted);
+        assert!(state.next_minute_delay(end).is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_pending_minutes_are_independent_ordered_and_deduplicated() {
+        let mut state = SubscriptionState::default();
+        let candle = confirmed_minute().candlestick;
+        let end = unix_nanos(candle.timestamp).unwrap() + 60_000_000_000_u64;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let symbols = ["TSLA.US", "NVDA.US", "MSFT.US", "META.US", "AMZN.US"];
+        for symbol in symbols {
+            let kind: BarType = format!("{symbol}.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL")
+                .parse()
+                .unwrap();
+            for _ in 0..2 {
+                state
+                    .queue_confirmed_minute(kind, candle, end - 402_000_000_u64)
+                    .unwrap();
+            }
+        }
+        assert_eq!(state.pending_minutes.len(), symbols.len());
+        state.publish_due_minutes(end - 1_u64, &sender);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            state.next_minute_delay(end - 1_u64),
+            Some(Duration::from_nanos(1))
+        );
+        // 无新行情也可由定时器发布；同时到期时使用固定顺序，保持组合事件可复现
+        state.publish_due_minutes(end, &sender);
+        let mut delivered = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            let DataEvent::Data(Data::Custom(data)) = event else {
+                panic!("Expected confirmed bar")
+            };
+            let value = data.data.as_any().downcast_ref::<BarWithVwap>().unwrap();
+            delivered.push(value.bar.bar_type.instrument_id().symbol.to_string());
+            assert_eq!(value.bar.ts_init, end);
+            assert_eq!(value.bar.ts_event, end);
+            state
+                .queue_confirmed_minute(value.bar.bar_type, candle, end)
+                .unwrap();
+            let mut old = candle;
+            old.timestamp -= time::Duration::minutes(1);
+            state
+                .queue_confirmed_minute(value.bar.bar_type, old, end)
+                .unwrap();
+        }
+        assert_eq!(
+            delivered,
+            ["AMZN.US", "META.US", "MSFT.US", "NVDA.US", "TSLA.US"]
+        );
+        assert!(state.pending_minutes.is_empty());
+        state.publish_due_minutes(end, &sender);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_unconfirmed_updates_never_enter_delay_queue() {
+        let mut state = SubscriptionState::default();
+        let kind: BarType = "AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        state
+            .bars
+            .insert(("AAPL.US".into(), Period::OneMinute as i32), (kind, 2));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut update = confirmed_minute();
+        update.is_confirmed = false;
+        let end = unix_nanos(update.candlestick.timestamp).unwrap() + 60_000_000_000_u64;
+        state.handle_candlestick("AAPL.US", update, end - 402_000_000_u64, &sender);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            DataEvent::Data(Data::Bar(_))
+        ));
+        assert!(state.pending_minutes.is_empty());
+        state.publish_due_minutes(end, &sender);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_unsubscribe_discards_pending_minute_before_resubscribe() {
+        let mut state = SubscriptionState::default();
+        let kind: BarType = "AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        let key = ("AAPL.US".to_string(), Period::OneMinute as i32);
+        state.bars.insert(key.clone(), (kind, 2));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let candle = confirmed_minute().candlestick;
+        let end = unix_nanos(candle.timestamp).unwrap() + 60_000_000_000_u64;
+        state
+            .queue_confirmed_minute(kind, candle, end - 402_000_000_u64)
+            .unwrap();
+        state.remove_bar_subscription("AAPL.US", Period::OneMinute);
+        state.bars.insert(key, (kind, 2));
+        state.publish_due_minutes(end, &sender);
+        assert!(state.next_minute_delay(end).is_none());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[rstest]
+    fn test_pending_minute_rechecks_clock_before_dispatch() {
+        let mut state = SubscriptionState::default();
+        let kind: BarType = "AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        let candle = confirmed_minute().candlestick;
+        let end = unix_nanos(candle.timestamp).unwrap() + 60_000_000_000_u64;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .queue_confirmed_minute(kind, candle, end - 402_000_000_u64)
+            .unwrap();
+        state.publish_due_minutes(end - 800_000_000_u64, &sender);
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            state.next_minute_delay(end - 800_000_000_u64),
+            Some(Duration::from_millis(800))
+        );
+        // 超出界限的时钟回退不能导致发布未来 Bar，也不能无限延长队列等待
+        state.publish_due_minutes(end - 2_000_000_000_u64, &sender);
+        assert!(state.pending_minutes.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_disconnect_discards_pending_minutes() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender.clone());
+        let mut client = LongbridgeDataClient::new(
+            ClientId::from("LONGBRIDGE"),
+            LongbridgeDataClientConfig::default(),
+        );
+        let kind: BarType = "AAPL.US.LONGBRIDGE-1-MINUTE-LAST-EXTERNAL".parse().unwrap();
+        let candle = confirmed_minute().candlestick;
+        let end = unix_nanos(candle.timestamp).unwrap() + 60_000_000_000_u64;
+        client
+            .subscriptions
+            .lock()
+            .unwrap()
+            .queue_confirmed_minute(kind, candle, end - 402_000_000_u64)
+            .unwrap();
+        client.disconnect().await.unwrap();
+        assert!(client.cancellation_token.is_cancelled());
+        let mut state = client.subscriptions.lock().unwrap();
+        assert!(state.pending_minutes.is_empty());
+        state.publish_due_minutes(end, &sender);
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[rstest]
     fn test_historical_bar_request_validation() {

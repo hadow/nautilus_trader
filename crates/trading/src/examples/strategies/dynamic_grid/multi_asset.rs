@@ -39,7 +39,7 @@ use nautilus_model::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderExpired,
         OrderFillVoided, OrderFilled, OrderRejected, OrderSubmitted,
     },
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, StrategyId},
     instruments::Instrument,
     orders::{Order, OrderAny},
     position::Position,
@@ -105,6 +105,9 @@ pub struct MultiAssetGridConfig {
     pub state_path: Option<PathBuf>,
     /// 由 runner 提供的环境/账户身份。
     pub recovery_context: Option<String>,
+    /// 只估值、不交易的外部持仓标的；必须属于配置池，且不能被本策略认领。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub isolated_instruments: BTreeSet<InstrumentId>,
 }
 
 fn default_position_fraction() -> Decimal {
@@ -125,6 +128,20 @@ impl MultiAssetGridConfig {
             "At least one instrument is required"
         );
         anyhow::ensure!(
+            self.isolated_instruments
+                .iter()
+                .all(|id| self.instruments.contains_key(id))
+                && self.isolated_instruments.len() < self.instruments.len()
+                && self
+                    .base
+                    .external_order_claims
+                    .as_ref()
+                    .is_none_or(|claims| claims
+                        .iter()
+                        .all(|id| !self.isolated_instruments.contains(id))),
+            "Isolated instruments must be configured, unclaimed, and leave a tradable universe"
+        );
+        anyhow::ensure!(
             self.base.strategy_id.is_some()
                 && self.base.order_id_tag.is_some()
                 && !self.base.manage_stop,
@@ -139,6 +156,11 @@ impl MultiAssetGridConfig {
         let mut total = Decimal::ZERO;
         for (id, instrument) in &self.instruments {
             instrument.grid.validate()?;
+            anyhow::ensure!(
+                instrument.grid.sequential_requote_bars.is_none()
+                    || instrument.bar_type.spec().is_time_aggregated(),
+                "Sequential requote requires time-aggregated signal bars"
+            );
             RegimeFilter::validate_bar_type(&instrument.grid, instrument.bar_type)?;
             anyhow::ensure!(
                 id.venue == venue && instrument.bar_type.instrument_id() == *id,
@@ -207,6 +229,7 @@ impl From<DynamicGridConfig> for MultiAssetGridConfig {
             portfolio,
             state_path: c.state_path,
             recovery_context: c.recovery_context,
+            isolated_instruments: BTreeSet::new(),
         }
     }
 }
@@ -239,6 +262,20 @@ struct Checkpoint {
     portfolio_performance: PerformanceTracker,
     orders: Vec<OrderAny>,
     positions: Vec<Position>,
+    #[serde(default)]
+    external_positions: BTreeMap<InstrumentId, ExternalPosition>,
+}
+
+/// 只保存隔离归属与风险基线，不伪造成交或网格库存。数量变化必须重新人工核对。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ExternalPosition {
+    quantity: Decimal,
+    reference_price: Option<Decimal>,
+    // 重启后必须等新报价，不能用检查点中的旧行情开放买入。
+    #[serde(skip)]
+    price: Decimal,
+    #[serde(skip)]
+    ts_ns: u64,
 }
 
 // 与读取格式保持一致；写盘借用策略账本和分析历史，不为每次 fsync 克隆全部历史。
@@ -257,6 +294,7 @@ struct CheckpointRef<'a> {
     portfolio_performance: &'a PerformanceTracker,
     orders: Vec<OrderAny>,
     positions: Vec<Position>,
+    external_positions: &'a BTreeMap<InstrumentId, ExternalPosition>,
 }
 
 /// 全组合只使用一个原生 `StrategyCore`；单标的引擎只是状态机，不嵌套 Strategy 实例。
@@ -274,6 +312,7 @@ pub struct MultiAssetGridStrategy {
     stopped: bool,
     last_account_query: u64,
     entries_resume_ns: u64,
+    external_positions: BTreeMap<InstrumentId, ExternalPosition>,
 }
 
 impl MultiAssetGridStrategy {
@@ -306,6 +345,7 @@ impl MultiAssetGridStrategy {
         let engines = config
             .instruments
             .iter()
+            .filter(|(id, _)| !config.isolated_instruments.contains(id))
             .map(|(id, c)| {
                 let mut single = DynamicGridConfig::new(*id, c.bar_type);
                 single.base = config.base.clone();
@@ -337,6 +377,10 @@ impl MultiAssetGridStrategy {
             correlations: BTreeMap::new(),
         }));
         Ok(Self {
+            external_positions: loaded
+                .as_ref()
+                .map(|s| s.external_positions.clone())
+                .unwrap_or_default(),
             core: StrategyCore::new_checked(config.base.clone())?,
             config,
             engines,
@@ -460,7 +504,8 @@ impl MultiAssetGridStrategy {
     }
 
     fn exposures(&self, current: Option<&GridStrategyEngine>) -> Vec<InstrumentExposure> {
-        self.engines
+        let mut views: Vec<_> = self
+            .engines
             .values()
             .chain(current)
             .map(|e| {
@@ -490,7 +535,80 @@ impl MultiAssetGridStrategy {
                     max_age_secs: e.config.grid.max_signal_age_secs,
                 }
             })
-            .collect()
+            .collect();
+        for (id, position) in &self.external_positions {
+            let config = &self.config.instruments[id];
+            let price = if position.price > Decimal::ZERO {
+                position.price
+            } else {
+                position.reference_price.unwrap_or(Decimal::ZERO)
+            };
+            views.push(InstrumentExposure {
+                id: *id,
+                sector: config.sector.clone(),
+                base_allocation: Decimal::ZERO,
+                max_position_pct: Decimal::ZERO,
+                enabled: false,
+                cash_delta: Decimal::ZERO,
+                exposure: position.quantity * price,
+                pending: Decimal::ZERO,
+                net_pnl: position.quantity * (price - position.reference_price.unwrap_or(price)),
+                regime: MarketRegime::Disabled,
+                atr_pct: Decimal::ZERO,
+                risk_off: false,
+                mark_ns: position.ts_ns,
+                max_age_secs: config.grid.max_signal_age_secs,
+            });
+        }
+        views
+    }
+
+    fn external_ready(&self, now: u64) -> bool {
+        self.config.isolated_instruments.iter().all(|id| {
+            self.external_positions.get(id).is_some_and(|p| {
+                p.quantity.is_zero()
+                    || (p.reference_price.is_some()
+                        && p.price > Decimal::ZERO
+                        && super::regime::is_fresh(
+                            p.ts_ns,
+                            now,
+                            self.config.instruments[id].grid.max_signal_age_secs,
+                        ))
+            })
+        })
+    }
+
+    /// 外部市值占用风险额度，但不能扩大网格现金预算，也不能算作策略收益。
+    fn risk_equity(
+        &self,
+        strategy_equity: Decimal,
+        broker_equity: Decimal,
+        views: &[InstrumentExposure],
+    ) -> Decimal {
+        (strategy_equity
+            + views
+                .iter()
+                .filter(|v| self.config.isolated_instruments.contains(&v.id))
+                .map(|v| v.net_pnl)
+                .sum::<Decimal>())
+        .min(broker_equity)
+    }
+
+    fn owned_or_isolated(&self, position: &Position) -> bool {
+        position.side == PositionSide::Long
+            && if self
+                .config
+                .isolated_instruments
+                .contains(&position.instrument_id)
+            {
+                position.strategy_id == StrategyId::from("EXTERNAL")
+            } else {
+                Some(position.strategy_id) == self.config.base.strategy_id
+                    && self
+                        .config
+                        .instruments
+                        .contains_key(&position.instrument_id)
+            }
     }
 
     fn account_capacity(&self, current: &GridStrategyEngine) -> anyhow::Result<(Decimal, Decimal)> {
@@ -500,13 +618,21 @@ impl MultiAssetGridStrategy {
         let cache = self.core.cache_ref();
         for position in cache.positions_open_refs(None, None, None, None, None) {
             anyhow::ensure!(
-                position.strategy_id == sid
-                    && position.side == PositionSide::Long
-                    && self
-                        .config
-                        .instruments
-                        .contains_key(&position.instrument_id),
+                self.owned_or_isolated(&position),
                 "Unowned account inventory requires reconciliation"
+            );
+        }
+        for id in &self.config.isolated_instruments {
+            let quantity: Decimal = cache
+                .positions_open_refs(None, Some(id), None, None, None)
+                .iter()
+                .map(|p| p.quantity.as_decimal())
+                .sum();
+            anyhow::ensure!(
+                self.external_positions
+                    .get(id)
+                    .is_some_and(|p| p.quantity == quantity),
+                "Isolated inventory changed; reconcile before resuming: {id}"
             );
         }
         for order in cache.orders_open(None, None, None, None, None) {
@@ -577,6 +703,13 @@ impl MultiAssetGridStrategy {
         current: &GridStrategyEngine,
         intent: &GridOrder,
     ) -> anyhow::Result<Decimal> {
+        anyhow::ensure!(
+            !self
+                .config
+                .isolated_instruments
+                .contains(&current.config.instrument_id),
+            "Isolated instrument cannot submit orders"
+        );
         if self.recovering || self.stopped {
             return Ok(Decimal::ZERO);
         }
@@ -619,7 +752,11 @@ impl MultiAssetGridStrategy {
         includes_intent: bool,
     ) -> anyhow::Result<Decimal> {
         let now = self.clock().timestamp_ns().as_u64();
-        if self.recovering || self.stopped || now < self.entries_resume_ns {
+        if self.recovering
+            || self.stopped
+            || now < self.entries_resume_ns
+            || !self.external_ready(now)
+        {
             return Ok(Decimal::ZERO);
         }
         let previous_peak = self.portfolio_risk.peak_equity;
@@ -629,10 +766,16 @@ impl MultiAssetGridStrategy {
         let mut views = self.exposures(Some(current));
         let cash =
             self.config.portfolio.capital + views.iter().map(|v| v.cash_delta).sum::<Decimal>();
-        let equity = cash + views.iter().map(|v| v.exposure).sum::<Decimal>();
+        let equity = cash
+            + views
+                .iter()
+                .filter(|v| !self.config.isolated_instruments.contains(&v.id))
+                .map(|v| v.exposure)
+                .sum::<Decimal>();
         let (free, broker_equity) = self.account_capacity(current)?;
+        let risk_equity = self.risk_equity(equity, broker_equity, &views);
         self.portfolio_risk
-            .observe(&self.config.portfolio, equity.min(broker_equity), now);
+            .observe(&self.config.portfolio, risk_equity, now);
         self.portfolio_risk
             .reallocate(&self.config.portfolio, &views, now);
         let c = &current.config.grid;
@@ -663,7 +806,7 @@ impl MultiAssetGridStrategy {
             &self.config.portfolio,
             &views,
             current.config.instrument_id,
-            equity.min(broker_equity),
+            risk_equity,
             cash,
             free,
             desired,
@@ -778,6 +921,7 @@ impl MultiAssetGridStrategy {
         CheckpointRef {
             version: 6,
             config: &self.config,
+            external_positions: &self.external_positions,
             instruments,
             portfolio_risk: &self.portfolio_risk,
             portfolio_performance: &self.portfolio_performance,
@@ -832,7 +976,12 @@ impl MultiAssetGridStrategy {
         let views = self.exposures(None);
         let cash =
             self.config.portfolio.capital + views.iter().map(|v| v.cash_delta).sum::<Decimal>();
-        let exposure = views.iter().map(|v| v.exposure).sum::<Decimal>();
+        let exposure = views
+            .iter()
+            .filter(|v| !self.config.isolated_instruments.contains(&v.id))
+            .map(|v| v.exposure)
+            .sum::<Decimal>();
+        let total_exposure: Decimal = views.iter().map(|v| v.exposure).sum();
         let position = self
             .engines
             .values()
@@ -845,7 +994,13 @@ impl MultiAssetGridStrategy {
             .next()
             .map(|e| self.account_capacity(e))
             .transpose()?;
-        let risk_equity = account.map_or(equity, |(_, value)| equity.min(value));
+        // 重启等待外部报价时不能把风险基线价当作现价，否则可能虚构回撤。
+        // 此时仍核对账户所有权/数量并撤买单，但沿用已持久化的最后风险权益。
+        let risk_equity = if self.external_ready(now) {
+            account.map_or(equity, |(_, value)| self.risk_equity(equity, value, &views))
+        } else {
+            self.portfolio_risk.last_equity
+        };
         self.portfolio_risk
             .observe(&self.config.portfolio, risk_equity, now);
         self.portfolio_performance
@@ -867,7 +1022,11 @@ impl MultiAssetGridStrategy {
                     views
                         .iter()
                         .filter(|v| {
-                            matches!(v.regime, MarketRegime::TrendUp | MarketRegime::TrendDown)
+                            !self.config.isolated_instruments.contains(&v.id)
+                                && matches!(
+                                    v.regime,
+                                    MarketRegime::TrendUp | MarketRegime::TrendDown
+                                )
                         })
                         .map(|v| v.exposure)
                         .sum(),
@@ -900,7 +1059,8 @@ impl MultiAssetGridStrategy {
         let pending: Decimal = views.iter().map(|v| v.pending).sum();
         let global_limit = self.config.portfolio.exposure_limit();
         let cancel_all = self.portfolio_blocked()
-            || exposure + pending > risk_equity * global_limit
+            || !self.external_ready(now)
+            || total_exposure + pending > risk_equity * global_limit
             || cash - pending < risk_equity * self.config.portfolio.min_cash_reserve
             || account.is_some_and(|(free, _)| pending > free);
         let concentration_breaches = self.portfolio_risk.concentration_breaches(
@@ -910,6 +1070,9 @@ impl MultiAssetGridStrategy {
             now,
         );
         for view in views {
+            if self.config.isolated_instruments.contains(&view.id) {
+                continue; // 风控可撤本策略买单，但绝不触碰外部标的。
+            }
             let allocation = self
                 .portfolio_risk
                 .allocations
@@ -1076,12 +1239,18 @@ impl MultiAssetGridStrategy {
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("Empty instrument universe"))?,
         )?;
-        let equity = (cash + exposure).min(broker_equity);
+        let strategy_exposure: Decimal = views
+            .iter()
+            .filter(|v| !self.config.isolated_instruments.contains(&v.id))
+            .map(|v| v.exposure)
+            .sum();
+        let equity = self.risk_equity(cash + strategy_exposure, broker_equity, &views);
         let c = &self.config.portfolio;
         anyhow::ensure!(
-            views
-                .iter()
-                .all(|v| now.saturating_sub(v.mark_ns) / 1_000_000_000 <= v.max_age_secs)
+            self.external_ready(now)
+                && views
+                    .iter()
+                    .all(|v| now.saturating_sub(v.mark_ns) / 1_000_000_000 <= v.max_age_secs)
                 && equity > Decimal::ZERO
                 && cash.min(free) >= equity * c.min_cash_reserve
                 && exposure <= equity * c.exposure_limit()
@@ -1124,11 +1293,29 @@ impl DataActor for MultiAssetGridStrategy {
         }
         for position in self.cache().positions_open(None, None, None, None, None) {
             anyhow::ensure!(
-                position.strategy_id == sid
-                    && position.side == PositionSide::Long
-                    && self.engines.contains_key(&position.instrument_id),
+                self.owned_or_isolated(&position),
                 "Unowned account position blocks portfolio recovery"
             );
+        }
+        for id in self.config.isolated_instruments.clone() {
+            let quantity = self
+                .cache()
+                .positions_open(None, Some(&id), None, None, None)
+                .iter()
+                .map(|p| p.quantity.as_decimal())
+                .sum();
+            let position = self
+                .external_positions
+                .entry(id)
+                .or_insert(ExternalPosition {
+                    quantity,
+                    ..Default::default()
+                });
+            anyhow::ensure!(
+                position.quantity == quantity,
+                "Isolated inventory changed on restart: {id}"
+            );
+            self.subscribe_quotes(id, None, None);
         }
         let ids: Vec<_> = self.engines.keys().copied().collect();
         let mut currency = None;
@@ -1140,6 +1327,16 @@ impl DataActor for MultiAssetGridStrategy {
             );
             currency = Some(instrument.quote_currency());
             self.with_engine(*id, GridStrategyEngine::on_start)?;
+        }
+        for id in &self.config.isolated_instruments {
+            let instrument = self.cache().try_instrument(id)?;
+            anyhow::ensure!(
+                matches!(
+                    instrument,
+                    nautilus_model::instruments::InstrumentAny::Equity(_)
+                ) && currency == Some(instrument.quote_currency()),
+                "Isolation supports same-currency long equities only"
+            );
         }
         if self
             .config
@@ -1201,6 +1398,41 @@ impl DataActor for MultiAssetGridStrategy {
             || quote.bid_size.is_zero()
             || quote.ask_size.is_zero()
         {
+            return Ok(());
+        }
+        if self
+            .config
+            .isolated_instruments
+            .contains(&quote.instrument_id)
+        {
+            let now = self.clock().timestamp_ns().as_u64();
+            let Some(position) = self.external_positions.get_mut(&quote.instrument_id) else {
+                return Ok(()); // 启动对账完成之前不建立风险基线。
+            };
+            if quote.ts_event.as_u64() <= position.ts_ns
+                || !super::regime::is_fresh(
+                    quote.ts_event.as_u64(),
+                    now,
+                    self.config.instruments[&quote.instrument_id]
+                        .grid
+                        .max_signal_age_secs,
+                )
+            {
+                return Ok(());
+            }
+            position.price = quote.bid_price.as_decimal();
+            position.ts_ns = quote.ts_event.as_u64();
+            let initialize = position.reference_price.is_none();
+            position.reference_price.get_or_insert(position.price);
+            self.observe_close(quote.instrument_id, now, quote.bid_price.as_decimal());
+            if let Err(error) = self.observe_portfolio(false) {
+                self.halt_all(&error.to_string());
+                return Err(error);
+            }
+            if initialize && let Err(error) = self.persist(None, None) {
+                self.halt_all(&error.to_string());
+                return Err(error);
+            }
             return Ok(());
         }
         self.portfolio_performance.diagnostics.quote_events = self
@@ -1294,6 +1526,7 @@ impl DataActor for MultiAssetGridStrategy {
             }
             self.portfolio_risk = saved.portfolio_risk.clone();
             self.portfolio_performance = saved.portfolio_performance.clone();
+            self.external_positions = saved.external_positions.clone();
             self.loaded = Some(saved);
             self.recovering = true;
         }
@@ -1399,7 +1632,8 @@ nautilus_strategy!(MultiAssetGridStrategy, {
             return;
         }
         let result = self.dispatch(event.instrument_id, false, |e, r| {
-            e.apply_fill(event)?;
+            let now = r.clock().timestamp_ns().as_u64();
+            e.apply_fill(event, now)?;
             r.persist_engine(e, None)?;
             if matches!(
                 e.state.state,
@@ -1412,7 +1646,6 @@ nautilus_strategy!(MultiAssetGridStrategy, {
                 && !(e.state.risk.risk_off_reason.is_some()
                     && e.config.grid.risk_policy == super::config::RiskPolicy::Flatten)
             {
-                let now = r.clock().timestamp_ns().as_u64();
                 e.exits(r, now, false)?;
             }
             Ok(())
@@ -1452,8 +1685,22 @@ impl Checkpoint {
             "Checkpoint version/configuration mismatch; audit before migration"
         );
         anyhow::ensure!(
-            self.instruments.keys().eq(expected.instruments.keys()),
+            self.instruments.keys().eq(expected
+                .instruments
+                .keys()
+                .filter(|id| !expected.isolated_instruments.contains(id))),
             "Recovered instrument set mismatch"
+        );
+        anyhow::ensure!(
+            self.external_positions
+                .keys()
+                .eq(expected.isolated_instruments.iter())
+                && self
+                    .external_positions
+                    .values()
+                    .all(|p| p.quantity >= Decimal::ZERO
+                        && p.reference_price.is_none_or(|price| price > Decimal::ZERO)),
+            "Invalid isolated position checkpoint"
         );
         self.portfolio_risk.validate(
             &expected.portfolio,

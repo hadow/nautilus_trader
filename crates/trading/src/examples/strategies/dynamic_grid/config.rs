@@ -38,6 +38,26 @@ pub enum SpacingMode {
     Atr,
 }
 
+/// 网格买入层的实际挂单方式，不改变几何层级或覆盖卖单。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GridEntryMode {
+    /// 保留原行为：预算允许时同时挂出全部合格买入层。
+    #[default]
+    AllLevels,
+    /// 每次只激活最近一层，新增买单须等待独立的已完成信号 Bar。
+    Sequential,
+}
+
+impl GridEntryMode {
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Serde skip_serializing_if requires a predicate taking &T"
+    )]
+    fn is_all_levels(&self) -> bool {
+        *self == Self::AllLevels
+    }
+}
+
 /// 趋势斜率与价格确认使用的移动平均类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegimeAverage {
@@ -52,6 +72,8 @@ pub enum RegimeAverage {
 pub enum PositionSizing {
     /// 每层使用相同资金。
     Equal,
+    /// 等额预算取整后，将各侧余款按近到远补成完整交易单位，不改变价格层或总预算。
+    EqualLots,
     /// 离中心越远，分配越大。
     Progressive,
     /// 越靠近中心，分配越大。
@@ -90,6 +112,15 @@ pub enum RiskPolicy {
 pub struct GridConfig {
     /// 选择研究基准行为或股票自适应生产行为。
     pub strategy_mode: StrategyMode,
+    /// 缺省保持原多层挂单；候选模式必须显式启用，避免改变旧检查点配置。
+    #[serde(skip_serializing_if = "GridEntryMode::is_all_levels")]
+    pub entry_mode: GridEntryMode,
+    /// 可选 Sequential 换层确认数；连续完成 Bar 出现同一更近限价层后才撤旧单。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequential_requote_bars: Option<u32>,
+    /// 可选 Sequential 成本感知止盈；仅为尚未挂卖单的全额成交限价买单选择更近原网格层。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fill_cost_exits: bool,
     /// 中心价每一侧的网格层数。
     pub grid_levels: usize,
     /// 使用固定百分比或 ATR 计算间距。
@@ -257,6 +288,9 @@ impl Default for GridConfig {
     fn default() -> Self {
         Self {
             strategy_mode: StrategyMode::LegacyDgt,
+            entry_mode: GridEntryMode::AllLevels,
+            sequential_requote_bars: None,
+            fill_cost_exits: false,
             grid_levels: 10,
             spacing_mode: SpacingMode::Atr,
             spacing_pct: Decimal::new(1, 2),
@@ -347,6 +381,16 @@ impl GridConfig {
     ///
     /// 周期无效、信号参数非有限值，或风险/成本边界相互矛盾时返回错误。
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.fill_cost_exits || self.entry_mode == GridEntryMode::Sequential,
+            "Fill-cost exits require Sequential entry"
+        );
+        if let Some(bars) = self.sequential_requote_bars {
+            anyhow::ensure!(
+                self.entry_mode == GridEntryMode::Sequential && (2..=1024).contains(&bars),
+                "Sequential requote requires Sequential entry and 2..=1024 confirmation bars"
+            );
+        }
         if let Some(scale) = &self.grid_scale_regime {
             anyhow::ensure!(
                 self.strategy_mode == StrategyMode::StockAdaptive
@@ -533,6 +577,35 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[rstest]
+    fn sequential_research_defaults_and_validation() {
+        let original = serde_json::to_value(GridConfig::default()).unwrap();
+        assert!(original.get("sequential_requote_bars").is_none());
+        assert!(original.get("fill_cost_exits").is_none());
+        for patch in [
+            serde_json::json!({"sequential_requote_bars": 2}),
+            serde_json::json!({"fill_cost_exits": true}),
+            serde_json::json!({"entry_mode": "Sequential", "sequential_requote_bars": 1}),
+        ] {
+            let mut value = original.clone();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            assert!(
+                serde_json::from_value::<GridConfig>(value)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
+        let valid: GridConfig = serde_json::from_value(serde_json::json!({
+            "entry_mode": "Sequential", "sequential_requote_bars": 2, "fill_cost_exits": true,
+        }))
+        .unwrap();
+        valid.validate().unwrap();
+    }
 
     #[rstest]
     fn grid_scale_regime_is_opt_in_and_rejects_invalid_research_limits() {

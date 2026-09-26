@@ -26,6 +26,20 @@ The SDK execution record does not expose commission or liquidity side. Fill repo
 zero commission in the order currency and `NO_LIQUIDITY_SIDE`; downstream accounting should replace
 these values from a broker statement if exact fee reconciliation is required.
 
+## Confirmed minute bars
+
+Dynamic Grid consumes confirmed one-minute `BarWithVwap` events. If an SDK-confirmed candle
+arrives up to one second before its interval ends on the local clock, the adapter queues it until
+that boundary instead of discarding it. The event loop continues receiving quotes and trades;
+the timer rechecks the clock before dispatch. Larger clock differences are rejected with the
+symbol, source start, interval end and receive timestamp in the diagnostic.
+
+Only one confirmed candle per bar subscription can wait at a time. Duplicate and older confirmations
+are suppressed within the subscription; unsubscribe, disconnect and stop discard pending candles.
+The bar keeps its interval-end `ts_event`, while `ts_init` records initialization at dispatch.
+Source price and VWAP precision and the strict historical parser are unchanged. This does not
+promote unconfirmed updates to confirmed data or change the ordinary streaming `Bar` channel.
+
 ## API limits
 
 The adapter applies process-wide Longbridge limits across every client instance:
@@ -242,7 +256,8 @@ check cannot remove the strategy's conservative pending-order reservations.
 
 `--run` now enforces these blockers before building a Paper/Live node. It first locks and validates
 the local checkpoint, then queries the account. A fresh start additionally requires free cash to
-cover the configured capital and no unattributed frozen cash. Restoring a valid checkpoint does
+cover the configured capital and no unattributed frozen cash, unless the Paper-only waiver below
+is explicitly enabled. Restoring a valid checkpoint does
 not require funding the initial budget again: native reconciliation and order risk checks must
 still run, and lack of spare cash must not by itself prevent recovery for inventory reduction.
 Do not create a dummy checkpoint to evade these checks.
@@ -254,7 +269,7 @@ The queries are sequential snapshots, not an atomic account view; order counts c
 does not validate its contents. No checkpoint is created, imported, deleted or unlocked by this check.
 
 For a separately prepared `mode=Live` configuration, `--check-live` performs the same read-only
-queries against the live account; it cannot be combined with `--run` or `--live`. It does not place
+queries without the SDK's Paper-only account guard; it cannot be combined with `--run` or `--live`. It does not place
 orders. Trading still requires both `mode=Live` and `--run --live`. A bare `--live`, duplicate flags,
 or a check flag for the wrong mode is rejected before connecting. The repository Paper example
 is not converted to a live configuration by any of these commands.
@@ -429,6 +444,77 @@ target/debug/longbridge-dynamic-grid \
 Use Ctrl-C for the normal shutdown path and verify broker orders/inventory afterwards. Stopping
 does not flatten positions. Preserve the matching checkpoint; never restart with a fresh state
 merely to evade a recovery or risk failure.
+
+### 外部持仓隔离（2026-09-25）
+
+Runner 支持显式配置 `isolated_instruments`，例如：
+
+```json
+"isolated_instruments": ["AAPL.US.LONGBRIDGE"]
+```
+
+这是**整个标的只读隔离**，不是把 `enabled` 改为 `false`。隔离标的仍须在
+`instruments` 中提供行情与行业配置，但不会构建网格引擎；不会买入、卖出、撤单或
+被 kill switch / Flatten 接管。其原有配置额度不自动转给其他股票。
+当前 `dynamic_grid_live_six.json` 已隔离 AAPL，因此实际可交易的是另外五只股票。
+六标的 Paper 配置经独立 `--check-paper` 核对后也隔离 AAPL，不接管已有 20 股。
+
+开启隔离后，runner 不再按标的认领未知外部订单。已有策略订单依赖原子检查点恢复
+原生归属；外部持仓由 Nautilus 对账保持为 `EXTERNAL`。隔离只支持配置池内、同报价币种
+的多头股票；池外持仓、空头、币种不匹配和未知未终结订单继续阻止启动。
+仍有手工委托的隔离标的不会自动撤单或放行。
+
+外部持仓市值进入总暴露、行业、相关性和同时持仓标的数限制，不增加可交易现金。
+首次新鲜有效 bid 建立风险估值基线，后续外部浮盈亏纳入组合亏损风控，但不混入
+策略收益报告或网格周期。风险预算仍以配置资本为基准，不因已有外部资产而自动放大。
+缺少新鲜报价时禁止所有新增买入；有真实网格库存覆盖的卖出仍按原规则处理。
+
+检查点保存隔离名单、数量和风险价格基线。重启清空报价新鲜度；券商数量与基线不符、
+包括手工买卖或公司行动造成的数量变化时，停止新增交易并要求重新核对，不自动接管差额。
+不得删除检查点或直接修改隔离名单来绕过这项保护。
+
+只读检查现在合并今日与历史接口的订单，并输出 `holdings`、`isolated_positions`、
+`cash_check.available_cash`、`frozen_cash`、`settling_cash`、`frozen_transaction_fees`
+及待买限价单名义金额。输出包含账户敏感数据，不要提交或公开原始日志。
+历史接口有返回窗口，未找到活动订单并不证明冻结额无效；手续费金额相同也不等于
+逐笔预留已验证。`freeze_attribution=UNVERIFIED` 时保留 `UNATTRIBUTED_FROZEN_CASH`
+新启动门禁（下文的 Paper 显式豁免除外）；冻结和待交收资金不会加回可用现金。
+
+本次 SDK/OAuth 只读核对已排除“未隔离持仓无检查点”这一阻塞，但冻结资金来源仍未
+得到订单证据支持，**未启动 Paper 或 Live 交易节点**。CLI 与 runner 的账户快照也存在
+差异，不能拿不同授权上下文的余额互相佐证。部署前应由同一 OAuth 授权下的券商账户
+和账单确认资金归属；本改动不宣称完成真实券商恢复或成交验收。
+
+离线验证：Dynamic Grid 单元回归 193 项、原生集成 87 项、Adapter 库 42 项、runner
+门禁 15 项通过；4 项原有性能测试未执行。debug 构建、修改文件格式检查和 Adapter
+定向 Clippy 通过。核心 crate 的 Clippy 仍有 12 项未改动的 `momentum_pullback`
+既有错误；未宣称全仓检查通过。没有运行季度回测或真实券商交易验收。
+
+### 模拟账户冻结资金豁免
+
+`paper_allow_unattributed_frozen_cash` 默认 `false`，仅 `mode=Paper` 可设为 `true`；
+Live / Sandbox 配置启用它会在连接券商前报错。六标的 Paper 配置已开启该选项，
+Live 配置保持严格门禁。
+
+该选项只将 `UNATTRIBUTED_FROZEN_CASH` 降为
+`startup_warnings=["PAPER_UNATTRIBUTED_FROZEN_CASH_WAIVED"]`，运行时也打印警告。
+`freeze_attribution` 仍为 `UNVERIFIED`，不表示冻结款已核清或可以使用。
+可用现金不足、未知订单、未隔离持仓、检查点校验和原生启动对账均不豁免。
+要恢复严格检查，将此选项改回 `false`。
+
+Paper 使用真正的 Longbridge Adapter 提交券商模拟委托，不是本地 Sandbox 撮合。
+预检和执行均启用 SDK `papertrading=true`；SDK 使用 `x-papertrading: true`，
+由服务端拒绝实盘账户令牌。未启用这个标记不代表账户一定是实盘，因此模拟账户应使用
+Paper 配置和 `--run`，不要沿用 Live 配置及 `--live`。
+
+```bash
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_paper_six.json --check-paper
+
+# 会提交券商模拟订单；先检查上方输出，再由操作员启动。
+target/debug/longbridge-dynamic-grid \
+  crates/adapters/longbridge/examples/dynamic_grid_paper_six.json --run
+```
 
 ## Examples and tests
 

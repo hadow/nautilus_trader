@@ -1,0 +1,41 @@
+{
+  "instruments": {
+    "AAPL.SIM": "instuments/comparison/AAPL.json",
+    "MSFT.SIM": "instuments/comparison/MSFT.json",
+    "NVDA.SIM": "instuments/NVDA.json",
+    "TSLA.SIM": "instuments/TSLA.json",
+    "AMZN.SIM": "instuments/AMZN.json",
+    "META.SIM": "instuments/META.json"
+  },
+  "portfolio": {
+    "capital": "100000",
+    "max_order_value": "20000",
+    "max_orders_per_minute": 120,
+    "max_concurrent_symbols": 16,
+    "kill_switch": false,
+    "risk_policy": "Hold",
+    "max_instrument_allocation": "0.20",
+    "max_total_exposure": "0.70",
+    "max_total_grid_exposure": "0.70",
+    "max_total_equity_exposure": "0.70",
+    "min_cash_reserve": "0.20",
+    "max_portfolio_drawdown": "0.25",
+    "max_portfolio_daily_loss": "0.07",
+    "max_sector_exposure": "0.40",
+    "max_correlated_exposure": "0.50",
+    "correlation_threshold": 0.8,
+    "correlation_lookback_days": 60,
+    "correlation_min_observations": 20,
+    "min_reallocation_interval_secs": 3600,
+    "min_allocation_change_pct": "0.03",
+    "trend_up_allocation_factor": "0.75",
+    "trend_down_allocation_factor": "0.25",
+    "allocation_volatility_target": "0.02",
+    "allocation_pnl_weight": "2"
+  },
+  "currency": "USD",
+  "random_seed": 42,
+  "slippage_probability": 1,
+  "start_ns": 1738540800000000000,
+  "end_ns": 1739577600000000000
+}

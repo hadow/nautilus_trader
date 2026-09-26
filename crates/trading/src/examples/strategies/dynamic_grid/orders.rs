@@ -23,7 +23,10 @@ use std::{
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::{config::GridConfig, engine::GridLevel};
+use super::{
+    config::GridConfig,
+    engine::{GridEngine, GridLevel},
+};
 
 /// 单个股票持仓内部的库存归属。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +116,7 @@ pub struct InventoryLot {
     /// 库存归属核心仓或战术网格仓。
     #[serde(default)]
     pub component: PositionComponent,
-    /// 原始止盈目标；网格重置后仍保留。
+    /// 止盈目标；可选成本适配只能在首次卖单前降低，网格重置后仍保留。
     pub target: Decimal,
     /// 已买入数量。
     pub bought: Decimal,
@@ -599,6 +602,50 @@ impl OrderManager {
         self.live.take();
         self.orders.insert(id, order.clone());
         Ok(order)
+    }
+
+    /// 仅为全额成交、尚无任何卖单历史的 Grid 限价买入调整一次目标。
+    /// 部分成交即时覆盖路径、种子/Core、旧代库存及既有卖单均不改价。
+    pub(super) fn adapt_exit_target(
+        &mut self,
+        id: &str,
+        grid: &GridEngine,
+        config: &GridConfig,
+    ) -> Option<(Decimal, Decimal)> {
+        let entry = self.orders.get(id)?;
+        let lot = self.lots.get(id)?;
+        let entry_limit = entry.limit?;
+        if !entry.buy
+            || entry.component != PositionComponent::Grid
+            || entry.phase != OrderPhase::Filled
+            || entry.grid_id != grid.grid_id
+            || lot.bought <= Decimal::ZERO
+            || lot.sold > Decimal::ZERO
+            || self.orders.values().any(|o| !o.buy && o.lot_id == id)
+        {
+            return None;
+        }
+        // 入场成本已含真实成交价和费用，不能再扣一次入场滑点。出场按保守费率和滑点预算。
+        let exit_cost =
+            config.maker_fee.max(config.taker_fee) + config.commission + config.slippage;
+        let minimum_profit = lot.entry_value * config.minimum_profit_margin;
+        let target = grid
+            .levels
+            .iter()
+            .map(|level| level.price)
+            .filter(|price| {
+                let net = *price * lot.bought * (Decimal::ONE - exit_cost) - lot.remaining_cost;
+                // 至少换到原买入层或更低；不能把买价向下/卖价向上取整的一 tick 差当成换层。
+                *price <= entry_limit
+                    && *price < lot.target
+                    && net > Decimal::ZERO
+                    && net >= minimum_profit
+            })
+            .min()?;
+        let previous = lot.target;
+        self.lots.get_mut(id)?.target = target;
+        self.live.take();
+        Some((previous, target))
     }
 
     /// 为真实已成交库存创建覆盖卖单，并扣除已有卖单的预留数量。

@@ -16,7 +16,7 @@
 //! 历史回放与券商 runner 共用的组合配置文件模型。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     path::{Path, PathBuf},
 };
@@ -92,6 +92,7 @@ impl GridPortfolioFile {
             portfolio: self.portfolio.clone(),
             state_path: None,
             recovery_context: None,
+            isolated_instruments: BTreeSet::new(),
         };
         c.validate()?;
         for instrument in self.instruments.values() {
